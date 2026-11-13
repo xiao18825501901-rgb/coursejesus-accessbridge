@@ -1,0 +1,2 @@
+"""CourseJesus AccessBridge competition application."""
+

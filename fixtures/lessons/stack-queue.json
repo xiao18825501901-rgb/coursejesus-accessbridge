@@ -1,0 +1,83 @@
+{
+  "lesson_id": "stack-queue",
+  "title": {"en": "Stacks and queues", "zh": "栈与队列"},
+  "concept": {"en": "When to remove the newest item and when to remove the oldest item", "zh": "何时移除最新元素，何时移除最旧元素"},
+  "original_source_excerpt": {
+    "en": "A stack returns the newest item; a queue returns the oldest item.",
+    "zh": "栈返回最新元素；队列返回最旧元素。"
+  },
+  "sources": [
+    {
+      "id": "AB-S1",
+      "title": {"en": "Original synthetic data-structure note", "zh": "原创数据结构说明"},
+      "rights": "Original synthetic teaching text created for this competition; no school, course, or learner records.",
+      "text": {
+        "en": "A stack stores items in insertion order and removes the newest item first. A queue stores items in insertion order and removes the oldest item first.",
+        "zh": "栈按插入顺序存储元素，并优先移除最新元素；队列也按插入顺序存储元素，但优先移除最旧元素。"
+      }
+    }
+  ],
+  "steps": [
+    {"id": "AB-S1", "title": {"en": "Read one operation", "zh": "一次只看一个操作"}, "body": {"en": "Look at a single add or remove before reading the next one.", "zh": "在继续看下一个操作前，先理解当前一个增删操作。"}, "source_id": "AB-S1"},
+    {"id": "AB-S2", "title": {"en": "Stack is last-in-first-out", "zh": "栈是后进先出"}, "body": {"en": "push(A), push(B), push(C) leaves C on top; pop returns C.", "zh": "push(A)、push(B)、push(C) 后 C 在顶部；pop 返回 C。"}, "source_id": "AB-S1"},
+    {"id": "AB-S3", "title": {"en": "Queue is first-in-first-out", "zh": "队列是先进先出"}, "body": {"en": "enqueue(A), enqueue(B), enqueue(C) leaves A at the front; dequeue returns A.", "zh": "enqueue(A)、enqueue(B)、enqueue(C) 后 A 在前端；dequeue 返回 A。"}, "source_id": "AB-S1"}
+  ],
+  "visual_spec": {
+    "visual_spec_version": "1.0",
+    "should_generate": true,
+    "pedagogical_reason": "Contrast the removal rule of a stack with the removal rule of a queue.",
+    "visual_goal": "Show stack-to-LIFO and queue-to-FIFO as two grounded branches.",
+    "visual_type": "DIAGRAM",
+    "renderer": "DETERMINISTIC_DIAGRAM",
+    "importance": "HIGH",
+    "timing": "INLINE",
+    "source_grounding": [
+      {"source_id": "AB-S1", "source_version": "1.0", "locator": "synthetic-note/insertion-order", "supported_claim": "Stack removes newest; queue removes oldest."}
+    ],
+    "must_include": ["Stack removes newest first", "Queue removes oldest first"],
+    "must_not_include": ["Unbounded recursive structure", "Network request"],
+    "exact_labels": [],
+    "equations": [],
+    "code_elements": [],
+    "reference_assets": [],
+    "style": {"tone": "CLEAN_TECHNICAL", "background": "light neutral", "composition": "two concept branches", "camera": "", "color_guidance": "neutral blue and grey"},
+    "duration_seconds": null,
+    "aspect_ratio": "16:9",
+    "cost_tier": "FREE",
+    "confidence": 1.0,
+    "fallback_renderer": "DETERMINISTIC_DIAGRAM",
+    "cache_policy": "NO_CACHE",
+    "language": "en",
+    "motion_is_essential": false,
+    "semantic_precision": "EXACT",
+    "diagram": {
+      "layout": "LEFT_RIGHT",
+      "nodes": [
+        {"id": "stack", "label": "Stack", "kind": "structure"},
+        {"id": "lifo", "label": "Newest first", "kind": "rule"},
+        {"id": "queue", "label": "Queue", "kind": "structure"},
+        {"id": "fifo", "label": "Oldest first", "kind": "rule"}
+      ],
+      "edges": [
+        {"from": "stack", "to": "lifo", "kind": "rule"},
+        {"from": "queue", "to": "fifo", "kind": "rule"}
+      ]
+    },
+    "animation_steps": []
+  },
+  "alt_text": {"en": "Diagram contrasting stack removal with queue removal.", "zh": "对比栈与队列移除规则的示意图。"},
+  "long_description": {
+    "en": "The diagram has two branches. Stack points to the rule newest first. Queue points to the rule oldest first.",
+    "zh": "图中有两条分支：栈指向“最新元素先出”；队列指向“最旧元素先出”。"
+  },
+  "glossary": [
+    {"term": {"en": "LIFO", "zh": "后进先出"}, "definition": {"en": "The last item added is the first item removed.", "zh": "最后加入的元素最先被移除。"}},
+    {"term": {"en": "FIFO", "zh": "先进先出"}, "definition": {"en": "The first item added is the first item removed.", "zh": "最先加入的元素最先被移除。"}}
+  ],
+  "quiz": [
+    {"id": "Q1", "prompt": {"en": "push(A), push(B), push(C) then pop returns which value?", "zh": "push(A)、push(B)、push(C) 后执行 pop，返回什么？"}, "options": [{"en": "A", "zh": "A"}, {"en": "B", "zh": "B"}, {"en": "C", "zh": "C"}], "answer": 2, "rationale": {"en": "C was added last, so a stack removes C first.", "zh": "C 最后加入，所以栈最先移除 C。"}, "source_id": "AB-S1"},
+    {"id": "Q2", "prompt": {"en": "enqueue(A), enqueue(B), enqueue(C) then dequeue returns which value?", "zh": "enqueue(A)、enqueue(B)、enqueue(C) 后执行 dequeue，返回什么？"}, "options": [{"en": "A", "zh": "A"}, {"en": "B", "zh": "B"}, {"en": "C", "zh": "C"}], "answer": 0, "rationale": {"en": "A was added first, so a queue removes A first.", "zh": "A 最先加入，所以队列最先移除 A。"}, "source_id": "AB-S1"},
+    {"id": "Q3", "prompt": {"en": "Which phrase describes a stack?", "zh": "哪个短语描述栈？"}, "options": [{"en": "Last in, first out", "zh": "后进先出"}, {"en": "First in, first out", "zh": "先进先出"}], "answer": 0, "rationale": {"en": "Stacks remove the most recently added item.", "zh": "栈移除最近加入的元素。"}, "source_id": "AB-S1"}
+  ],
+  "source_reference": "AB-S1 · original synthetic data-structure note"
+}

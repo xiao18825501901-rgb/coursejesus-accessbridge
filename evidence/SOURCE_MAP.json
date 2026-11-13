@@ -1,0 +1,164 @@
+{
+  "schema": 1,
+  "artifact": "coursejesus-accessbridge-source-map",
+  "captured_at_local": "2026-11-13T04:40:00+08:00",
+  "primary_source": {
+    "repository": "https://github.com/xiao18825501901-rgb/coursemate-ai.git",
+    "commit": "1074b612db87c97c9caff09b5a32bcc5360d7de0",
+    "branch": "fix/visual-quality-20261105",
+    "commit_role": "Owner-reported visual candidate HEAD; also the remote HEAD of main at capture time.",
+    "read_only_reference_clone": "F:\\Hackathon-2026\\coursejesus-accessed\\source",
+    "reference_clone_state": {
+      "head": "1074b612db87c97c9caff09b5a32bcc5360d7de0",
+      "tracked_modifications": 5,
+      "untracked_entries": 0,
+      "modification_kind": "CRLF line endings only; `git diff -w --stat` is empty for all five files",
+      "note": "These five test files were already modified when the clone was first inspected. None of them was read as a source for this build."
+    },
+    "owner_report_context_not_reproduced_locally": {
+      "tracked_newline_edits": 10,
+      "untracked_entries": 7550,
+      "frontend_build": "1074b61",
+      "backend_runtime": "knowledge-map-ae8e786",
+      "release_lock": "HELD at report time"
+    }
+  },
+  "imported_files": [
+    {
+      "upstream_path": "services/rag-api/app/visual/spec.py",
+      "upstream_sha256": "2d6a44b780faaec3a5b9bbe4563f3c7b766257f9f37d1d818ee2840bb000b0a2",
+      "upstream_bytes": 9256,
+      "provenance_copy": "source-visual-1074/spec.py",
+      "provenance_copy_sha256": "2d6a44b780faaec3a5b9bbe4563f3c7b766257f9f37d1d818ee2840bb000b0a2",
+      "local_path": "app/visual/spec.py",
+      "local_sha256": "2d6a44b780faaec3a5b9bbe4563f3c7b766257f9f37d1d818ee2840bb000b0a2",
+      "change": "none, byte-identical copy",
+      "reason": "VisualSpec 1.0 Pydantic models used unchanged by the competition compiler."
+    },
+    {
+      "upstream_path": "services/rag-api/app/visual/validators.py",
+      "upstream_sha256": "20d6ffaf0a4c6e571c82f03ea779e46223f661bc9da2565421b119031dfb307a",
+      "upstream_bytes": 5585,
+      "provenance_copy": "source-visual-1074/validators.py",
+      "provenance_copy_sha256": "20d6ffaf0a4c6e571c82f03ea779e46223f661bc9da2565421b119031dfb307a",
+      "local_path": "app/visual/validators.py",
+      "local_sha256": "f5ac6ef4fa1d87346d5db16e8636c89b8d53ee6073f30187c2234030cd7fca68",
+      "change": "added 'title' and 'desc' to the SVG tag allowlist",
+      "reason": "Accessible SVG needs <title> and <desc>; every other allowlist entry and safety rule is untouched."
+    },
+    {
+      "upstream_path": "services/rag-api/app/visual/compiler.py",
+      "upstream_sha256": "8d04ca79802e16b648d4f0f5397730f51678fb6181e84735e9222fe31c43c806",
+      "upstream_bytes": 22229,
+      "provenance_copy": "source-visual-1074/compiler.py",
+      "provenance_copy_sha256": "8d04ca79802e16b648d4f0f5397730f51678fb6181e84735e9222fe31c43c806",
+      "local_path": "app/visual/compiler_original.py",
+      "local_sha256": "8d04ca79802e16b648d4f0f5397730f51678fb6181e84735e9222fe31c43c806",
+      "change": "none, byte-identical copy kept for comparison",
+      "reason": "Preserves the exact upstream compiler next to the competition compiler instead of overwriting it."
+    },
+    {
+      "upstream_path": "(handoff package) coursejesus_accessed/offline_pack.py",
+      "upstream_sha256": "5f26d2f3ab46dfe8b567118d7b7ed0bd2c8406244f3d6da3839e6b0b2e71f038",
+      "upstream_bytes": 9044,
+      "provenance_copy": "not vendored; adapted in place",
+      "provenance_copy_sha256": null,
+      "local_path": "app/offline_pack.py",
+      "local_sha256": "db3afd857f9ea9023488ed876810619a465bf9956639d8e14fe6e1d4e3435adb",
+      "change": "LearningPack schema and rendering rewritten to match this lesson schema: bilingual fields, source-rights gate, answer validation, duplicate rejection, unsafe-SVG rejection, practice-not-a-grade notice.",
+      "reason": "The handoff helper rendered its own isolated pack; the competition app must feed it packs produced by the integrated build."
+    }
+  ],
+  "new_files": [
+    {
+      "path": "app/visual/compiler.py",
+      "sha256": "f99f7497226112297d9a99c86529c749a0c81e0eed58477d8711def550bb927e",
+      "origin": "New deterministic compiler derived from compiler_original.py",
+      "change": "Tight viewBox computed from content bounds, escaped bilingual <title>/<desc>, role=img, content hash over spec+alt+desc"
+    },
+    {
+      "path": "app/visual/router.py",
+      "sha256": "77fabf12a9f99a1af19d702a83273dc9315efc67317fbb2bdf084272de9816d1",
+      "origin": "New file; upstream routing lives inside services not imported here",
+      "change": "Deterministic-only router that rejects remote renderers"
+    },
+    {
+      "path": "app/lessons.py",
+      "origin": "New",
+      "change": "Strict lesson schema: bilingual text, valid source references, exactly three quiz items, answer index bounds"
+    },
+    {
+      "path": "app/site.py",
+      "origin": "New",
+      "change": "Index, online lesson pages, offline page wiring, build manifest"
+    },
+    {
+      "path": "app/offline_export.py",
+      "origin": "New",
+      "change": "Maps a validated lesson plus its compiled visual into a LearningPack"
+    },
+    {
+      "path": "app/build.py",
+      "origin": "New",
+      "change": "CLI entry point that writes app/dist"
+    },
+    {
+      "path": "app/server.py",
+      "origin": "New",
+      "change": "Loopback-only stdlib static server with /healthz"
+    },
+    {
+      "path": "fixtures/lessons/*.json",
+      "origin": "New, original synthetic teaching content",
+      "change": "Three lessons: stack-queue, bfs-dfs, matrix-transform"
+    },
+    {
+      "path": "tests/*.py",
+      "origin": "New",
+      "change": "Schema, compiler, determinism, semantics, security, server and real-Chromium browser tests"
+    },
+    {
+      "path": "scripts/*",
+      "origin": "New",
+      "change": "start, stop, foreground run, demo recorder, evidence builder"
+    }
+  ],
+  "excluded_sources": [
+    {
+      "path": "F:\\Hackathon-2026\\coursejesus-accessed",
+      "commit": "5b622b9d0bfde519cd3eb34e7229dbbcbbfcea5b",
+      "label": "CleanRebuild",
+      "decision": "excluded",
+      "reason": "Inspected directly: the tree is NanoJev research tooling, not a CourseJesus application scaffold. It has no compatible web app, lesson schema, or visual pipeline to extend."
+    },
+    {
+      "path": "D:\\CourseMate_COMPLETE_ARCHIVE_20260918\\01_SOURCE_REPOSITORY",
+      "decision": "not used",
+      "reason": "Historical locator only, as instructed; not assumed current."
+    }
+  ],
+  "not_copied": [
+    ".env files and API keys",
+    "Canvas tokens or OAuth state",
+    "student or learner records",
+    "production databases",
+    "model weights",
+    "private media assets",
+    "browser sessions or cookies",
+    "the original repository's .git directory"
+  ],
+  "verification_note": "Each upstream file was hashed locally from the read-only clone and compared with the provenance copy in source-visual-1074/. All three matched byte-for-byte at capture time.",
+  "current_revision": {
+    "captured_at": "2026-11-13",
+    "parent_competition_head": "5025c6b",
+    "candidate": "Drive Hackathon_Unblock_20261113_PRIVATE_CANDIDATES.zip / CourseJesus_AccessBridge_Reviewed_Candidate",
+    "candidate_zip_sha256": "7978ec5f27ce9542fa6aa09a32e6b56e00b561f1733bb12516b555dbbe420b5c",
+    "imported": [
+      "fixtures/lessons/bfs-dfs.json",
+      "fixtures/lessons/matrix-transform.json",
+      "tests/test_reviewed_content.py"
+    ],
+    "selective_integration": "Only fixtures and independent algorithm tests imported. Existing compiler/site preserved, then matrix numeric SVG/quiz and BFS order labels updated. Candidate build outputs and old evidence not imported.",
+    "rights": "Current owner grant in LICENSE; historical absence of upstream LICENSE preserved."
+  }
+}

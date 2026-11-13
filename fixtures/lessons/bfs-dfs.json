@@ -1,0 +1,281 @@
+{
+  "lesson_id": "bfs-dfs",
+  "title": {
+    "en": "Breadth-first and depth-first search",
+    "zh": "广度优先与深度优先搜索"
+  },
+  "concept": {
+    "en": "Explore neighbours level by level, or follow one branch before backing up",
+    "zh": "逐层扩展邻居，或先走完一条分支再回溯"
+  },
+  "original_source_excerpt": {
+    "en": "In this five-node directed graph, A points to B and C, B to D, and C to E. Both searches start at A and consider each node's outgoing neighbours in alphabetical order. BFS visits nodes by edge distance from A; DFS follows one branch before backtracking.",
+    "zh": "本例是五个节点的有向图：A 指向 B、C，B 指向 D，C 指向 E。两种搜索都从 A 出发，并按字母顺序考察各节点的出邻居。BFS 按距 A 的边数分层访问；DFS 先沿一条分支前进，再回溯。"
+  },
+  "sources": [
+    {
+      "id": "AB-S1",
+      "title": {
+        "en": "Original synthetic graph-search note",
+        "zh": "原创图搜索说明"
+      },
+      "rights": "Original synthetic teaching text created for this competition; no school, course, or learner records.",
+      "text": {
+        "en": "In this five-node directed graph, A points to B and C, B to D, and C to E. Both searches start at A and consider each node's outgoing neighbours in alphabetical order. BFS visits nodes by edge distance from A; DFS follows one branch before backtracking.",
+        "zh": "本例是五个节点的有向图：A 指向 B、C，B 指向 D，C 指向 E。两种搜索都从 A 出发，并按字母顺序考察各节点的出邻居。BFS 按距 A 的边数分层访问；DFS 先沿一条分支前进，再回溯。"
+      }
+    }
+  ],
+  "steps": [
+    {
+      "id": "AB-S1",
+      "title": {
+        "en": "Start at one node",
+        "zh": "从一个节点开始"
+      },
+      "body": {
+        "en": "Start at A. Use outgoing-neighbour order B before C; the only outgoing neighbours of B and C are D and E respectively.",
+        "zh": "从 A 开始，按出邻居的字母顺序先考察 B、再考察 C；B 和 C 各自唯一的出邻居分别是 D 和 E。"
+      },
+      "source_id": "AB-S1"
+    },
+    {
+      "id": "AB-S2",
+      "title": {
+        "en": "BFS keeps layers",
+        "zh": "广度优先保留层"
+      },
+      "body": {
+        "en": "BFS visits A at distance 0, B and C at distance 1, and D and E at distance 2. With this neighbour order: A, B, C, D, E.",
+        "zh": "BFS 依次访问距离 0 的 A、距离 1 的 B 和 C、距离 2 的 D 和 E。按本例邻居顺序，访问次序为 A、B、C、D、E。"
+      },
+      "source_id": "AB-S1"
+    },
+    {
+      "id": "AB-S3",
+      "title": {
+        "en": "DFS keeps a path",
+        "zh": "深度优先保留路径"
+      },
+      "body": {
+        "en": "With B considered before C, DFS follows A, B, D, then backtracks to A before visiting C, E. A different neighbour order can give another valid DFS order.",
+        "zh": "先考察 B、再考察 C 时，DFS 先访问 A、B、D，再回溯到 A，之后访问 C、E。改变邻居考察顺序，可以得到另一种合法 DFS 次序。"
+      },
+      "source_id": "AB-S1"
+    }
+  ],
+  "visual_spec": {
+    "visual_spec_version": "1.0",
+    "should_generate": true,
+    "pedagogical_reason": "Show the graph topology used to explain BFS and DFS.",
+    "visual_goal": "Show a small rooted graph with two children and two descendants.",
+    "visual_type": "DIAGRAM",
+    "renderer": "DETERMINISTIC_DIAGRAM",
+    "importance": "HIGH",
+    "timing": "INLINE",
+    "source_grounding": [
+      {
+        "source_id": "AB-S1",
+        "source_version": "1.0",
+        "locator": "synthetic-note/graph-order",
+        "supported_claim": "BFS expands by distance; DFS follows a branch first."
+      }
+    ],
+    "must_include": [
+      "Start: A; outgoing neighbours alphabetical",
+      "BFS: A, B, C, D, E",
+      "DFS: A, B, D, C, E"
+    ],
+    "must_not_include": [
+      "Weighted edge values",
+      "Recursive implementation detail"
+    ],
+    "exact_labels": [],
+    "equations": [],
+    "code_elements": [],
+    "reference_assets": [],
+    "style": {
+      "tone": "MINIMAL",
+      "background": "light neutral",
+      "composition": "simple rooted graph",
+      "camera": "",
+      "color_guidance": "neutral blue and grey"
+    },
+    "duration_seconds": null,
+    "aspect_ratio": "16:9",
+    "cost_tier": "FREE",
+    "confidence": 1.0,
+    "fallback_renderer": "DETERMINISTIC_DIAGRAM",
+    "cache_policy": "NO_CACHE",
+    "language": "en",
+    "motion_is_essential": false,
+    "semantic_precision": "EXACT",
+    "diagram": {
+      "layout": "TOP_DOWN",
+      "nodes": [
+        {
+          "id": "a",
+          "label": "A",
+          "kind": "start"
+        },
+        {
+          "id": "b",
+          "label": "B",
+          "kind": "node"
+        },
+        {
+          "id": "c",
+          "label": "C",
+          "kind": "node"
+        },
+        {
+          "id": "d",
+          "label": "D",
+          "kind": "node"
+        },
+        {
+          "id": "e",
+          "label": "E",
+          "kind": "node"
+        }
+      ],
+      "edges": [
+        {
+          "from": "a",
+          "to": "b",
+          "kind": "edge"
+        },
+        {
+          "from": "a",
+          "to": "c",
+          "kind": "edge"
+        },
+        {
+          "from": "b",
+          "to": "d",
+          "kind": "edge"
+        },
+        {
+          "from": "c",
+          "to": "e",
+          "kind": "edge"
+        }
+      ]
+    },
+    "animation_steps": []
+  },
+  "alt_text": {
+    "en": "Small graph with A connected to B and C, and B connected to D, C connected to E.",
+    "zh": "小型图：A 连接 B 和 C，B 连接 D，C 连接 E。"
+  },
+  "long_description": {
+    "en": "Directed graph: A points to B and C; B points to D; C points to E. Start at A and inspect outgoing neighbours alphabetically (B before C). BFS visits A,B,C,D,E. DFS visits A,B,D,C,E.",
+    "zh": "有向图：A 指向 B、C；B 指向 D；C 指向 E。从 A 出发，按字母顺序考察出邻居（先 B 后 C）。BFS 顺序为 A、B、C、D、E；DFS 顺序为 A、B、D、C、E。"
+  },
+  "glossary": [
+    {
+      "term": {
+        "en": "BFS",
+        "zh": "广度优先搜索"
+      },
+      "definition": {
+        "en": "Search layer by layer away from the start.",
+        "zh": "按距离逐层扩展搜索。"
+      }
+    },
+    {
+      "term": {
+        "en": "DFS",
+        "zh": "深度优先搜索"
+      },
+      "definition": {
+        "en": "Follow one branch as far as possible before backtracking.",
+        "zh": "先沿一条分支走远，再回溯。"
+      }
+    }
+  ],
+  "quiz": [
+    {
+      "id": "Q1",
+      "prompt": {
+        "en": "In the diagram, which nodes are directly connected to A?",
+        "zh": "图中哪些节点直接连接到 A？"
+      },
+      "options": [
+        {
+          "en": "B and C",
+          "zh": "B 和 C"
+        },
+        {
+          "en": "D and E",
+          "zh": "D 和 E"
+        },
+        {
+          "en": "B and D",
+          "zh": "B 和 D"
+        }
+      ],
+      "answer": 0,
+      "rationale": {
+        "en": "The graph shows A to B and A to C.",
+        "zh": "图中显示 A 指向 B 和 A 指向 C。"
+      },
+      "source_id": "AB-S1"
+    },
+    {
+      "id": "Q2",
+      "prompt": {
+        "en": "Which order follows BFS from A?",
+        "zh": "从 A 开始，哪种顺序符合广度优先？"
+      },
+      "options": [
+        {
+          "en": "A, B, C, D, E",
+          "zh": "A、B、C、D、E"
+        },
+        {
+          "en": "A, B, D, C, E",
+          "zh": "A、B、D、C、E"
+        },
+        {
+          "en": "A, D, B, E, C",
+          "zh": "A、D、B、E、C"
+        }
+      ],
+      "answer": 0,
+      "rationale": {
+        "en": "BFS visits A, then the first layer B and C, then the next layer D and E.",
+        "zh": "广度优先先访问 A，再访问第一层 B、C，再访问下一层 D、E。"
+      },
+      "source_id": "AB-S1"
+    },
+    {
+      "id": "Q3",
+      "prompt": {
+        "en": "When A considers B before C, which prefix follows DFS from A?",
+        "zh": "当 A 先考察 B 再考察 C 时，从 A 出发的 DFS 前缀是哪一个？"
+      },
+      "options": [
+        {
+          "en": "A, B, D",
+          "zh": "A、B、D"
+        },
+        {
+          "en": "A, C, E",
+          "zh": "A、C、E"
+        },
+        {
+          "en": "A, B, C",
+          "zh": "A、B、C"
+        }
+      ],
+      "answer": 0,
+      "rationale": {
+        "en": "The specified neighbour order chooses B first. DFS then visits D before returning to explore C and E.",
+        "zh": "题目指定先考察 B；DFS 接着访问 D，再回溯并探索 C 和 E。"
+      },
+      "source_id": "AB-S1"
+    }
+  ],
+  "source_reference": "AB-S1 · original synthetic graph-search note"
+}

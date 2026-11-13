@@ -1,0 +1,51 @@
+{
+  "schema": 1,
+  "build": "coursejesus-accessbridge-v1",
+  "lessons": [
+    "stack-queue",
+    "bfs-dfs",
+    "matrix-transform"
+  ],
+  "visual_hashes": {
+    "stack-queue": "579e04378b2a2d54e46ef4925ea9325d5ae108330e6f24ce9cc018d1d54f75a3",
+    "bfs-dfs": "efa0240853ba6412b9fec7af0c6eb93fd2a1c73304df88a185c6362b89f20b02",
+    "matrix-transform": "7a0e5753d76640477c1d7f236afe87377db61ab3a97f01afdcd6bd6d599a5edc"
+  },
+  "files": [
+    {
+      "path": "index.html",
+      "sha256": "7b9abbaf137ba8c86420f89e463453ec636fdbb747979a51ac0d841f4fb1c04c",
+      "size": 14711
+    },
+    {
+      "path": "lessons/stack-queue.html",
+      "sha256": "364276ec97169519525d971f439f8e688bbb4886932c580313a0f8695f642b47",
+      "size": 22078
+    },
+    {
+      "path": "offline/stack-queue.html",
+      "sha256": "cd5c60538960e8c2956522c7276d2f6264b922941093c7c0fc0b9ad8e819e492",
+      "size": 13261
+    },
+    {
+      "path": "lessons/bfs-dfs.html",
+      "sha256": "88382bf8de0b45df611b3d98b8532f1a40afa6f72100e4bd7888f6633e3097ac",
+      "size": 25143
+    },
+    {
+      "path": "offline/bfs-dfs.html",
+      "sha256": "a6e9c1bb18cf5a07255c2209b0bee8407d13d8bc689c2ee2e63ad9f33980c2f5",
+      "size": 15781
+    },
+    {
+      "path": "lessons/matrix-transform.html",
+      "sha256": "84349af69fa415880b818c805c84bf2b0ce1949a217d9e3e57ef88c182b8d94d",
+      "size": 25996
+    },
+    {
+      "path": "offline/matrix-transform.html",
+      "sha256": "51f6f1031c3dd33b4eadf4ed775fbab0d18643cd645a0bcb5cb753cd18884e5c",
+      "size": 16301
+    }
+  ]
+}

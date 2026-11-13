@@ -1,0 +1,49 @@
+{
+  "status": "PASS",
+  "scope": "VERIFIED_LOCAL real Chrome against generated application",
+  "checks": [
+    "index_three_lessons",
+    "no_browser_persistent_learner_data",
+    "index_chinese_toggle",
+    "keyboard_large_text",
+    "responsive_no_horizontal_overflow_360_390_768_1280",
+    "axe_index_wcag_scan",
+    "lesson_three_steps_three_questions_accessible_svg",
+    "keyboard_skip_link",
+    "keyboard_language_toggle_updates_svg_text",
+    "keyboard_wrong_answer_feedback",
+    "quiz_correct_answer_and_source_feedback",
+    "source_expansion",
+    "zoom_200_percent_equivalent_reflow",
+    "lesson_mobile_no_overflow",
+    "axe_lesson_wcag_scan",
+    "bfs_diagram_rendered",
+    "matrix_transform_lesson_opens",
+    "offline_file_opens_with_network_disabled",
+    "offline_pack_quiz_and_language_toggle",
+    "second_browser_context_isolated_no_shared_state",
+    "zero_external_network_requests",
+    "zero_page_or_console_errors"
+  ],
+  "axe_version": "4.14.0",
+  "axe_violations": {
+    "index": [],
+    "lesson": []
+  },
+  "network_requests": [
+    "http://127.0.0.1:59962/index.html",
+    "http://127.0.0.1:59962/lessons/stack-queue.html",
+    "http://127.0.0.1:59962/lessons/stack-queue.html",
+    "http://127.0.0.1:59962/lessons/stack-queue.html",
+    "http://127.0.0.1:59962/lessons/bfs-dfs.html",
+    "http://127.0.0.1:59962/lessons/matrix-transform.html"
+  ],
+  "external_network_requests": [],
+  "page_errors": [],
+  "console_errors": [],
+  "notes": [
+    "The accessibility scan is automated evidence, not WCAG certification.",
+    "The 200% check uses a 640 CSS-pixel viewport as the equivalent reflow width for a 1280-pixel window.",
+    "The offline page was opened through file:// while the browser context was offline."
+  ]
+}
