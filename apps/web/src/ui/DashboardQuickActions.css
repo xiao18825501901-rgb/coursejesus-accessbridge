@@ -1,0 +1,110 @@
+.cj-dashboard-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  width: 100%;
+  margin: 0 0 26px;
+}
+
+.cj-dashboard-action {
+  position: relative;
+  isolation: isolate;
+  min-width: 0;
+  min-height: 78px;
+  padding: 13px 16px;
+  border: 1px dashed var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--ink);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  text-align: left;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+  box-shadow: 0 0 0 rgba(0, 0, 0, 0);
+  transition:
+    background-color 130ms cubic-bezier(.2, .7, .25, 1),
+    border-color 130ms cubic-bezier(.2, .7, .25, 1),
+    box-shadow 130ms cubic-bezier(.2, .7, .25, 1),
+    color 130ms cubic-bezier(.2, .7, .25, 1),
+    transform 80ms cubic-bezier(.2, .7, .25, 1);
+}
+
+@media (hover: hover) {
+  .cj-dashboard-action:hover {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--accent);
+    box-shadow: 0 3px 10px rgb(30 48 61 / 8%);
+  }
+}
+
+.cj-dashboard-action:active {
+  transform: scale(.975);
+}
+
+.cj-dashboard-action:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.cj-dashboard-action-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+
+.cj-dashboard-action-icon .ico {
+  width: 22px;
+  height: 22px;
+}
+
+.cj-dashboard-action-label {
+  min-width: 0;
+  font-weight: 600;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 480px) {
+  .cj-dashboard-actions {
+    gap: 8px;
+    margin-bottom: 22px;
+  }
+
+  .cj-dashboard-action {
+    min-height: 76px;
+    padding: 10px 7px;
+    gap: 6px;
+    font-size: 11px;
+  }
+
+  .cj-dashboard-action-icon .ico {
+    width: 19px;
+    height: 19px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cj-dashboard-action {
+    transition: none;
+  }
+
+  .cj-dashboard-action:active {
+    transform: none;
+  }
+}
+
+@media (forced-colors: active) {
+  .cj-dashboard-action {
+    border-color: ButtonText;
+    color: ButtonText;
+    forced-color-adjust: auto;
+  }
+
+  .cj-dashboard-action:focus-visible {
+    outline-color: Highlight;
+  }
+}

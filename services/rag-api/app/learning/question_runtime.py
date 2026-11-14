@@ -1,0 +1,3265 @@
+"""Run the existing Question Engine stages for one practice exercise.
+
+This module is the application boundary between the refreshed ``做一题`` action
+and the Stage 1--7 contracts.  It does not create a second question store: a
+successful result is an immutable Assessment question revision plus its existing
+rubric/reference solution and Question Engine provenance row.
+
+The returned object deliberately separates ``public`` from ``private``.  Only
+the mounted UI's server-side run worker receives the private projection, stores
+it in the already-private exercise row, and reveals it through the existing
+explicit reveal endpoint.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import sqlite3
+import unicodedata
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any, Final, Literal, cast
+from uuid import uuid4
+
+from pydantic import Field, ValidationError
+
+from app.db import Database
+from app.errors import ApiError
+from app.jev import callsites
+from app.jev.models import owner_scope_hash
+from app.jev.service import SemanticDecisionService
+from app.learning.assessment_point_configuration import PointQuestionSlot
+from app.learning.assessment_point_dispatch import (
+    ResolvedPointDispatch,
+    resolve_point_dispatch,
+)
+from app.learning.assessment_point_question_inputs import (
+    AssessmentPointQuestionInput,
+    build_point_question_input,
+)
+from app.learning.assessment_point_store import AssessmentPointConfigurationStore
+from app.learning.assessment_question_slots import (
+    AssessmentQuestionSlot,
+    default_assessment_question_slots,
+)
+from app.learning.blind_solve import BlindSolveError, BlindSolveReceipt, run_blind_solve
+from app.learning.deterministic_graph_point_assessment import (
+    DeterministicGraphPointPublisher,
+)
+from app.learning.hybrid_quality import HybridReviewUnavailable
+from app.learning.learning_loop import LearningLoopError, LearningLoopService
+from app.learning.models import Contract, Identifier, Text
+from app.learning.practice_feedback import (
+    CriterionFeedback,
+    PracticeFeedbackOutput,
+    PracticeInteractionError,
+    generate_practice_feedback,
+    generate_practice_hint,
+)
+from app.learning.practice_recovery import PRACTICE_OPERATION_ACTIVE_WINDOW_SECONDS
+from app.learning.question_author import (
+    QUESTION_AUTHOR_PROMPT_VERSION,
+    RULE_VIOLATION_POLICY_VERSION,
+    AuthorGenerationError,
+    author_question,
+)
+from app.learning.question_blueprint import (
+    AnswerForm,
+    BloomTarget,
+    DifficultyFeature,
+    Hex64,
+    ObjectiveResolutionError,
+    QuestionBlueprint,
+    QuestionType,
+    TeachingObjective,
+    resolve_objective,
+)
+from app.learning.question_evidence import (
+    EvidencePackAccess,
+    EvidencePackError,
+    QuestionEvidencePack,
+    build_evidence_pack,
+)
+from app.learning.question_persistence import (
+    QuestionPersistenceError,
+    durable_hybrid_receipt_for_dimension,
+    persist_question_candidate,
+    persist_source_bound_candidate,
+)
+from app.learning.question_validator import (
+    QuestionSemanticSignals,
+    QuestionValidationReport,
+    collect_question_semantic_signals,
+    required_specialized_semantic_dimension,
+    validate_question_candidate,
+)
+from app.learning.structured_calls import ModelCallClaim
+from app.learning.workspaces import workspace_for
+
+GENERATION_VERSION: Final = "exercise.v2+question-engine.v1"
+GENERATION_POLICY_VERSION: Final = "question-generation-policy-v1"
+ASSESSMENT_GENERATION_POLICY_VERSION: Final = "assessment-question-slot-policy-v1"
+
+
+class _MeteredProviderProxy:
+    """Forward provider identity while routing calls through the V3 usage ledger."""
+
+    def __init__(
+        self,
+        provider: Any,
+        generate: Callable[..., tuple[Any, dict[str, Any]]],
+        *,
+        workspace_id: str,
+        operation_id: str,
+    ) -> None:
+        self._provider = provider
+        self._generate = generate
+        self._workspace_id = workspace_id
+        self._operation_id = operation_id
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._provider, name)
+
+    def generate(self, schema: Any, **kwargs: Any) -> tuple[Any, dict[str, Any]]:
+        return self._generate(
+            self._workspace_id,
+            self._operation_id,
+            schema,
+            **kwargs,
+        )
+
+
+class QuestionEngineRuntimeError(RuntimeError):
+    """Stable runtime refusal that never includes provider bodies or private answers."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class ExerciseReference(Contract):
+    id: Identifier
+    document_id: Identifier
+    document_version_id: Identifier
+    filename: str
+    source_scope: Literal["OFFICIAL", "OWNER_COURSE", "WORKSPACE_PRIVATE"]
+    locator_type: str
+    locator_value: str
+    section: str | None = None
+
+
+class ExerciseAnswerStep(Contract):
+    step_id: Identifier
+    ordinal: int
+    title: Text
+    text: Text
+    source_refs: list[Identifier] = Field(min_length=1, max_length=20)
+
+
+class PrivateExerciseProjection(Contract):
+    answer: Text
+    steps: list[ExerciseAnswerStep] = Field(min_length=1, max_length=12)
+
+
+class PublicExerciseProjection(Contract):
+    schema_version: Literal["exercise.v2"]
+    blueprint_id: Identifier
+    question_revision: Hex64
+    question_type: Literal["MCQ_SINGLE", "NUMERIC", "SHORT_TEXT", "EXPLANATION", "CODE"]
+    marks: int = Field(ge=1, le=100)
+    question_text: Text
+    options: list[str] = Field(max_length=10)
+    source_refs: list[Identifier] = Field(min_length=1, max_length=20)
+    answer_policy: Literal["HIDDEN_UNTIL_REVEAL", "SOLUTION_ONLY"]
+
+
+class GeneratedExercise(Contract):
+    question_revision_id: Identifier
+    blueprint_id: Identifier
+    status: Literal["READY"]
+    verification_status: Literal["AI_REVIEWED", "MODEL_ONLY"]
+    generation_version: Literal["exercise.v2+question-engine.v1"]
+    prototype_id: Literal[
+        "worked_application",
+        "concept_short_answer",
+        "rule_violation_analysis",
+        "assessment_ready",
+    ]
+    public: PublicExerciseProjection
+    private: PrivateExerciseProjection
+    references: list[ExerciseReference] = Field(min_length=1, max_length=20)
+    usage: list[dict[str, Any]] = Field(min_length=3, max_length=3)
+    # The mounted dual-pane worker needs the canonical target selected by the
+    # owner-scoped domain adapter.  These fields are intentionally part of the
+    # server-only result; they do not expose the private solution projection.
+    target_node_id: Identifier | None = None
+    target_node_title: Text | None = None
+
+
+@dataclass(frozen=True)
+class _Prototype:
+    prototype_id: Literal[
+        "worked_application", "concept_short_answer", "rule_violation_analysis"
+    ]
+    bloom_target: Literal["UNDERSTAND", "APPLY", "ANALYZE"]
+    target_difficulty: int
+    difficulty_features: tuple[Literal["STEPS", "CONCEPTS"], ...]
+    question_type: Literal["SHORT_TEXT", "EXPLANATION"]
+    expected_answer_form: Literal["SHORT_ANSWER", "WORKED_STEPS"]
+    generation_policy_version: str
+
+
+_PROTOTYPES: Final[dict[str, _Prototype]] = {
+    "worked_application": _Prototype(
+        prototype_id="worked_application",
+        bloom_target="APPLY",
+        target_difficulty=3,
+        difficulty_features=("STEPS", "CONCEPTS"),
+        question_type="EXPLANATION",
+        expected_answer_form="WORKED_STEPS",
+        generation_policy_version=GENERATION_POLICY_VERSION,
+    ),
+    "concept_short_answer": _Prototype(
+        prototype_id="concept_short_answer",
+        bloom_target="UNDERSTAND",
+        target_difficulty=2,
+        difficulty_features=("CONCEPTS",),
+        question_type="SHORT_TEXT",
+        expected_answer_form="SHORT_ANSWER",
+        generation_policy_version=GENERATION_POLICY_VERSION,
+    ),
+    "rule_violation_analysis": _Prototype(
+        prototype_id="rule_violation_analysis",
+        bloom_target="ANALYZE",
+        target_difficulty=4,
+        difficulty_features=("CONCEPTS", "STEPS"),
+        question_type="EXPLANATION",
+        expected_answer_form="WORKED_STEPS",
+        generation_policy_version=RULE_VIOLATION_POLICY_VERSION,
+    ),
+}
+
+
+def _hash(*parts: object) -> str:
+    payload = json.dumps(parts, ensure_ascii=False, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _public_run(run: object) -> dict[str, Any]:
+    """Keep cost/provenance metadata while excluding any model output."""
+
+    if hasattr(run, "model_dump"):
+        value = run.model_dump(mode="json")
+    elif isinstance(run, dict):
+        value = dict(run)
+    else:
+        return {}
+    allowed = {
+        "model",
+        "provider",
+        "protocol",
+        "region",
+        "role",
+        "template_version",
+        "schema_version",
+        "input_hash",
+        "started_at",
+        "finished_at",
+        "latency_ms",
+        "input_tokens",
+        "output_tokens",
+        "provider_response_id",
+        "status",
+        "error_class",
+    }
+    return {key: value[key] for key in allowed if key in value}
+
+
+def _normalized_choice(value: object) -> str:
+    return " ".join(unicodedata.normalize("NFKC", str(value)).split()).casefold()
+
+
+def _render_public_question(
+    prompt: str, question_type: str, options: list[str]
+) -> str:
+    """Render answer-free single-choice options for the existing practice pane."""
+
+    if question_type != "MCQ_SINGLE" or not options:
+        return prompt
+    labels = [f"{chr(65 + index)}. {option}" for index, option in enumerate(options)]
+    return f"{prompt.rstrip()}\n\n" + "\n".join(labels)
+
+
+def _deterministic_single_choice_feedback(
+    context: dict[str, Any], submitted_answer: str
+) -> tuple[PracticeFeedbackOutput, dict[str, Any]] | None:
+    """Grade a frozen single-choice key locally; other answer forms still use Qwen."""
+
+    question = context["question"]
+    if question.get("question_type") != "MCQ_SINGLE":
+        return None
+    options = [str(value) for value in question.get("options") or []]
+    answer = str(context["reference_solution"]["answer"])
+    answer_key = _normalized_choice(answer)
+    matching = [index for index, option in enumerate(options) if _normalized_choice(option) == answer_key]
+    if len(options) < 2 or len(matching) != 1:
+        raise QuestionEngineRuntimeError(
+            "PRACTICE_REFERENCE_INVALID",
+            "The immutable single-choice key could not be verified.",
+        )
+    submitted_key = _normalized_choice(submitted_answer)
+    selected_index: int | None = None
+    for index, option in enumerate(options):
+        if submitted_key == _normalized_choice(option):
+            selected_index = index
+            break
+    if selected_index is None and len(submitted_key) == 1 and "a" <= submitted_key <= "z":
+        candidate = ord(submitted_key) - ord("a")
+        if candidate < len(options):
+            selected_index = candidate
+    if selected_index is None and submitted_key.isdigit():
+        candidate = int(submitted_key) - 1
+        if 0 <= candidate < len(options):
+            selected_index = candidate
+    correct = selected_index == matching[0]
+    criteria = [
+        CriterionFeedback(
+            criterion_id=str(item["criterion_id"]),
+            met=correct,
+            feedback=(
+                "The selected option matches the frozen single-choice answer key."
+                if correct
+                else "The selected option does not match the frozen single-choice answer key."
+            ),
+        )
+        for item in context["rubric"]
+    ]
+    output = PracticeFeedbackOutput(
+        verdict="CORRECT" if correct else "INCORRECT",
+        feedback=(
+            "Your selected option is correct."
+            if correct
+            else "Your selected option is not correct; review the question conditions and try again."
+        ),
+        strengths=["Selected the option that matches the verified answer key."] if correct else [],
+        gaps=[] if correct else ["The selected option did not match the verified answer key."],
+        next_step=(
+            "Reveal the stored solution when you are ready to review the reasoning."
+            if correct
+            else "Re-read the options and submit the option best supported by the course source."
+        ),
+        criteria=criteria,
+    )
+    receipt = {
+        "model": "NONE",
+        "provider": "HOST_DETERMINISTIC",
+        "protocol": "local_exact_match",
+        "region": "SERVER",
+        "role": "PRACTICE_FEEDBACK",
+        "template_version": "practice-feedback.v1",
+        "schema_version": "practice-feedback-output.v1",
+        "input_hash": _hash(
+            "MCQ_SINGLE_EXACT_MATCH",
+            context["question_revision_id"],
+            submitted_key,
+            answer_key,
+        ),
+        "latency_ms": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "status": "COMPLETED",
+        "error_class": None,
+    }
+    return output, receipt
+
+
+class QuestionEngineRuntime:
+    """Orchestrate one owner/workspace-scoped practice question."""
+
+    def __init__(
+        self,
+        *,
+        database: Database,
+        provider: Any,
+        semantic_decisions: SemanticDecisionService | None,
+        metered_generate: Callable[..., tuple[Any, dict[str, Any]]] | None = None,
+        learning_loop: LearningLoopService | None = None,
+        hybrid_reviewer: Any | None = None,
+        point_store: AssessmentPointConfigurationStore | None = None,
+        source_bound_student_entry: bool = False,
+    ) -> None:
+        self.database = database
+        self.provider = provider
+        self.semantic_decisions = semantic_decisions
+        self.metered_generate = metered_generate
+        self.learning_loop = learning_loop or LearningLoopService(database)
+        # ``hybrid-strict-v1``.  Optional and strictly additive: when it is not
+        # configured the Question Engine behaves exactly as before, and when it
+        # is configured it can only ever *add* a qualified acceptance path.  A
+        # deterministic hard-gate failure is refused before it is consulted.
+        self.hybrid_reviewer = hybrid_reviewer
+        self.point_store = point_store
+        self.source_bound_student_entry = source_bound_student_entry
+        self.deterministic_point_publisher = (
+            DeterministicGraphPointPublisher(database, self._verify_point_input)
+            if point_store is not None
+            else None
+        )
+
+    def _verify_point_input(
+        self,
+        claim: ModelCallClaim,
+        point_input: AssessmentPointQuestionInput,
+    ) -> None:
+        claim.verify()
+        if (
+            claim.owner_user_id != point_input.owner_user_id
+            or claim.course_id != point_input.course_id
+            or claim.content_language != point_input.content_language
+        ):
+            raise ApiError(409, "ASSESSMENT_POINT_SCOPE_CONFLICT", "Point scope changed.")
+        current = self.point_question_inputs(
+            owner_user_id=point_input.owner_user_id,
+            workspace_id=point_input.workspace_id,
+            course_id=point_input.course_id,
+            private_course_id=point_input.private_course_id,
+            node_id=point_input.node_id,
+            configuration_id=point_input.configuration_id,
+            slots=(point_input.point_slot,),
+            content_language=point_input.content_language,
+        )
+        if len(current) != 1 or current[0].identity() != point_input.identity():
+            raise ApiError(
+                409,
+                "ASSESSMENT_POINT_SOURCE_CHANGED",
+                "The original point input is no longer current.",
+            )
+
+    def _provider_for_operation(
+        self,
+        *,
+        workspace_id: str,
+        operation_id: str | None,
+    ) -> Any:
+        if operation_id is None or self.metered_generate is None:
+            return self.provider
+        return _MeteredProviderProxy(
+            self.provider,
+            self.metered_generate,
+            workspace_id=workspace_id,
+            operation_id=operation_id,
+        )
+
+    def _claim_generation_operation(
+        self,
+        *,
+        workspace_id: str,
+        operation_id: str,
+        request_hash: str,
+    ) -> None:
+        """Create the durable operation parent required by the model-call ledger."""
+
+        try:
+            with self.database.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                existing = connection.execute(
+                    "SELECT request_hash,status FROM learning_operations "
+                    "WHERE workspace_id=? AND id=?",
+                    (workspace_id, operation_id),
+                ).fetchone()
+                if existing is not None:
+                    code = (
+                        "QUESTION_OPERATION_CONFLICT"
+                        if str(existing["request_hash"]) != request_hash
+                        else "QUESTION_OPERATION_REPLAY"
+                    )
+                    raise QuestionEngineRuntimeError(
+                        code,
+                        "The question-generation operation id has already been claimed.",
+                    )
+                connection.execute(
+                    "INSERT INTO learning_operations("
+                    "workspace_id,id,request_hash,kind,status) "
+                    "VALUES(?,?,?,'QUESTION_GENERATION','RUNNING')",
+                    (workspace_id, operation_id, request_hash),
+                )
+        except sqlite3.IntegrityError as error:
+            raise QuestionEngineRuntimeError(
+                "QUESTION_OPERATION_CONFLICT",
+                "Another learning operation is already active for this workspace.",
+            ) from error
+
+    def _finish_generation_operation(
+        self,
+        *,
+        workspace_id: str,
+        operation_id: str,
+        question_revision_id: str,
+    ) -> None:
+        result = json.dumps(
+            {
+                "question_revision_id": question_revision_id,
+                "status": "READY",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        with self.database.connect() as connection:
+            updated = connection.execute(
+                "UPDATE learning_operations SET status='COMPLETED',result_json=? "
+                "WHERE workspace_id=? AND id=? AND status='RUNNING'",
+                (result, workspace_id, operation_id),
+            ).rowcount
+        if updated != 1:
+            raise QuestionEngineRuntimeError(
+                "QUESTION_OPERATION_LOST",
+                "The question-generation operation could not be finalized safely.",
+            )
+
+    def _fail_generation_operation(
+        self,
+        *,
+        workspace_id: str,
+        operation_id: str,
+    ) -> None:
+        with self.database.connect() as connection:
+            reservation_states = {
+                str(row["status"])
+                for row in connection.execute(
+                    "SELECT status FROM learning_model_call_reservations "
+                    "WHERE workspace_id=? AND operation_id=?",
+                    (workspace_id, operation_id),
+                ).fetchall()
+            }
+            status = (
+                "UNKNOWN"
+                if reservation_states & {"RESERVED", "UNKNOWN"}
+                else "FAILED"
+            )
+            connection.execute(
+                "UPDATE learning_operations SET status=? "
+                "WHERE workspace_id=? AND id=? AND status='RUNNING'",
+                (status, workspace_id, operation_id),
+            )
+
+    def reconcile_terminal_ui_operation(
+        self,
+        *,
+        owner_user_id: str,
+        operation_id: str,
+        ui_status: str,
+    ) -> dict[str, Any]:
+        """Settle only the matching abandoned Question Engine parent.
+
+        October UI data can contain a terminal shell run while the same durable
+        Question Engine operation remains ``RUNNING`` after an unexpected Python
+        exception.  The exact owner/id/kind join prevents a broad unlock.  Any
+        unresolved model reservation is preserved as ``UNKNOWN``; it is never
+        replayed or rewritten as a known failure.
+        """
+
+        terminal_ui_status = ui_status.strip().lower()
+        if terminal_ui_status not in {"failed", "cancelled"}:
+            return {"reconciled": False, "status": None}
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            operation = connection.execute(
+                "SELECT operation.workspace_id FROM learning_operations AS operation "
+                "JOIN learning_workspaces AS workspace ON workspace.id=operation.workspace_id "
+                "WHERE operation.id=? AND operation.kind='QUESTION_GENERATION' "
+                "AND operation.status='RUNNING' AND workspace.owner_user_id=?",
+                (operation_id, owner_user_id),
+            ).fetchone()
+            if operation is None:
+                return {"reconciled": False, "status": None}
+            workspace_id = str(operation["workspace_id"])
+            reservation_states = sorted(
+                {
+                    str(row["status"])
+                    for row in connection.execute(
+                        "SELECT status FROM learning_model_call_reservations "
+                        "WHERE workspace_id=? AND operation_id=?",
+                        (workspace_id, operation_id),
+                    ).fetchall()
+                }
+            )
+            status = (
+                "UNKNOWN"
+                if set(reservation_states) & {"RESERVED", "UNKNOWN"}
+                else "FAILED"
+            )
+            result = json.dumps(
+                {
+                    "reconciled_from_terminal_ui": terminal_ui_status,
+                    "reservation_states": reservation_states,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            updated = connection.execute(
+                "UPDATE learning_operations SET status=?,result_json=? "
+                "WHERE workspace_id=? AND id=? AND kind='QUESTION_GENERATION' "
+                "AND status='RUNNING'",
+                (status, result, workspace_id, operation_id),
+            ).rowcount
+            return {"reconciled": updated == 1, "status": status if updated else None}
+
+    def _recent_exposures(self, workspace_id: str, node_id: str) -> list[str]:
+        with self.database.connect() as connection:
+            return [
+                str(row["family_id"])
+                for row in connection.execute(
+                    "SELECT question.family_id FROM question_engine_provenance AS provenance "
+                    "JOIN assessment_question_revisions AS question "
+                    "ON question.id=provenance.question_revision_id "
+                    "WHERE provenance.workspace_id=? AND provenance.node_id=? "
+                    "ORDER BY question.rowid DESC LIMIT 10",
+                    (workspace_id, node_id),
+                ).fetchall()
+            ]
+
+    def _practice_context(
+        self,
+        *,
+        owner_user_id: str,
+        workspace_id: str,
+        question_revision_id: str,
+    ) -> dict[str, Any]:
+        """Load one READY revision through its exact owner/workspace boundary."""
+
+        workspace_for(self.database, workspace_id, owner_user_id)
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT question.prompt_text,question.question_type,question.options_json,"
+                "provenance.node_id,provenance.spec_version,provenance.objective_id,"
+                "provenance.blueprint_json,reference.steps_json,reference.answer_json "
+                "FROM question_engine_provenance AS provenance "
+                "JOIN assessment_question_revisions AS question "
+                "ON question.id=provenance.question_revision_id "
+                "JOIN learning_workspaces AS workspace ON workspace.id=provenance.workspace_id "
+                "JOIN assessment_reference_solutions AS reference "
+                "ON reference.question_revision_id=question.id "
+                "WHERE provenance.question_revision_id=? AND provenance.workspace_id=? "
+                "AND provenance.publication_status='READY' "
+                "AND question.owner_user_id=? AND workspace.owner_user_id=? "
+                "ORDER BY reference.solution_revision DESC LIMIT 1",
+                (
+                    question_revision_id,
+                    workspace_id,
+                    owner_user_id,
+                    owner_user_id,
+                ),
+            ).fetchone()
+            if row is None:
+                raise QuestionEngineRuntimeError(
+                    "PRACTICE_QUESTION_NOT_FOUND",
+                    "The READY practice question is not available in this learner workspace.",
+                )
+            rubric_rows = connection.execute(
+                "SELECT criterion_id,dimension,max_fraction,description "
+                "FROM assessment_rubric_criteria WHERE question_revision_id=? "
+                "ORDER BY criterion_id",
+                (question_revision_id,),
+            ).fetchall()
+        try:
+            blueprint = json.loads(row["blueprint_json"])
+            options = json.loads(row["options_json"])
+            steps = json.loads(row["steps_json"])
+            answer = json.loads(row["answer_json"])
+        except (TypeError, ValueError) as error:
+            raise QuestionEngineRuntimeError(
+                "PRACTICE_REFERENCE_INVALID",
+                "The immutable practice reference could not be verified.",
+            ) from error
+        rubric = [dict(item) for item in rubric_rows]
+        if not rubric:
+            raise QuestionEngineRuntimeError(
+                "PRACTICE_RUBRIC_MISSING", "The practice rubric is unavailable."
+            )
+        return {
+            "question_revision_id": question_revision_id,
+            "question": {
+                "text": row["prompt_text"],
+                "question_type": row["question_type"],
+                "options": options,
+            },
+            "objective": {
+                "node_id": row["node_id"],
+                "spec_version": row["spec_version"],
+                "objective_id": row["objective_id"],
+                "text": blueprint.get("objective_text"),
+            },
+            "rubric": rubric,
+            "reference_solution": {"answer": answer, "steps": steps},
+        }
+
+    @staticmethod
+    def _prototype_id_for_blueprint(
+        blueprint: dict[str, Any],
+    ) -> Literal[
+        "worked_application",
+        "concept_short_answer",
+        "rule_violation_analysis",
+        "assessment_ready",
+    ]:
+        for prototype in _PROTOTYPES.values():
+            if (
+                blueprint.get("generation_policy_version")
+                == prototype.generation_policy_version
+                and blueprint.get("bloom_target") == prototype.bloom_target
+                and blueprint.get("question_type") == prototype.question_type
+                and blueprint.get("expected_answer_form") == prototype.expected_answer_form
+                and int(blueprint.get("target_difficulty") or 0)
+                == prototype.target_difficulty
+            ):
+                return prototype.prototype_id
+        # A configured assessment question can also be a safe practice item: it
+        # has the same READY, rubric, hidden-answer and evidence guarantees, but
+        # its generation-policy label belongs to the assessment pipeline. Map
+        # short-answer shapes to their equivalent practice renderer. A validated
+        # single-choice assessment item is also directly renderable by the
+        # practice UI, so keep its honest assessment identity instead of forcing
+        # a second paid authoring call merely to change its shape.
+        if str(blueprint.get("blueprint_id") or "").startswith("assessment_"):
+            for prototype in _PROTOTYPES.values():
+                if (
+                    blueprint.get("bloom_target") == prototype.bloom_target
+                    and blueprint.get("question_type") == prototype.question_type
+                    and blueprint.get("expected_answer_form")
+                    == prototype.expected_answer_form
+                    and int(blueprint.get("target_difficulty") or 0)
+                    == prototype.target_difficulty
+                ):
+                    return prototype.prototype_id
+            if (
+                blueprint.get("question_type") == "MCQ_SINGLE"
+                and blueprint.get("expected_answer_form") == "SINGLE_CHOICE"
+                and int(blueprint.get("target_difficulty") or 0) in range(1, 6)
+                and blueprint.get("bloom_target")
+                in {"REMEMBER", "UNDERSTAND", "APPLY", "ANALYZE"}
+            ):
+                return "assessment_ready"
+        raise QuestionEngineRuntimeError(
+            "READY_QUESTION_BLUEPRINT_UNSUPPORTED",
+            "The compatible READY question uses an unsupported practice blueprint.",
+        )
+
+    @staticmethod
+    def _stored_steps(steps: list[dict[str, Any]], answer: str) -> list[ExerciseAnswerStep]:
+        projected: list[ExerciseAnswerStep] = []
+        for item in steps:
+            ordinal = int(item["ordinal"])
+            body = f"{item['result']}\n\n{item['explanation']}".strip()
+            if ordinal == len(steps) and answer.casefold() not in body.casefold():
+                body = f"{body}\n\n结论：{answer}"
+            projected.append(
+                ExerciseAnswerStep(
+                    step_id=str(item.get("step_id") or f"step_{ordinal}"),
+                    ordinal=ordinal,
+                    title=str(item["operation"]),
+                    text=body,
+                    source_refs=[str(value) for value in item["source_refs"]],
+                )
+            )
+        return projected
+
+    def _unused_ready_projection(
+        self,
+        *,
+        owner_user_id: str,
+        workspace_id: str,
+        course_id: str,
+        objective: TeachingObjective,
+        evidence: QuestionEvidencePack,
+    ) -> dict[str, Any] | None:
+        """Project one compatible, unexposed READY revision without a provider call."""
+
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                "SELECT question.id,question.question_type,question.prompt_text,"
+                "question.verification_method,"
+                "question.options_json,provenance.blueprint_id,"
+                "provenance.question_revision_hash,provenance.blueprint_json,"
+                "reference.steps_json,reference.answer_json,reference.source_refs_json "
+                "FROM question_engine_provenance AS provenance "
+                "JOIN assessment_question_revisions AS question "
+                "ON question.id=provenance.question_revision_id "
+                "JOIN assessment_reference_solutions AS reference "
+                "ON reference.question_revision_id=question.id "
+                "WHERE provenance.workspace_id=? AND provenance.node_id=? "
+                "AND provenance.spec_version=? AND provenance.objective_id=? "
+                "AND provenance.evidence_pack_hash=? "
+                "AND provenance.publication_status='READY' "
+                "AND question.course_id=? AND question.owner_user_id=? "
+                "AND question.validation_status='VALIDATED' "
+                "AND (question.verification_method='AI_REVIEWED' OR ("
+                " question.verification_method='MODEL_ONLY'"
+                " AND provenance.readiness_reason='SOURCE_BOUND_AUTHOR_COMPLETE')) "
+                "AND NOT EXISTS("
+                " SELECT 1 FROM learning_loop_exposures AS exposure "
+                " WHERE exposure.owner_user_id=? AND exposure.workspace_id=? "
+                " AND exposure.family_id=question.family_id"
+                ") AND NOT EXISTS("
+                " SELECT 1 FROM assessment_exposure_events AS exposure "
+                " WHERE exposure.workspace_id=? AND exposure.family_id=question.family_id"
+                ") ORDER BY question.created_at,question.id,"
+                "reference.solution_revision DESC LIMIT 50",
+                (
+                    workspace_id,
+                    objective.node_id,
+                    objective.spec_version,
+                    objective.item_id,
+                    evidence.identity(),
+                    course_id,
+                    owner_user_id,
+                    owner_user_id,
+                    workspace_id,
+                    workspace_id,
+                ),
+            ).fetchall()
+        if not rows:
+            return None
+        row: sqlite3.Row | None = None
+        prototype_id: str | None = None
+        for candidate in rows:
+            try:
+                candidate_blueprint = json.loads(str(candidate["blueprint_json"]))
+                candidate_prototype = self._prototype_id_for_blueprint(candidate_blueprint)
+            except QuestionEngineRuntimeError as error:
+                if error.code == "READY_QUESTION_BLUEPRINT_UNSUPPORTED":
+                    continue
+                raise
+            except (TypeError, ValueError) as error:
+                raise QuestionEngineRuntimeError(
+                    "READY_QUESTION_PROJECTION_INVALID",
+                    "The compatible READY question could not be projected safely.",
+                ) from error
+            row = candidate
+            prototype_id = candidate_prototype
+            break
+        if row is None or prototype_id is None:
+            return None
+        try:
+            blueprint = json.loads(str(row["blueprint_json"]))
+            options = json.loads(str(row["options_json"]))
+            raw_steps = json.loads(str(row["steps_json"]))
+            answer = json.loads(str(row["answer_json"]))
+            source_refs = json.loads(str(row["source_refs_json"]))
+            if (
+                not isinstance(blueprint, dict)
+                or not isinstance(options, list)
+                or not isinstance(raw_steps, list)
+                or not raw_steps
+                or not isinstance(answer, str)
+                or not isinstance(source_refs, list)
+                or not source_refs
+            ):
+                raise ValueError("invalid READY projection")
+            generated = GeneratedExercise(
+                question_revision_id=str(row["id"]),
+                blueprint_id=str(row["blueprint_id"]),
+                status="READY",
+                verification_status=str(row["verification_method"]),
+                generation_version=GENERATION_VERSION,
+                prototype_id=prototype_id,
+                public=PublicExerciseProjection(
+                    schema_version="exercise.v2",
+                    blueprint_id=str(row["blueprint_id"]),
+                    question_revision=str(row["question_revision_hash"]),
+                    question_type=str(row["question_type"]),
+                    marks=int(blueprint["marks"]),
+                    question_text=_render_public_question(
+                        str(row["prompt_text"]),
+                        str(row["question_type"]),
+                        [str(value) for value in options],
+                    ),
+                    options=[str(value) for value in options],
+                    source_refs=[str(value) for value in source_refs],
+                    answer_policy=str(blueprint["answer_policy"]),
+                ),
+                private=PrivateExerciseProjection(
+                    answer=answer,
+                    steps=self._stored_steps(raw_steps, answer),
+                ),
+                references=self._references(evidence),
+                usage=[
+                    {"role": "QUESTION_READY_POOL", "status": "REUSED"},
+                    {"role": "QUESTION_AUTHOR", "status": "NOT_CALLED_READY_REUSE"},
+                    {"role": "QUESTION_BLIND_SOLVER", "status": "NOT_CALLED_READY_REUSE"},
+                ],
+            )
+        except (KeyError, TypeError, ValueError, ValidationError) as error:
+            raise QuestionEngineRuntimeError(
+                "READY_QUESTION_PROJECTION_INVALID",
+                "The compatible READY question could not be projected safely.",
+            ) from error
+        return generated.model_dump(mode="json")
+
+    def reuse_ready_or_generate(
+        self,
+        *,
+        owner_user_id: str,
+        workspace_id: str,
+        course_id: str,
+        private_course_id: str,
+        node_id: str,
+        operation_id: str,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
+        """Prefer the compatible READY pool; generate only when that pool is empty."""
+
+        ready = self.reuse_ready(
+            owner_user_id=owner_user_id,
+            workspace_id=workspace_id,
+            course_id=course_id,
+            private_course_id=private_course_id,
+            node_id=node_id,
+            operation_id=operation_id,
+            should_cancel=should_cancel,
+        )
+        if ready is not None:
+            return ready
+        return self.generate_one(
+            owner_user_id=owner_user_id,
+            workspace_id=workspace_id,
+            course_id=course_id,
+            private_course_id=private_course_id,
+            node_id=node_id,
+            operation_id=operation_id,
+            should_cancel=should_cancel,
+        )
+
+    def reuse_ready(
+        self,
+        *,
+        owner_user_id: str,
+        workspace_id: str,
+        course_id: str,
+        private_course_id: str,
+        node_id: str,
+        operation_id: str,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> dict[str, Any] | None:
+        """Return a compatible unexposed READY item without authoring a new one."""
+
+        objective, evidence, _blueprint = self._preflight_generate_one_inputs(
+            owner_user_id=owner_user_id,
+            workspace_id=workspace_id,
+            course_id=course_id,
+            private_course_id=private_course_id,
+            node_id=node_id,
+            operation_id=operation_id,
+            should_cancel=should_cancel,
+        )
+        ready = self._unused_ready_projection(
+            owner_user_id=owner_user_id,
+            workspace_id=workspace_id,
+            course_id=course_id,
+            objective=objective,
+            evidence=evidence,
+        )
+        return ready
+
+    def _claim_practice_operation(
+        self,
+        *,
+        owner_user_id: str,
+        workspace_id: str,
+        question_revision_id: str,
+        operation_id: str,
+        kind: Literal["HINT", "ATTEMPT"],
+        input_hash: str,
+    ) -> dict[str, Any] | None:
+        if not 8 <= len(operation_id.strip()) <= 100:
+            raise QuestionEngineRuntimeError(
+                "PRACTICE_OPERATION_REQUIRED",
+                "A stable practice operation id between 8 and 100 characters is required.",
+            )
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            inserted = connection.execute(
+                "INSERT OR IGNORE INTO practice_interaction_operations("
+                "workspace_id,operation_id,question_revision_id,owner_user_id,kind,"
+                "input_hash,status) "
+                "VALUES(?,?,?,?,?,?,'CLAIMED')",
+                (
+                    workspace_id,
+                    operation_id,
+                    question_revision_id,
+                    owner_user_id,
+                    kind,
+                    input_hash,
+                ),
+            ).rowcount
+            if inserted == 1:
+                connection.execute(
+                    "INSERT INTO practice_operation_metering_guards("
+                    "workspace_id,operation_id,guard_version) VALUES(?,?,'metered-practice.v1')",
+                    (workspace_id, operation_id),
+                )
+                connection.execute(
+                    "INSERT INTO practice_operation_retry_links("
+                    "workspace_id,prior_operation_id,new_operation_id,reconciliation_id) "
+                    "SELECT old.workspace_id,old.operation_id,?,reconciliation.id "
+                    "FROM practice_operation_reconciliations AS reconciliation "
+                    "JOIN practice_interaction_operations AS old "
+                    "ON old.workspace_id=reconciliation.workspace_id "
+                    "AND old.operation_id=reconciliation.operation_id "
+                    "WHERE old.workspace_id=? AND old.operation_id!=? "
+                    "AND old.question_revision_id=? AND old.owner_user_id=? "
+                    "AND old.kind=? AND old.input_hash=? "
+                    "AND NOT EXISTS(SELECT 1 FROM practice_operation_retry_links AS retry "
+                    "WHERE retry.reconciliation_id=reconciliation.id) "
+                    "ORDER BY reconciliation.created_at DESC,reconciliation.rowid DESC LIMIT 1",
+                    (
+                        operation_id,
+                        workspace_id,
+                        operation_id,
+                        question_revision_id,
+                        owner_user_id,
+                        kind,
+                        input_hash,
+                    ),
+                )
+            row = connection.execute(
+                "SELECT * FROM practice_interaction_operations "
+                "WHERE workspace_id=? AND operation_id=?",
+                (workspace_id, operation_id),
+            ).fetchone()
+        if inserted == 1:
+            return None
+        if row is None or any(
+            str(row[key]) != value
+            for key, value in (
+                ("question_revision_id", question_revision_id),
+                ("owner_user_id", owner_user_id),
+                ("kind", kind),
+                ("input_hash", input_hash),
+            )
+        ):
+            raise QuestionEngineRuntimeError(
+                "PRACTICE_IDEMPOTENCY_CONFLICT",
+                "The practice operation id is already bound to different input.",
+            )
+        if row["status"] == "COMPLETED":
+            return cast(dict[str, Any], json.loads(row["result_json"]))
+        if row["status"] == "FAILED":
+            raise QuestionEngineRuntimeError(
+                str(row["error_code"]),
+                "The original practice operation failed and was not billed again.",
+            )
+        with self.database.connect() as connection:
+            reconciliation = connection.execute(
+                "SELECT disposition FROM practice_operation_reconciliations "
+                "WHERE workspace_id=? AND operation_id=? "
+                "ORDER BY created_at DESC,rowid DESC LIMIT 1",
+                (workspace_id, operation_id),
+            ).fetchone()
+            stale = bool(
+                connection.execute(
+                    "SELECT COALESCE((julianday('now')-julianday(?))*86400 > ?,0)",
+                    (row["updated_at"], PRACTICE_OPERATION_ACTIVE_WINDOW_SECONDS),
+                ).fetchone()[0]
+            )
+        if reconciliation is not None:
+            disposition = str(reconciliation["disposition"])
+            if disposition in {"NOT_SENT", "UPSTREAM_FAILED"}:
+                raise QuestionEngineRuntimeError(
+                    "PRACTICE_OPERATION_RECOVERED",
+                    "The original operation was reconciled. Retry with a new request id; "
+                    "the new receipt will be linked to this operation.",
+                )
+            if disposition == "UPSTREAM_COMPLETED_NO_RESULT":
+                raise QuestionEngineRuntimeError(
+                    "PRACTICE_OPERATION_RESULT_UNAVAILABLE",
+                    "The provider call completed but no complete practice result was saved. "
+                    "Retry only with a new linked request id.",
+                )
+            raise QuestionEngineRuntimeError(
+                "PRACTICE_OPERATION_COST_UNKNOWN",
+                "The original provider outcome and cost remain unknown. Retry only with a new "
+                "linked request id after accepting possible duplicate cost.",
+            )
+        if stale:
+            raise QuestionEngineRuntimeError(
+                "PRACTICE_OPERATION_RECOVERY_REQUIRED",
+                "The practice operation did not finish and requires operator reconciliation.",
+            )
+        raise QuestionEngineRuntimeError(
+            "PRACTICE_OPERATION_IN_PROGRESS",
+            "The same practice operation is already in progress.",
+        )
+
+    def _fail_practice_operation(
+        self, *, workspace_id: str, operation_id: str, error_code: str
+    ) -> None:
+        try:
+            with self.database.connect() as connection:
+                connection.execute(
+                    "UPDATE practice_interaction_operations SET status='FAILED',error_code=?,"
+                    "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                    "WHERE workspace_id=? AND operation_id=? AND status='CLAIMED'",
+                    (error_code[:100], workspace_id, operation_id),
+                )
+        except Exception:
+            # Preserve the original stable provider/contract failure. A stale
+            # CLAIMED receipt still prevents a duplicate paid call.
+            return
+
+    def generate_hint(
+        self,
+        *,
+        owner_user_id: str,
+        workspace_id: str,
+        question_revision_id: str,
+        operation_id: str,
+        assignment_id: str | None = None,
+    ) -> dict[str, Any]:
+        context = self._practice_context(
+            owner_user_id=owner_user_id,
+            workspace_id=workspace_id,
+            question_revision_id=question_revision_id,
+        )
+        input_hash = _hash("HINT", question_revision_id, context)
+        exposure_key = hashlib.sha256(operation_id.encode("utf-8")).hexdigest()
+        try:
+            self.learning_loop.record_exposure(
+                owner_user_id=owner_user_id,
+                operation_id=f"hint-request-{exposure_key}",
+                question_revision_id=question_revision_id,
+                kind="HINT_REQUEST",
+                channel="PROBLEM_PANE",
+                receipt=f"hint-request:{operation_id}",
+                assignment_id=assignment_id,
+            )
+        except LearningLoopError as error:
+            raise QuestionEngineRuntimeError(error.code, str(error)) from error
+        replay = self._claim_practice_operation(
+            owner_user_id=owner_user_id,
+            workspace_id=workspace_id,
+            question_revision_id=question_revision_id,
+            operation_id=operation_id,
+            kind="HINT",
+            input_hash=input_hash,
+        )
+        if replay is not None:
+            return replay
+        try:
+            output, run = generate_practice_hint(
+                self._provider_for_operation(
+                    workspace_id=workspace_id,
+                    operation_id=operation_id,
+                ),
+                context=context,
+            )
+            event_id = f"ph_{uuid4().hex}"
+            result = {
+                "id": event_id,
+                "question_revision_id": question_revision_id,
+                "assistance": "HINT",
+                "independent": False,
+                "hint": output.hint,
+                "strategy": output.strategy,
+                "usage": _public_run(run),
+            }
+            try:
+                self.learning_loop.record_exposure(
+                    owner_user_id=owner_user_id,
+                    operation_id=f"hint-result-{exposure_key}",
+                    question_revision_id=question_revision_id,
+                    kind="HINT",
+                    channel="PROBLEM_PANE",
+                    receipt=f"hint-result:{operation_id}",
+                    assignment_id=assignment_id,
+                )
+            except LearningLoopError as error:
+                raise QuestionEngineRuntimeError(error.code, str(error)) from error
+            encoded_result = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+            with self.database.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    "INSERT INTO practice_hint_events("
+                    "id,workspace_id,question_revision_id,owner_user_id,operation_id,input_hash,"
+                    "hint_json,provider_run_json) VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        event_id,
+                        workspace_id,
+                        question_revision_id,
+                        owner_user_id,
+                        operation_id,
+                        input_hash,
+                        json.dumps(output.model_dump(mode="json"), ensure_ascii=False),
+                        json.dumps(run.model_dump(mode="json"), ensure_ascii=False),
+                    ),
+                )
+                updated = connection.execute(
+                    "UPDATE practice_interaction_operations SET status='COMPLETED',result_json=?,"
+                    "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                    "WHERE workspace_id=? AND operation_id=? AND status='CLAIMED'",
+                    (encoded_result, workspace_id, operation_id),
+                ).rowcount
+                if updated != 1:
+                    raise QuestionEngineRuntimeError(
+                        "PRACTICE_OPERATION_LOST", "The hint operation receipt was lost."
+                    )
+            return result
+        except QuestionEngineRuntimeError:
+            raise
+        except PracticeInteractionError as error:
+            self._fail_practice_operation(
+                workspace_id=workspace_id,
+                operation_id=operation_id,
+                error_code=error.code,
+            )
+            raise QuestionEngineRuntimeError(error.code, str(error)) from error
+
+    def submit_practice_attempt(
+        self,
+        *,
+        owner_user_id: str,
+        workspace_id: str,
+        question_revision_id: str,
+        operation_id: str,
+        submitted_answer: str,
+        assignment_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist the learner's answer and help snapshot before model grading.
+
+        This method performs no provider call.  A durable evaluation job is
+        committed with the canonical submission, so reveal/history traffic that
+        happens after this method returns cannot rewrite the frozen assistance
+        fact.
+        """
+
+        answer = submitted_answer.strip()
+        if not 1 <= len(answer) <= 6000:
+            raise QuestionEngineRuntimeError(
+                "PRACTICE_ANSWER_INVALID",
+                "A practice answer between 1 and 6000 characters is required.",
+            )
+        self._practice_context(
+            owner_user_id=owner_user_id,
+            workspace_id=workspace_id,
+            question_revision_id=question_revision_id,
+        )
+        if not 8 <= len(operation_id.strip()) <= 100:
+            raise QuestionEngineRuntimeError(
+                "PRACTICE_OPERATION_REQUIRED",
+                "A stable practice operation id between 8 and 100 characters is required.",
+            )
+        answer_hash = hashlib.sha256(answer.encode("utf-8")).hexdigest()
+        with self.database.connect() as connection:
+            existing = connection.execute(
+                "SELECT submission.*,job.status AS job_status,operation.result_json "
+                "FROM practice_submission_revisions AS submission "
+                "JOIN practice_evaluation_jobs AS job ON job.submission_id=submission.id "
+                "JOIN practice_interaction_operations AS operation "
+                "ON operation.workspace_id=submission.workspace_id "
+                "AND operation.operation_id=submission.operation_id "
+                "WHERE submission.workspace_id=? AND submission.operation_id=?",
+                (workspace_id, operation_id),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["owner_user_id"] != owner_user_id
+                    or existing["question_revision_id"] != question_revision_id
+                    or existing["answer_hash"] != answer_hash
+                ):
+                    raise QuestionEngineRuntimeError(
+                        "PRACTICE_IDEMPOTENCY_CONFLICT",
+                        "The practice operation id is already bound to different input.",
+                    )
+                if existing["result_json"]:
+                    return cast(dict[str, Any], json.loads(existing["result_json"]))
+                return {
+                    "id": existing["id"],
+                    "canonical_submission_id": existing["id"],
+                    "question_revision_id": question_revision_id,
+                    "status": existing["job_status"],
+                    "assistance": existing["assistance"],
+                    "independent": existing["assistance"] == "NONE",
+                    "feedback": None,
+                }
+        if assignment_id:
+            try:
+                linked = self.learning_loop.record_submission(
+                    owner_user_id=owner_user_id,
+                    operation_id=operation_id,
+                    assignment_id=assignment_id,
+                    answer=answer,
+                )
+            except LearningLoopError as error:
+                raise QuestionEngineRuntimeError(error.code, str(error)) from error
+            return {
+                "id": linked["canonical_submission_id"],
+                "canonical_submission_id": linked["canonical_submission_id"],
+                "question_revision_id": question_revision_id,
+                "status": "PENDING",
+                "assistance": linked["assistance"],
+                "independent": bool(linked["independent_at_submission"]),
+                "eligibility_reasons": linked["eligibility_reasons"],
+                "feedback": None,
+            }
+
+        # Legacy/non-loop practice still gains the same durable ordering.  It is
+        # not inserted into a learning cycle or counted in cycle metrics.
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            question = self.learning_loop._question(
+                connection,
+                owner_user_id=owner_user_id,
+                workspace_id=workspace_id,
+                question_revision_id=question_revision_id,
+            )
+            frozen_sequence = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(sequence),0) FROM learning_loop_exposures "
+                    "WHERE owner_user_id=? AND workspace_id=?",
+                    (owner_user_id, workspace_id),
+                ).fetchone()[0]
+            )
+            exposures = connection.execute(
+                "SELECT kind FROM learning_loop_exposures WHERE owner_user_id=? "
+                "AND workspace_id=? AND sequence<=? "
+                "AND (question_revision_id=? OR family_id=? OR question_content_hash=?)",
+                (
+                    owner_user_id, workspace_id, frozen_sequence, question_revision_id,
+                    question["family_id"], question["content_hash"],
+                ),
+            ).fetchall()
+            kinds = {str(row["kind"]) for row in exposures if row["kind"] != "STEM"}
+            assistance = (
+                "ANSWER_REVEALED"
+                if kinds & {"SOLUTION", "DETAIL"}
+                else "HINT" if kinds else "NONE"
+            )
+            input_hash = _hash(
+                "ATTEMPT_SUBMISSION",
+                question_revision_id,
+                answer_hash,
+                question["rubric_revision"],
+                frozen_sequence,
+            )
+            inserted = connection.execute(
+                "INSERT OR IGNORE INTO practice_interaction_operations("
+                "workspace_id,operation_id,question_revision_id,owner_user_id,kind,input_hash,status) "
+                "VALUES(?,?,?,?,?,?,'CLAIMED')",
+                (
+                    workspace_id, operation_id, question_revision_id, owner_user_id,
+                    "ATTEMPT", input_hash,
+                ),
+            ).rowcount
+            if inserted != 1:
+                raise QuestionEngineRuntimeError(
+                    "PRACTICE_IDEMPOTENCY_CONFLICT",
+                    "The practice operation id is already bound to different input.",
+                )
+            connection.execute(
+                "INSERT INTO practice_operation_metering_guards("
+                "workspace_id,operation_id,guard_version) VALUES(?,?,'metered-practice.v1')",
+                (workspace_id, operation_id),
+            )
+            submission_id = f"ps_{uuid4().hex}"
+            connection.execute(
+                "INSERT INTO practice_submission_revisions("
+                "id,workspace_id,question_revision_id,owner_user_id,operation_id,"
+                "submitted_answer,answer_hash,rubric_revision,assistance,exposure_sequence,"
+                "substantive) VALUES(?,?,?,?,?,?,?,?,?,?,1)",
+                (
+                    submission_id, workspace_id, question_revision_id, owner_user_id,
+                    operation_id, answer, answer_hash, question["rubric_revision"],
+                    assistance, frozen_sequence,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO practice_evaluation_jobs("
+                "submission_id,workspace_id,operation_id,status) VALUES(?,?,?,'PENDING')",
+                (submission_id, workspace_id, operation_id),
+            )
+        return {
+            "id": submission_id,
+            "canonical_submission_id": submission_id,
+            "question_revision_id": question_revision_id,
+            "status": "PENDING",
+            "assistance": assistance,
+            "independent": assistance == "NONE",
+            "feedback": None,
+        }
+
+    def evaluate_practice_attempt(
+        self,
+        *,
+        owner_user_id: str,
+        workspace_id: str,
+        question_revision_id: str,
+        operation_id: str,
+    ) -> dict[str, Any]:
+        """Claim and evaluate one durable submission exactly once per operation."""
+
+        context = self._practice_context(
+            owner_user_id=owner_user_id,
+            workspace_id=workspace_id,
+            question_revision_id=question_revision_id,
+        )
+        lease_owner = f"practice-evaluator-{uuid4().hex}"
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            submission = connection.execute(
+                "SELECT submission.*,job.status AS job_status,job.lease_expires_at "
+                "FROM practice_submission_revisions AS submission "
+                "JOIN practice_evaluation_jobs AS job ON job.submission_id=submission.id "
+                "WHERE submission.workspace_id=? AND submission.operation_id=? "
+                "AND submission.owner_user_id=? AND submission.question_revision_id=?",
+                (workspace_id, operation_id, owner_user_id, question_revision_id),
+            ).fetchone()
+            if submission is None:
+                raise QuestionEngineRuntimeError(
+                    "PRACTICE_SUBMISSION_NOT_FOUND", "The saved practice submission was not found."
+                )
+            operation = connection.execute(
+                "SELECT status,result_json,error_code FROM practice_interaction_operations "
+                "WHERE workspace_id=? AND operation_id=?",
+                (workspace_id, operation_id),
+            ).fetchone()
+            if operation["status"] == "COMPLETED":
+                return cast(dict[str, Any], json.loads(operation["result_json"]))
+            if operation["status"] == "FAILED":
+                raise QuestionEngineRuntimeError(
+                    str(operation["error_code"]), "The saved practice evaluation failed."
+                )
+            claimed = connection.execute(
+                "UPDATE practice_evaluation_jobs SET status='RUNNING',lease_owner=?,"
+                "lease_expires_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','+15 minutes'),"
+                "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                "WHERE submission_id=? AND (status='PENDING' OR (status='RUNNING' "
+                "AND lease_expires_at<=strftime('%Y-%m-%dT%H:%M:%fZ','now'))) ",
+                (lease_owner, submission["id"]),
+            ).rowcount
+            if claimed != 1:
+                raise QuestionEngineRuntimeError(
+                    "PRACTICE_EVALUATION_IN_PROGRESS",
+                    "The saved practice submission is already being evaluated.",
+                )
+        provider_context = {
+            **context,
+            "submitted_answer": str(submission["submitted_answer"]),
+            "assistance": str(submission["assistance"]),
+        }
+        try:
+            deterministic = _deterministic_single_choice_feedback(
+                context, str(submission["submitted_answer"])
+            )
+            if deterministic is not None:
+                output, run = deterministic
+            else:
+                output, run = generate_practice_feedback(
+                    self._provider_for_operation(
+                        workspace_id=workspace_id,
+                        operation_id=operation_id,
+                    ),
+                    context=provider_context,
+                )
+            expected = {str(item["criterion_id"]) for item in context["rubric"]}
+            actual = {item.criterion_id for item in output.criteria}
+            if actual != expected:
+                raise PracticeInteractionError(
+                    "PRACTICE_FEEDBACK_RUBRIC_MISMATCH",
+                    "The feedback did not cover the immutable practice rubric.",
+                )
+            attempt_id = f"pa_{uuid4().hex}"
+            status = "NEEDS_REVIEW" if output.verdict == "NEEDS_REVIEW" else "GRADED"
+            result = {
+                "id": attempt_id,
+                "canonical_submission_id": submission["id"],
+                "question_revision_id": question_revision_id,
+                "verdict": output.verdict,
+                "feedback": output.feedback,
+                "strengths": output.strengths,
+                "gaps": output.gaps,
+                "next_step": output.next_step,
+                "criteria": [item.model_dump(mode="json") for item in output.criteria],
+                "assistance": submission["assistance"],
+                "independent": submission["assistance"] == "NONE",
+                "status": status,
+                "usage": _public_run(run),
+            }
+            encoded_result = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+            with self.database.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                owned = connection.execute(
+                    "SELECT 1 FROM practice_evaluation_jobs WHERE submission_id=? "
+                    "AND status='RUNNING' AND lease_owner=?",
+                    (submission["id"], lease_owner),
+                ).fetchone()
+                if owned is None:
+                    raise QuestionEngineRuntimeError(
+                        "PRACTICE_EVALUATION_LEASE_LOST",
+                        "The practice evaluation lease was lost before the result was saved.",
+                    )
+                input_hash = connection.execute(
+                    "SELECT input_hash FROM practice_interaction_operations "
+                    "WHERE workspace_id=? AND operation_id=?",
+                    (workspace_id, operation_id),
+                ).fetchone()[0]
+                connection.execute(
+                    "INSERT INTO practice_question_attempts("
+                    "id,workspace_id,question_revision_id,owner_user_id,operation_id,input_hash,"
+                    "submitted_answer,assistance,status,feedback_json,provider_run_json) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        attempt_id, workspace_id, question_revision_id, owner_user_id,
+                        operation_id, input_hash, submission["submitted_answer"],
+                        submission["assistance"], status,
+                        json.dumps(output.model_dump(mode="json"), ensure_ascii=False),
+                        json.dumps(
+                            run.model_dump(mode="json")
+                            if hasattr(run, "model_dump")
+                            else run,
+                            ensure_ascii=False,
+                        ),
+                    ),
+                )
+                updated = connection.execute(
+                    "UPDATE practice_interaction_operations SET status='COMPLETED',result_json=?,"
+                    "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                    "WHERE workspace_id=? AND operation_id=? AND status='CLAIMED'",
+                    (encoded_result, workspace_id, operation_id),
+                ).rowcount
+                if updated != 1:
+                    raise QuestionEngineRuntimeError(
+                        "PRACTICE_OPERATION_LOST", "The attempt operation receipt was lost."
+                    )
+                connection.execute(
+                    "UPDATE practice_evaluation_jobs SET status='COMPLETED',lease_owner=NULL,"
+                    "lease_expires_at=NULL,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                    "WHERE submission_id=? AND lease_owner=?",
+                    (submission["id"], lease_owner),
+                )
+                self.learning_loop.attach_evaluation_in_transaction(
+                    connection,
+                    owner_user_id=owner_user_id,
+                    canonical_submission_id=str(submission["id"]),
+                    canonical_evaluation_id=attempt_id,
+                    outcome=str(output.verdict),
+                )
+            return result
+        except QuestionEngineRuntimeError as error:
+            self._mark_evaluation_unknown(
+                submission_id=str(submission["id"]),
+                lease_owner=lease_owner,
+                error_code=error.code,
+            )
+            raise
+        except PracticeInteractionError as error:
+            if error.code.endswith("_PROVIDER_FAILED"):
+                self._mark_evaluation_unknown(
+                    submission_id=str(submission["id"]),
+                    lease_owner=lease_owner,
+                    error_code=error.code,
+                )
+                raise QuestionEngineRuntimeError(
+                    "PRACTICE_EVALUATION_UNKNOWN",
+                    "The provider outcome is unknown; no automatic paid retry was made.",
+                ) from error
+            try:
+                with self.database.connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    connection.execute(
+                        "UPDATE practice_evaluation_jobs SET status='FAILED',error_code=?,"
+                        "lease_owner=NULL,lease_expires_at=NULL,"
+                        "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                        "WHERE submission_id=? AND lease_owner=?",
+                        (error.code[:100], submission["id"], lease_owner),
+                    )
+                    connection.execute(
+                        "UPDATE practice_interaction_operations SET status='FAILED',error_code=?,"
+                        "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                        "WHERE workspace_id=? AND operation_id=? AND status='CLAIMED'",
+                        (error.code[:100], workspace_id, operation_id),
+                    )
+                    link = connection.execute(
+                        "SELECT link.cycle_id,link.owner_user_id FROM learning_loop_submission_links "
+                        "AS link WHERE link.canonical_submission_id=?",
+                        (submission["id"],),
+                    ).fetchone()
+                    if link is not None:
+                        self.learning_loop._record_reliability_in_connection(
+                            connection,
+                            owner_user_id=str(link["owner_user_id"]),
+                            cycle_id=str(link["cycle_id"]),
+                            operation_id=str(operation_id),
+                            stage="GRADE",
+                            status="FAILED",
+                        )
+            finally:
+                raise QuestionEngineRuntimeError(error.code, str(error)) from error
+        except Exception as error:
+            self._mark_evaluation_unknown(
+                submission_id=str(submission["id"]),
+                lease_owner=lease_owner,
+                error_code="PRACTICE_EVALUATION_UNKNOWN",
+            )
+            raise QuestionEngineRuntimeError(
+                "PRACTICE_EVALUATION_UNKNOWN",
+                "The evaluation outcome is unknown; no automatic paid retry was made.",
+            ) from error
+
+    def _mark_evaluation_unknown(
+        self, *, submission_id: str, lease_owner: str, error_code: str
+    ) -> None:
+        try:
+            with self.database.connect() as connection:
+                submission = connection.execute(
+                    "SELECT owner_user_id,operation_id FROM practice_submission_revisions "
+                    "WHERE id=?",
+                    (submission_id,),
+                ).fetchone()
+                connection.execute(
+                    "UPDATE practice_evaluation_jobs SET status='UNKNOWN',error_code=?,"
+                    "lease_owner=NULL,lease_expires_at=NULL,"
+                    "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                    "WHERE submission_id=? AND status='RUNNING' AND lease_owner=?",
+                    (error_code[:100], submission_id, lease_owner),
+                )
+                link = connection.execute(
+                    "SELECT cycle_id,owner_user_id FROM learning_loop_submission_links "
+                    "WHERE canonical_submission_id=?",
+                    (submission_id,),
+                ).fetchone()
+                if submission is not None and link is not None:
+                    self.learning_loop._record_reliability_in_connection(
+                        connection,
+                        owner_user_id=str(link["owner_user_id"]),
+                        cycle_id=str(link["cycle_id"]),
+                        operation_id=str(submission["operation_id"]),
+                        stage="GRADE",
+                        status="UNKNOWN",
+                    )
+        except Exception:
+            # Preserve the original exception. A remaining lease expires into
+            # explicit reconciliation; this function never starts a paid retry.
+            return
+
+    def practice_state(
+        self,
+        *,
+        owner_user_id: str,
+        workspace_id: str,
+        question_revision_id: str,
+    ) -> dict[str, Any]:
+        """Return the learner-visible interaction projection without private answers."""
+
+        self._practice_context(
+            owner_user_id=owner_user_id,
+            workspace_id=workspace_id,
+            question_revision_id=question_revision_id,
+        )
+        with self.database.connect() as connection:
+            hint_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM practice_hint_events WHERE workspace_id=? "
+                    "AND question_revision_id=?",
+                    (workspace_id, question_revision_id),
+                ).fetchone()[0]
+            )
+            hint = connection.execute(
+                "SELECT operation.result_json FROM practice_hint_events AS event "
+                "JOIN practice_interaction_operations AS operation "
+                "ON operation.workspace_id=event.workspace_id "
+                "AND operation.operation_id=event.operation_id "
+                "WHERE event.workspace_id=? AND event.question_revision_id=? "
+                "ORDER BY event.created_at DESC,event.rowid DESC LIMIT 1",
+                (workspace_id, question_revision_id),
+            ).fetchone()
+            attempt = connection.execute(
+                "SELECT operation.result_json FROM practice_question_attempts AS item "
+                "JOIN practice_interaction_operations AS operation "
+                "ON operation.workspace_id=item.workspace_id "
+                "AND operation.operation_id=item.operation_id "
+                "WHERE item.workspace_id=? AND item.question_revision_id=? "
+                "ORDER BY item.created_at DESC,item.rowid DESC LIMIT 1",
+                (workspace_id, question_revision_id),
+            ).fetchone()
+            pending = connection.execute(
+                "SELECT submission.id,submission.operation_id,submission.assistance,"
+                "job.status,job.error_code "
+                "FROM practice_submission_revisions AS submission "
+                "JOIN practice_evaluation_jobs AS job ON job.submission_id=submission.id "
+                "WHERE submission.workspace_id=? AND submission.question_revision_id=? "
+                "ORDER BY submission.created_at DESC,submission.rowid DESC LIMIT 1",
+                (workspace_id, question_revision_id),
+            ).fetchone()
+        latest_attempt = json.loads(attempt["result_json"]) if attempt else None
+        if latest_attempt is None and pending is not None:
+            latest_attempt = {
+                "id": pending["id"],
+                "canonical_submission_id": pending["id"],
+                "operation_id": pending["operation_id"],
+                "question_revision_id": question_revision_id,
+                "status": pending["status"],
+                "assistance": pending["assistance"],
+                "independent": pending["assistance"] == "NONE",
+                "feedback": None,
+                "error_code": pending["error_code"],
+            }
+        return {
+            "hint_count": hint_count,
+            "latest_hint": json.loads(hint["result_json"]) if hint else None,
+            "latest_attempt": latest_attempt,
+        }
+
+    def grade_practice_attempt(
+        self,
+        *,
+        owner_user_id: str,
+        workspace_id: str,
+        question_revision_id: str,
+        operation_id: str,
+        submitted_answer: str,
+        answer_revealed: bool = False,
+    ) -> dict[str, Any]:
+        # Kept for trusted non-HTTP internal callers. The browser path records
+        # reveal before calling submit. Compatibility callers used to pass the
+        # same server-known fact directly, so append that fact to the unified
+        # exposure ledger before freezing the submission instead of discarding it.
+        if answer_revealed:
+            try:
+                self.learning_loop.record_exposure(
+                    owner_user_id=owner_user_id,
+                    operation_id=f"{operation_id}:reveal",
+                    question_revision_id=question_revision_id,
+                    kind="SOLUTION",
+                    channel="QUESTION",
+                    receipt=f"compat-reveal:{workspace_id}:{operation_id}",
+                )
+            except LearningLoopError as error:
+                raise QuestionEngineRuntimeError(error.code, str(error)) from error
+        self.submit_practice_attempt(
+            owner_user_id=owner_user_id,
+            workspace_id=workspace_id,
+            question_revision_id=question_revision_id,
+            operation_id=operation_id,
+            submitted_answer=submitted_answer,
+        )
+        return self.evaluate_practice_attempt(
+            owner_user_id=owner_user_id,
+            workspace_id=workspace_id,
+            question_revision_id=question_revision_id,
+            operation_id=operation_id,
+        )
+
+    def _grade_practice_attempt_legacy(
+        self,
+        *,
+        owner_user_id: str,
+        workspace_id: str,
+        question_revision_id: str,
+        operation_id: str,
+        submitted_answer: str,
+        answer_revealed: bool,
+    ) -> dict[str, Any]:
+        answer = submitted_answer.strip()
+        if not 1 <= len(answer) <= 6000:
+            raise QuestionEngineRuntimeError(
+                "PRACTICE_ANSWER_INVALID",
+                "A practice answer between 1 and 6000 characters is required.",
+            )
+        context = self._practice_context(
+            owner_user_id=owner_user_id,
+            workspace_id=workspace_id,
+            question_revision_id=question_revision_id,
+        )
+        with self.database.connect() as connection:
+            hinted = connection.execute(
+                "SELECT 1 FROM practice_hint_events WHERE workspace_id=? "
+                "AND question_revision_id=? LIMIT 1",
+                (workspace_id, question_revision_id),
+            ).fetchone()
+        assistance = "ANSWER_REVEALED" if answer_revealed else "HINT" if hinted else "NONE"
+        provider_context = {
+            **context,
+            "submitted_answer": answer,
+            "assistance": assistance,
+        }
+        input_hash = _hash("ATTEMPT", question_revision_id, provider_context)
+        replay = self._claim_practice_operation(
+            owner_user_id=owner_user_id,
+            workspace_id=workspace_id,
+            question_revision_id=question_revision_id,
+            operation_id=operation_id,
+            kind="ATTEMPT",
+            input_hash=input_hash,
+        )
+        if replay is not None:
+            return replay
+        try:
+            output, run = generate_practice_feedback(
+                self._provider_for_operation(
+                    workspace_id=workspace_id,
+                    operation_id=operation_id,
+                ),
+                context=provider_context,
+            )
+            expected = {str(item["criterion_id"]) for item in context["rubric"]}
+            actual = {item.criterion_id for item in output.criteria}
+            if actual != expected:
+                raise PracticeInteractionError(
+                    "PRACTICE_FEEDBACK_RUBRIC_MISMATCH",
+                    "The feedback did not cover the immutable practice rubric.",
+                )
+            attempt_id = f"pa_{uuid4().hex}"
+            status = "NEEDS_REVIEW" if output.verdict == "NEEDS_REVIEW" else "GRADED"
+            result = {
+                "id": attempt_id,
+                "question_revision_id": question_revision_id,
+                "verdict": output.verdict,
+                "feedback": output.feedback,
+                "strengths": output.strengths,
+                "gaps": output.gaps,
+                "next_step": output.next_step,
+                "criteria": [item.model_dump(mode="json") for item in output.criteria],
+                "assistance": assistance,
+                "independent": assistance == "NONE",
+                "status": status,
+                "usage": _public_run(run),
+            }
+            encoded_result = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+            with self.database.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    "INSERT INTO practice_question_attempts("
+                    "id,workspace_id,question_revision_id,owner_user_id,operation_id,input_hash,"
+                    "submitted_answer,assistance,status,feedback_json,provider_run_json) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        attempt_id,
+                        workspace_id,
+                        question_revision_id,
+                        owner_user_id,
+                        operation_id,
+                        input_hash,
+                        answer,
+                        assistance,
+                        status,
+                        json.dumps(output.model_dump(mode="json"), ensure_ascii=False),
+                        json.dumps(run.model_dump(mode="json"), ensure_ascii=False),
+                    ),
+                )
+                updated = connection.execute(
+                    "UPDATE practice_interaction_operations SET status='COMPLETED',result_json=?,"
+                    "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                    "WHERE workspace_id=? AND operation_id=? AND status='CLAIMED'",
+                    (encoded_result, workspace_id, operation_id),
+                ).rowcount
+                if updated != 1:
+                    raise QuestionEngineRuntimeError(
+                        "PRACTICE_OPERATION_LOST", "The attempt operation receipt was lost."
+                    )
+            return result
+        except QuestionEngineRuntimeError:
+            raise
+        except PracticeInteractionError as error:
+            self._fail_practice_operation(
+                workspace_id=workspace_id,
+                operation_id=operation_id,
+                error_code=error.code,
+            )
+            raise QuestionEngineRuntimeError(error.code, str(error)) from error
+
+    @staticmethod
+    def _check_cancelled(should_cancel: Callable[[], bool] | None) -> None:
+        """Fail closed between bounded external stages when the UI run was stopped.
+
+        The provider SDK is synchronous, so an in-flight HTTP request remains
+        bounded by its configured timeout.  This cooperative check guarantees
+        that a cross-worker cancellation observed after that request cannot
+        advance to another paid stage or publish a question revision.
+        """
+
+        if should_cancel is None:
+            return
+        try:
+            cancelled = bool(should_cancel())
+        except Exception as error:
+            raise QuestionEngineRuntimeError(
+                "QUESTION_CANCELLATION_CHECK_FAILED",
+                "The exercise cancellation state could not be verified.",
+            ) from error
+        if cancelled:
+            raise QuestionEngineRuntimeError(
+                "QUESTION_CANCELLED", "The exercise request was cancelled."
+            )
+
+    def _select_prototype(
+        self,
+        *,
+        owner_user_id: str,
+        course_id: str,
+        workspace_id: str,
+        objective: TeachingObjective,
+    ) -> _Prototype:
+        if self.semantic_decisions is None:
+            return _PROTOTYPES["worked_application"]
+        selected = callsites.select_exercise_prototype(
+            self.semantic_decisions,
+            node={
+                "node_id": objective.node_id,
+                "spec_version": objective.spec_version,
+                "objective_id": objective.item_id,
+                "objective": objective.objective,
+            },
+            eligible_prototypes=tuple(_PROTOTYPES),
+            recent_exposures=self._recent_exposures(workspace_id, objective.node_id),
+            learning_evidence={
+                "requirement": objective.requirement,
+                "acceptance": objective.acceptance,
+            },
+            scope=self.semantic_decisions.scope(
+                owner_user_id=owner_user_id,
+                authorization_scope="exercise",
+                course_id=course_id,
+                workspace_id=workspace_id,
+                node_id=objective.node_id,
+                spec_version=objective.spec_version,
+            ),
+        )
+        return _PROTOTYPES.get(selected, _PROTOTYPES["worked_application"])
+
+    @staticmethod
+    def _canonical_blueprint(
+        *,
+        blueprint_kind: Literal["practice", "assessment"],
+        course_id: str,
+        objective: TeachingObjective,
+        evidence: QuestionEvidencePack,
+        identity_parts: tuple[object, ...],
+        bloom_target: BloomTarget,
+        target_difficulty: int,
+        difficulty_features: list[DifficultyFeature],
+        question_type: QuestionType,
+        expected_answer_form: AnswerForm,
+        marks: float,
+        scoring_criteria: list[str],
+        misconception_targets: list[str],
+        generation_policy_version: str,
+    ) -> QuestionBlueprint:
+        operation_hash = _hash(
+            course_id,
+            objective.node_id,
+            objective.spec_version,
+            objective.item_id,
+            *identity_parts,
+        )
+        return QuestionBlueprint(
+            blueprint_id=f"{blueprint_kind}_{operation_hash[:32]}",
+            course_id=course_id,
+            node_id=objective.node_id,
+            spec_version=objective.spec_version,
+            spec_content_hash=objective.spec_content_hash,
+            objective_id=objective.item_id,
+            objective_text=objective.objective,
+            source_scope=evidence.source_scope(),
+            bloom_target=bloom_target,
+            target_difficulty=target_difficulty,
+            difficulty_features=difficulty_features,
+            question_type=question_type,
+            expected_answer_form=expected_answer_form,
+            marks=marks,
+            scoring_criteria=scoring_criteria,
+            assumptions=[],
+            conditions=[],
+            unit_conventions=[],
+            misconception_targets=misconception_targets,
+            question_family_id=f"{blueprint_kind}_family_{operation_hash[:24]}",
+            variant_seed=int(operation_hash[:8], 16),
+            visibility_policy="OWNER_ONLY",
+            answer_policy="HIDDEN_UNTIL_REVEAL",
+            prompt_versions={"question_author": QUESTION_AUTHOR_PROMPT_VERSION},
+            generation_policy_version=generation_policy_version,
+        )
+
+    @staticmethod
+    def _blueprint(
+        *,
+        course_id: str,
+        objective: TeachingObjective,
+        evidence: QuestionEvidencePack,
+        prototype: _Prototype,
+        operation_id: str,
+    ) -> QuestionBlueprint:
+        return QuestionEngineRuntime._canonical_blueprint(
+            blueprint_kind="practice",
+            course_id=course_id,
+            objective=objective,
+            evidence=evidence,
+            identity_parts=(operation_id,),
+            bloom_target=prototype.bloom_target,
+            target_difficulty=prototype.target_difficulty,
+            difficulty_features=list(prototype.difficulty_features),
+            question_type=prototype.question_type,
+            expected_answer_form=prototype.expected_answer_form,
+            marks=100,
+            scoring_criteria=[objective.acceptance],
+            misconception_targets=[],
+            generation_policy_version=prototype.generation_policy_version,
+        )
+
+    @staticmethod
+    def _assessment_blueprint(
+        *,
+        course_id: str,
+        objective: TeachingObjective,
+        evidence: QuestionEvidencePack,
+        slot: AssessmentQuestionSlot,
+        preparation_key: str,
+    ) -> QuestionBlueprint:
+        return QuestionEngineRuntime._canonical_blueprint(
+            blueprint_kind="assessment",
+            course_id=course_id,
+            objective=objective,
+            evidence=evidence,
+            identity_parts=(preparation_key, slot.model_dump(mode="json")),
+            bloom_target=slot.bloom_target,
+            target_difficulty=slot.target_difficulty,
+            difficulty_features=slot.difficulty_features,
+            question_type=slot.question_type,
+            expected_answer_form=slot.expected_answer_form,
+            marks=slot.marks,
+            scoring_criteria=[objective.acceptance, slot.scoring_focus],
+            misconception_targets=[slot.misconception_target],
+            generation_policy_version=ASSESSMENT_GENERATION_POLICY_VERSION,
+        )
+
+    def _apply_hybrid_review(
+        self,
+        *,
+        candidate: Any,
+        blueprint: QuestionBlueprint,
+        evidence: QuestionEvidencePack,
+        blind: BlindSolveReceipt,
+        signals: QuestionSemanticSignals,
+        report: QuestionValidationReport,
+        owner_user_id: str,
+        workspace_id: str,
+        course_id: str,
+        node_id: str,
+        objective: TeachingObjective,
+    ) -> tuple[QuestionSemanticSignals, QuestionValidationReport]:
+        """Let the qualified hybrid chain decide when the local one could not.
+
+        The hybrid chain is consulted only when the local/TypeSafe chain did not
+        already validate the candidate.  A ``REJECTED`` report (a deterministic
+        hard-gate failure) is never passed on: a model vote cannot overturn a
+        deterministic refusal.  If the hybrid chain produces a durable,
+        reference-verified, in-scope receipt whose every required case passed,
+        its projected verdicts replace the fallback signals and the report is
+        recomputed through the unchanged validator.
+        """
+        if self.hybrid_reviewer is None or report.status == "REJECTED":
+            return signals, report
+        if report.status == "VALIDATED":
+            return signals, report
+        try:
+            outcome = self.hybrid_reviewer.review(
+                candidate=candidate,
+                blueprint=blueprint,
+                evidence=evidence,
+                blind_receipt=blind,
+                deterministic_report=report,
+                owner_user_id=owner_user_id,
+                workspace_id=workspace_id,
+                course_id=course_id,
+                node_id=node_id,
+                spec_version=objective.spec_version,
+            )
+        except QuestionEngineRuntimeError:
+            raise
+        except HybridReviewUnavailable as error:
+            raise QuestionEngineRuntimeError(error.code, str(error)) from error
+        if outcome is None:
+            return signals, report
+        if not outcome.accepted:
+            return signals, report
+        revised = validate_question_candidate(
+            candidate=candidate,
+            blueprint=blueprint,
+            evidence=evidence,
+            blind_receipt=blind,
+            semantic_signals=outcome.signals,
+        )
+        if revised.status != "VALIDATED":
+            return signals, report
+        return outcome.signals, revised
+
+    def _execute_pipeline(
+        self,
+        *,
+        owner_user_id: str,
+        workspace_id: str,
+        course_id: str,
+        node_id: str,
+        objective: TeachingObjective,
+        evidence: QuestionEvidencePack,
+        blueprint: QuestionBlueprint,
+        should_cancel: Callable[[], bool] | None,
+        model_operation_id: str | None = None,
+    ) -> tuple[Any, Any, Any, Any]:
+        """Run author, blind solve, validation and READY persistence for one blueprint."""
+
+        self._check_cancelled(should_cancel)
+        provider = self._provider_for_operation(
+            workspace_id=workspace_id,
+            operation_id=model_operation_id,
+        )
+        try:
+            candidate = author_question(
+                provider,
+                blueprint=blueprint,
+                evidence=evidence,
+            )
+        except AuthorGenerationError as error:
+            # Re-ask exactly once, and only when the refusal is an incomplete task
+            # contract.  That failure is detected before any review is paid for, and
+            # it is a commission the author routinely gets right on a second sample:
+            # roughly two in five campus items were lost to a missing role, which is
+            # the dominant reason that course cannot reach the qualification's recall
+            # floor.  A provider response that was received and explicitly rejected
+            # as SCHEMA_INVALID is also safe to resample once: its outcome is known,
+            # unlike an unknown transport request, and production proved that both
+            # the author and blind solver can return this recoverable refusal.
+            # Both contract refusals are retried.  AUTHOR_CONTRACT_INVALID means the
+            # contract did not satisfy its own schema and AUTHOR_CONTRACT_INCOMPLETE
+            # means it declared a profile whose required roles it did not supply;
+            # both are detected before any review is paid for, and both are
+            # commissions a resample routinely fixes.  Production hit the first of
+            # them on a live SQL preparation six attempts in, which is what showed
+            # the distinction was too narrow.
+            provider_schema_rejected = bool(
+                error.provider_run
+                and error.provider_run.get("error_class") == "SCHEMA_INVALID"
+            )
+            if (
+                error.code not in {"AUTHOR_CONTRACT_INCOMPLETE", "AUTHOR_CONTRACT_INVALID"}
+                and not provider_schema_rejected
+            ):
+                raise
+            candidate = author_question(
+                provider,
+                blueprint=blueprint,
+                evidence=evidence,
+            )
+        self._check_cancelled(should_cancel)
+        try:
+            blind = run_blind_solve(
+                provider,
+                candidate=candidate,
+                evidence=evidence,
+            )
+        except BlindSolveError as error:
+            # Retry only a completed, known-bad schema response.  Transport-unknown,
+            # blocked and semantic failures remain terminal to avoid duplicate spend
+            # or weakening the independent-solve gate.
+            provider_schema_rejected = bool(
+                error.provider_run
+                and error.provider_run.get("error_class") == "SCHEMA_INVALID"
+            )
+            if not provider_schema_rejected:
+                raise
+            blind = run_blind_solve(
+                provider,
+                candidate=candidate,
+                evidence=evidence,
+            )
+        self._check_cancelled(should_cancel)
+        scope = (
+            self.semantic_decisions.scope(
+                owner_user_id=owner_user_id,
+                authorization_scope="question_validation",
+                course_id=course_id,
+                workspace_id=workspace_id,
+                node_id=node_id,
+                spec_version=objective.spec_version,
+                question_hash=candidate.question_revision,
+            )
+            if self.semantic_decisions is not None
+            else SemanticDecisionService.scope(
+                owner_user_id=owner_user_id,
+                authorization_scope="question_validation",
+                course_id=course_id,
+                workspace_id=workspace_id,
+                node_id=node_id,
+                spec_version=objective.spec_version,
+                question_hash=candidate.question_revision,
+            )
+        )
+        signals = collect_question_semantic_signals(
+            self.semantic_decisions,
+            candidate=candidate,
+            blueprint=blueprint,
+            evidence=evidence,
+            blind_receipt=blind,
+            scope=scope,
+        )
+        self._check_cancelled(should_cancel)
+        report = validate_question_candidate(
+            candidate=candidate,
+            blueprint=blueprint,
+            evidence=evidence,
+            blind_receipt=blind,
+            semantic_signals=signals,
+        )
+        signals, report = self._apply_hybrid_review(
+            candidate=candidate,
+            blueprint=blueprint,
+            evidence=evidence,
+            blind=blind,
+            signals=signals,
+            report=report,
+            owner_user_id=owner_user_id,
+            workspace_id=workspace_id,
+            course_id=course_id,
+            node_id=node_id,
+            objective=objective,
+        )
+        if self.semantic_decisions is None and self.hybrid_reviewer is None:
+            raise QuestionEngineRuntimeError(
+                "QUESTION_REVIEW_UNAVAILABLE",
+                "Question semantic review is unavailable; no exercise was published.",
+            )
+        self._check_cancelled(should_cancel)
+        persisted = persist_question_candidate(
+            database=self.database,
+            owner_user_id=owner_user_id,
+            workspace_id=workspace_id,
+            blueprint=blueprint,
+            evidence=evidence,
+            candidate=candidate,
+            blind_receipt=blind,
+            validation_report=report,
+            semantic_decisions=self.semantic_decisions,
+        )
+        if persisted.status != "READY" or persisted.verification_method != "AI_REVIEWED":
+            raise QuestionEngineRuntimeError(
+                "QUESTION_NOT_READY",
+                "The question did not pass all current validation gates and was not published.",
+            )
+        return persisted, candidate, blind, report
+
+    def _execute_source_bound_author(
+        self,
+        *,
+        owner_user_id: str,
+        workspace_id: str,
+        course_id: str,
+        node_id: str,
+        objective: TeachingObjective,
+        evidence: QuestionEvidencePack,
+        blueprint: QuestionBlueprint,
+        should_cancel: Callable[[], bool] | None,
+        model_operation_id: str | None,
+        blueprint_payload: dict[str, object] | None = None,
+    ) -> tuple[Any, Any]:
+        """Author once, then apply the trusted source/shape/private-field host gate."""
+
+        self._check_cancelled(should_cancel)
+        provider = self._provider_for_operation(
+            workspace_id=workspace_id, operation_id=model_operation_id
+        )
+        candidate = author_question(
+            provider,
+            blueprint=blueprint,
+            evidence=evidence,
+            require_task_contract=False,
+        )
+        self._check_cancelled(should_cancel)
+        persisted = persist_source_bound_candidate(
+            database=self.database,
+            owner_user_id=owner_user_id,
+            workspace_id=workspace_id,
+            blueprint=blueprint,
+            evidence=evidence,
+            candidate=candidate,
+            blueprint_payload=blueprint_payload,
+        )
+        if persisted.status != "READY" or persisted.verification_method != "MODEL_ONLY":
+            raise QuestionEngineRuntimeError(
+                "QUESTION_NOT_READY",
+                "The source-bound question was not published for student use.",
+            )
+        return persisted, candidate
+
+    def _existing_assessment_slot(
+        self,
+        *,
+        owner_user_id: str,
+        workspace_id: str,
+        blueprint: QuestionBlueprint,
+        evidence: QuestionEvidencePack,
+    ) -> tuple[str, list[dict[str, Any]]] | None:
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                "SELECT provenance.question_revision_id,provenance.question_revision_hash,"
+                "provenance.blueprint_hash,"
+                "provenance.evidence_pack_hash,provenance.publication_status,"
+                "provenance.author_run_json,provenance.blind_run_json,"
+                "provenance.validation_report_json,"
+                "question.validation_status,question.verification_method "
+                "FROM question_engine_provenance AS provenance "
+                "JOIN assessment_question_revisions AS question "
+                "ON question.id=provenance.question_revision_id "
+                "WHERE provenance.workspace_id=? AND provenance.blueprint_id=?",
+                (workspace_id, blueprint.blueprint_id),
+            ).fetchall()
+        if not rows:
+            return None
+        # Provenance is append-only: a candidate that reached NEEDS_REVIEW or
+        # REJECTED must remain available for audit, but it is not a reusable
+        # Assessment slot.  Recovery may author a later immutable revision for
+        # the same stable slot.  Select only the exact current READY revision;
+        # no such row means the caller should generate the missing slot.
+        current_rows = [
+            row
+            for row in rows
+            if str(row["blueprint_hash"]) == blueprint.identity()
+            and str(row["evidence_pack_hash"]) == evidence.identity()
+            and str(row["publication_status"]) == "READY"
+            and str(row["validation_status"]) == "VALIDATED"
+            and str(row["verification_method"]) == "AI_REVIEWED"
+        ]
+        if not current_rows:
+            return None
+        if len(current_rows) != 1:
+            raise QuestionEngineRuntimeError(
+                "ASSESSMENT_SLOT_CONFLICT",
+                "The assessment slot is bound to more than one current READY question revision.",
+            )
+        row = current_rows[0]
+        try:
+            author_run = json.loads(str(row["author_run_json"]))
+            blind_run = json.loads(str(row["blind_run_json"]))
+            report = json.loads(str(row["validation_report_json"]))
+            signals = report["semantic_signals"]
+            expected_definitions = {
+                "AMBIGUITY": "question.ambiguity.v1",
+                "AUTHOR_BLIND_AGREEMENT": "question.answer_agreement.v1",
+            }
+            specialized_dimension = required_specialized_semantic_dimension(blueprint)
+            if specialized_dimension == "MCQ_DISTRACTOR_QUALITY":
+                expected_definitions[specialized_dimension] = (
+                    "question.mcq_distractor_quality.v1"
+                )
+            elif specialized_dimension == "RULE_VIOLATION_QUALITY":
+                expected_definitions[specialized_dimension] = (
+                    "question.rule_violation_quality.v1"
+                )
+            if not isinstance(signals, list) or len(signals) != len(expected_definitions):
+                raise ValueError("semantic signals are incomplete")
+            dimensions = [signal["dimension"] for signal in signals]
+            receipts = [signal["receipt_id"] for signal in signals]
+        except (KeyError, TypeError, ValueError) as error:
+            raise QuestionEngineRuntimeError(
+                "ASSESSMENT_SLOT_RECEIPT_INVALID",
+                "The saved assessment slot receipts could not be verified.",
+            ) from error
+        if (
+            set(dimensions) != set(expected_definitions)
+            or not all(isinstance(receipt, str) and receipt for receipt in receipts)
+        ):
+            raise QuestionEngineRuntimeError(
+                "ASSESSMENT_SLOT_RECEIPT_INVALID",
+                "The saved assessment slot receipts could not be verified.",
+            )
+        paths = [signal.get("path") for signal in signals]
+        jev_receipts = [
+            receipt
+            for signal, receipt in zip(signals, receipts, strict=True)
+            if str(signal.get("path")) == "jev"
+        ]
+        # The historical chain needs one distinct durable row per dimension.  A
+        # hybrid-strict-v1 receipt is a single row that covers every required
+        # case of the revision, so it is verified per dimension instead.
+        if len(set(jev_receipts)) != len(jev_receipts) or any(
+            path not in {"jev", "hybrid"} for path in paths
+        ):
+            raise QuestionEngineRuntimeError(
+                "ASSESSMENT_SLOT_RECEIPT_INVALID",
+                "The saved assessment slot receipts could not be verified.",
+            )
+        with self.database.connect() as connection:
+            receipt_rows = connection.execute(
+                "SELECT * FROM jev_decision_receipts WHERE id IN ("
+                + ",".join("?" for _ in jev_receipts or [""])
+                + ")",
+                jev_receipts or [""],
+            ).fetchall()
+        receipts_by_id = {str(receipt["id"]): receipt for receipt in receipt_rows}
+        expected_scope = owner_scope_hash(owner_user_id, "question_validation")
+        for signal in signals:
+            if str(signal.get("path")) == "hybrid":
+                with self.database.connect() as connection:
+                    current_receipt = durable_hybrid_receipt_for_dimension(
+                        connection,
+                        receipt_id=str(signal["receipt_id"]),
+                        owner_user_id=owner_user_id,
+                        workspace_id=workspace_id,
+                        course_id=blueprint.course_id,
+                        node_id=blueprint.node_id,
+                        spec_version=blueprint.spec_version,
+                        question_revision_hash=str(row["question_revision_hash"]),
+                        verdict=str(signal["verdict"]),
+                        dimension=str(signal["dimension"]),
+                    )
+                if not current_receipt:
+                    raise QuestionEngineRuntimeError(
+                        "ASSESSMENT_SLOT_RECEIPT_INVALID",
+                        "The saved assessment slot receipts could not be verified.",
+                    )
+                continue
+            receipt = receipts_by_id.get(str(signal["receipt_id"]))
+            try:
+                output = json.loads(str(receipt["output_json"])) if receipt is not None else None
+                current_receipt = (
+                    receipt is not None
+                    and signal["used_jev"] is True
+                    and signal["path"] == "jev"
+                    and str(receipt["definition_key"])
+                    == expected_definitions[signal["dimension"]]
+                    and str(receipt["primitive"]) == "Choice"
+                    and str(receipt["mode"]) == "on"
+                    and str(receipt["caller_role"]) == "question_validator"
+                    and str(receipt["owner_scope_hash"]) == expected_scope
+                    and str(receipt["course_id"]) == blueprint.course_id
+                    and str(receipt["workspace_id"]) == workspace_id
+                    and str(receipt["node_id"]) == blueprint.node_id
+                    and str(receipt["spec_version"]) == str(blueprint.spec_version)
+                    and str(receipt["question_hash"]) == str(row["question_revision_hash"])
+                    and str(receipt["outcome"]) == "ok"
+                    and isinstance(output, dict)
+                    and output.get("choice") == signal["verdict"]
+                )
+            except (KeyError, TypeError, ValueError):
+                current_receipt = False
+            if not current_receipt:
+                raise QuestionEngineRuntimeError(
+                    "ASSESSMENT_SLOT_RECEIPT_INVALID",
+                    "The saved assessment slot receipts could not be verified.",
+                )
+        usage = [
+            _public_run(author_run),
+            _public_run(blind_run),
+            {"role": "QUESTION_VALIDATOR", "semantic_receipts": receipts},
+        ]
+        return str(row["question_revision_id"]), usage
+
+    def _record_assessment_slot(
+        self,
+        *,
+        preparation_key: str,
+        workspace_id: str,
+        slot: AssessmentQuestionSlot,
+        objective: TeachingObjective,
+        blueprint: QuestionBlueprint,
+        question_revision_id: str,
+    ) -> None:
+        values = (
+            preparation_key,
+            workspace_id,
+            slot.ordinal,
+            slot.slot_key,
+            slot.marks,
+            objective.item_id,
+            blueprint.blueprint_id,
+            question_revision_id,
+            blueprint.question_family_id,
+        )
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            configured = connection.execute(
+                "SELECT 1 FROM assessment_configurations WHERE id=? AND workspace_id=? "
+                "AND status='FROZEN'",
+                (preparation_key, workspace_id),
+            ).fetchone()
+            if configured is not None:
+                config_values = (
+                    preparation_key,
+                    workspace_id,
+                    slot.slot_key,
+                    slot.ordinal,
+                    question_revision_id,
+                    blueprint.question_family_id,
+                    blueprint.blueprint_id,
+                    objective.item_id,
+                    slot.primary_point_id if isinstance(slot, PointQuestionSlot) else None,
+                )
+                connection.execute(
+                    "INSERT OR IGNORE INTO assessment_configuration_questions("
+                    "configuration_id,workspace_id,slot_id,ordinal,question_revision_id,"
+                    "family_id,blueprint_id,objective_id,primary_point_id) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    config_values,
+                )
+                row = connection.execute(
+                    "SELECT configuration_id,workspace_id,slot_id,ordinal,question_revision_id,"
+                    "family_id,blueprint_id,objective_id,primary_point_id "
+                    "FROM assessment_configuration_questions "
+                    "WHERE configuration_id=? AND slot_id=?",
+                    (preparation_key, slot.slot_key),
+                ).fetchone()
+                if row is None or tuple(row) != config_values:
+                    raise QuestionEngineRuntimeError(
+                        "ASSESSMENT_SLOT_CONFLICT",
+                        "The configured Assessment slot is already bound to different input.",
+                    )
+                return
+            connection.execute(
+                "INSERT OR IGNORE INTO assessment_preparation_questions("
+                "preparation_job_id,workspace_id,ordinal,slot_key,marks,objective_id,"
+                "blueprint_id,question_revision_id,family_id) VALUES(?,?,?,?,?,?,?,?,?)",
+                values,
+            )
+            row = connection.execute(
+                "SELECT preparation_job_id,workspace_id,ordinal,slot_key,marks,objective_id,"
+                "blueprint_id,question_revision_id,family_id "
+                "FROM assessment_preparation_questions "
+                "WHERE preparation_job_id=? AND ordinal=?",
+                (preparation_key, slot.ordinal),
+            ).fetchone()
+        if row is None or tuple(row) != values:
+            raise QuestionEngineRuntimeError(
+                "ASSESSMENT_SLOT_CONFLICT",
+                "The assessment preparation slot is already bound to different input.",
+            )
+
+    def resolve_point_dispatch(
+        self,
+        *,
+        owner_user_id: str,
+        workspace_id: str,
+        course_id: str,
+        private_course_id: str,
+        node_id: str,
+        configuration_id: str,
+        slots: tuple[PointQuestionSlot, ...] | None,
+        content_language: str | None,
+    ) -> tuple[ResolvedPointDispatch, ...]:
+        return resolve_point_dispatch(
+            self.database,
+            self.point_store,
+            owner_user_id=owner_user_id,
+            workspace_id=workspace_id,
+            course_id=course_id,
+            private_course_id=private_course_id,
+            node_id=node_id,
+            configuration_id=configuration_id,
+            slots=slots,
+            content_language=content_language,
+        )
+
+    def point_question_inputs(
+        self,
+        *,
+        owner_user_id: str,
+        workspace_id: str,
+        course_id: str,
+        private_course_id: str,
+        node_id: str,
+        configuration_id: str,
+        slots: tuple[PointQuestionSlot, ...] | None,
+        content_language: str | None,
+    ) -> tuple[AssessmentPointQuestionInput, ...]:
+        resolved = self.resolve_point_dispatch(
+            owner_user_id=owner_user_id,
+            workspace_id=workspace_id,
+            course_id=course_id,
+            private_course_id=private_course_id,
+            node_id=node_id,
+            configuration_id=configuration_id,
+            slots=slots,
+            content_language=content_language,
+        )
+        return tuple(
+            build_point_question_input(
+                item,
+                owner_user_id=owner_user_id,
+                workspace_id=workspace_id,
+                course_id=course_id,
+                private_course_id=private_course_id,
+                node_id=node_id,
+            )
+            for item in resolved
+        )
+
+    def point_ready_for(
+        self,
+        workspace: sqlite3.Row,
+        node: sqlite3.Row,
+        question_revision_id: str,
+    ) -> bool:
+        """Revalidate a generated point revision before a future assessment opens."""
+
+        if self.deterministic_point_publisher is None:
+            return False
+        with self.database.connect() as connection:
+            saved = connection.execute(
+                "SELECT point_input_json FROM assessment_point_deterministic_provenance "
+                "WHERE question_revision_id=? AND workspace_id=?",
+                (question_revision_id, workspace["id"]),
+            ).fetchone()
+        if saved is None:
+            return False
+        try:
+            point_input = AssessmentPointQuestionInput.model_validate_json(
+                saved["point_input_json"]
+            )
+            if (
+                point_input.owner_user_id != workspace["owner_user_id"]
+                or point_input.course_id != workspace["course_id"]
+                or point_input.private_course_id != workspace["private_course_id"]
+                or point_input.node_id != node["id"]
+                or point_input.spec_version != node["spec_version"]
+            ):
+                return False
+            claim = ModelCallClaim(
+                request_id="point-ready-read:" + point_input.identity(),
+                owner_user_id=point_input.owner_user_id,
+                course_id=point_input.course_id,
+                content_language=point_input.content_language,
+                verify=lambda: None,
+            )
+            result = self.deterministic_point_publisher.read_ready(claim, point_input)
+            return (
+                result is not None
+                and result.question_revision_id == question_revision_id
+            )
+        except (ApiError, ValidationError, ValueError, KeyError, TypeError):
+            return False
+
+    def generate_assessment_set(
+        self,
+        *,
+        owner_user_id: str,
+        workspace_id: str,
+        course_id: str,
+        private_course_id: str,
+        node_id: str,
+        preparation_key: str,
+        slots: tuple[AssessmentQuestionSlot, ...] | None = None,
+        operation_id: str | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+        progress: Callable[[dict[str, Any]], None] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Prepare complementary READY revisions for one frozen configuration."""
+
+        if not 8 <= len(preparation_key.strip()) <= 100:
+            raise QuestionEngineRuntimeError(
+                "ASSESSMENT_PREPARATION_KEY_REQUIRED",
+                "A stable assessment preparation key between 8 and 100 characters is required.",
+            )
+        if self.metered_generate is not None and operation_id is None:
+            raise QuestionEngineRuntimeError(
+                "QUESTION_METERING_REQUIRED",
+                "Integrated assessment generation requires a claimed metered operation.",
+            )
+        try:
+            self._check_cancelled(should_cancel)
+            workspace = workspace_for(self.database, workspace_id, owner_user_id)
+            if (
+                str(workspace["course_id"]) != course_id
+                or str(workspace["private_course_id"]) != private_course_id
+            ):
+                raise QuestionEngineRuntimeError(
+                    "QUESTION_WORKSPACE_MISMATCH",
+                    "The assessment request does not match the learner workspace.",
+                )
+            point_slots = tuple(slots or ())
+            if point_slots and any(isinstance(slot, PointQuestionSlot) for slot in point_slots):
+                if not all(isinstance(slot, PointQuestionSlot) for slot in point_slots):
+                    raise QuestionEngineRuntimeError(
+                        "ASSESSMENT_POINT_SLOT_MISMATCH",
+                        "Point and legacy slots cannot be mixed in one frozen configuration.",
+                    )
+                if (
+                    self.deterministic_point_publisher is None
+                    and not self.source_bound_student_entry
+                ):
+                    raise QuestionEngineRuntimeError(
+                        "ASSESSMENT_POINT_METHOD_NOT_QUALIFIED",
+                        "The source-bound point preparation method is unavailable.",
+                    )
+                inputs = self.point_question_inputs(
+                    owner_user_id=owner_user_id,
+                    workspace_id=workspace_id,
+                    course_id=course_id,
+                    private_course_id=private_course_id,
+                    node_id=node_id,
+                    configuration_id=preparation_key,
+                    slots=cast(tuple[PointQuestionSlot, ...], point_slots),
+                    content_language=None,
+                )
+                prepared_points: list[dict[str, Any]] = []
+                for point_input in inputs:
+                    self._check_cancelled(should_cancel)
+                    if progress is not None:
+                        progress(
+                            {
+                                "ordinal": point_input.point_slot.ordinal,
+                                "stage": "DETERMINISTIC_PROOF",
+                                "prepared_slots": len(prepared_points),
+                            }
+                        )
+                    claim = ModelCallClaim(
+                        request_id=(operation_id or "point-deterministic:")
+                        + point_input.identity(),
+                        owner_user_id=owner_user_id,
+                        course_id=course_id,
+                        content_language=point_input.content_language,
+                        verify=lambda: self._check_cancelled(should_cancel),
+                    )
+                    result = (
+                        self.deterministic_point_publisher.prepare_or_read(
+                            claim, point_input, operation_id=operation_id
+                        )
+                        if self.deterministic_point_publisher is not None
+                        else None
+                    )
+                    candidate = None
+                    if result is None:
+                        if not self.source_bound_student_entry:
+                            raise QuestionEngineRuntimeError(
+                                "ASSESSMENT_POINT_METHOD_NOT_QUALIFIED",
+                                "This point requires the configured generation method.",
+                            )
+                        if progress is not None:
+                            progress(
+                                {
+                                    "ordinal": point_input.point_slot.ordinal,
+                                    "stage": "AUTHORING_COMPLETE_QUESTION",
+                                    "prepared_slots": len(prepared_points),
+                                }
+                            )
+                        target = point_input.targets[0]
+                        objective = TeachingObjective(
+                            node_id=point_input.node_id,
+                            spec_version=point_input.spec_version,
+                            spec_content_hash=point_input.spec_content_hash,
+                            item_id=target.item_id,
+                            requirement=target.requirement,
+                            objective=target.objective,
+                            acceptance=target.acceptance,
+                            evidence_ids=tuple(target.evidence.evidence_ids),
+                        )
+                        blueprint = self._assessment_blueprint(
+                            course_id=course_id,
+                            objective=objective,
+                            evidence=target.evidence,
+                            slot=point_input.point_slot,
+                            preparation_key=preparation_key,
+                        )
+                        result, candidate = self._execute_source_bound_author(
+                            owner_user_id=owner_user_id,
+                            workspace_id=workspace_id,
+                            course_id=course_id,
+                            node_id=node_id,
+                            objective=objective,
+                            evidence=target.evidence,
+                            blueprint=blueprint,
+                            should_cancel=should_cancel,
+                            model_operation_id=operation_id,
+                            blueprint_payload={
+                                **blueprint.model_dump(mode="json"),
+                                "point_input": point_input.model_dump(mode="json"),
+                            },
+                        )
+                    with self.database.connect() as connection:
+                        question = connection.execute(
+                            "SELECT family_id FROM assessment_question_revisions WHERE id=?",
+                            (result.question_revision_id,),
+                        ).fetchone()
+                    if candidate is not None:
+                        self._record_assessment_slot(
+                            preparation_key=preparation_key,
+                            workspace_id=workspace_id,
+                            slot=point_input.point_slot,
+                            objective=objective,
+                            blueprint=blueprint,
+                            question_revision_id=result.question_revision_id,
+                        )
+                    prepared_points.append(
+                        {
+                            "slot_key": point_input.point_slot.slot_key,
+                            "ordinal": point_input.point_slot.ordinal,
+                            "marks": point_input.point_slot.marks,
+                            "blueprint_id": point_input.blueprint_id,
+                            "family_id": str(question["family_id"]),
+                            "question_revision_id": result.question_revision_id,
+                            "verification_status": result.verification_method,
+                            "usage": (
+                                []
+                                if candidate is None
+                                else [_public_run(candidate.provider_run)]
+                            ),
+                        }
+                    )
+                    if progress is not None:
+                        progress(
+                            {
+                                "ordinal": point_input.point_slot.ordinal,
+                                "stage": "SLOT_READY",
+                                "prepared_slots": len(prepared_points),
+                            }
+                        )
+                return prepared_points
+            with self.database.connect() as connection:
+                version = connection.execute(
+                    "SELECT MAX(version) FROM teaching_specs WHERE node_id=?", (node_id,)
+                ).fetchone()[0]
+                item_rows = connection.execute(
+                    "SELECT item_id FROM teaching_items WHERE node_id=? AND spec_version=? "
+                    "AND requirement='REQUIRED' ORDER BY ordinal,item_id",
+                    (node_id, version),
+                ).fetchall()
+                objectives = [
+                    resolve_objective(
+                        connection,
+                        node_id=node_id,
+                        spec_version=int(version),
+                        item_id=str(row["item_id"]),
+                    )
+                    for row in item_rows
+                ]
+            if not objectives:
+                raise QuestionEngineRuntimeError(
+                    "NO_REQUIRED_ITEM",
+                    "The node has no REQUIRED teaching objective for an assessment.",
+                )
+
+            prepared: list[dict[str, Any]] = []
+            for slot in (slots or default_assessment_question_slots()):
+                self._check_cancelled(should_cancel)
+                if progress is not None:
+                    progress(
+                        {
+                            "ordinal": slot.ordinal,
+                            "stage": "RESOLVING_EVIDENCE",
+                            "prepared_slots": len(prepared),
+                        }
+                    )
+                objective = objectives[(slot.ordinal - 1) % len(objectives)]
+                evidence = build_evidence_pack(
+                    self.database,
+                    objective=objective,
+                    access=EvidencePackAccess(
+                        owner_user_id=owner_user_id,
+                        course_id=course_id,
+                        private_course_id=private_course_id,
+                    ),
+                )
+                blueprint = self._assessment_blueprint(
+                    course_id=course_id,
+                    objective=objective,
+                    evidence=evidence,
+                    slot=slot,
+                    preparation_key=preparation_key,
+                )
+                existing = self._existing_assessment_slot(
+                    owner_user_id=owner_user_id,
+                    workspace_id=workspace_id,
+                    blueprint=blueprint,
+                    evidence=evidence,
+                )
+                if existing is None:
+                    if progress is not None:
+                        progress(
+                            {
+                                "ordinal": slot.ordinal,
+                                "stage": "AUTHOR_AND_BLIND_SOLVE",
+                                "prepared_slots": len(prepared),
+                            }
+                        )
+                    persisted, candidate, blind, report = self._execute_pipeline(
+                        owner_user_id=owner_user_id,
+                        workspace_id=workspace_id,
+                        course_id=course_id,
+                        node_id=node_id,
+                        objective=objective,
+                        evidence=evidence,
+                        blueprint=blueprint,
+                        should_cancel=should_cancel,
+                        model_operation_id=operation_id,
+                    )
+                    question_revision_id = persisted.question_revision_id
+                    usage = [
+                        _public_run(candidate.provider_run),
+                        _public_run(blind.provider_run),
+                        {
+                            "role": "QUESTION_VALIDATOR",
+                            "semantic_receipts": [
+                                signal.receipt_id
+                                for signal in report.semantic_signals
+                                if signal.receipt_id is not None
+                            ],
+                        },
+                    ]
+                else:
+                    question_revision_id, usage = existing
+                self._record_assessment_slot(
+                    preparation_key=preparation_key,
+                    workspace_id=workspace_id,
+                    slot=slot,
+                    objective=objective,
+                    blueprint=blueprint,
+                    question_revision_id=question_revision_id,
+                )
+                prepared.append(
+                    {
+                        "slot_key": slot.slot_key,
+                        "ordinal": slot.ordinal,
+                        "marks": slot.marks,
+                        "blueprint_id": blueprint.blueprint_id,
+                        "family_id": blueprint.question_family_id,
+                        "question_revision_id": question_revision_id,
+                        "verification_status": "AI_REVIEWED",
+                        "usage": usage,
+                    }
+                )
+                if progress is not None:
+                    progress(
+                        {
+                            "ordinal": slot.ordinal,
+                            "stage": "SLOT_READY",
+                            "prepared_slots": len(prepared),
+                        }
+                    )
+            return prepared
+        except QuestionEngineRuntimeError:
+            raise
+        except (
+            ObjectiveResolutionError,
+            EvidencePackError,
+            AuthorGenerationError,
+            BlindSolveError,
+            QuestionPersistenceError,
+            ValidationError,
+        ) as error:
+            raise QuestionEngineRuntimeError(
+                getattr(error, "code", "QUESTION_ENGINE_FAILED"),
+                "The assessment set could not be prepared from verified course evidence.",
+            ) from error
+        except (ApiError, TypeError) as error:
+            code = error.code if isinstance(error, ApiError) else "NO_TEACHING_SPEC"
+            message = (
+                error.message
+                if isinstance(error, ApiError)
+                else "No Teaching Spec was found."
+            )
+            raise QuestionEngineRuntimeError(code, message) from error
+
+    @staticmethod
+    def _steps(candidate: Any) -> list[ExerciseAnswerStep]:
+        steps: list[ExerciseAnswerStep] = []
+        for step in candidate.private_solution.solution_steps:
+            body = f"{step.result}\n\n{step.explanation}".strip()
+            if step.ordinal == len(candidate.private_solution.solution_steps):
+                answer = candidate.private_solution.candidate_answer.strip()
+                if answer.casefold() not in body.casefold():
+                    body = f"{body}\n\n结论：{answer}"
+            steps.append(
+                ExerciseAnswerStep(
+                    step_id=f"step_{step.ordinal}",
+                    ordinal=step.ordinal,
+                    title=step.operation,
+                    text=body,
+                    source_refs=step.source_refs,
+                )
+            )
+        return steps
+
+    @staticmethod
+    def _references(evidence: QuestionEvidencePack) -> list[ExerciseReference]:
+        return [
+            ExerciseReference(
+                id=fragment.evidence_id,
+                document_id=fragment.document_id,
+                document_version_id=fragment.document_version_id,
+                filename=fragment.filename,
+                source_scope=fragment.source_scope,
+                locator_type=fragment.locator_type,
+                locator_value=fragment.locator_value,
+                section=fragment.section,
+            )
+            for fragment in evidence.fragments
+        ]
+
+    def _preflight_generate_one_inputs(
+        self,
+        *,
+        owner_user_id: str,
+        workspace_id: str,
+        course_id: str,
+        private_course_id: str,
+        node_id: str,
+        operation_id: str,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> tuple[TeachingObjective, QuestionEvidencePack, QuestionBlueprint]:
+        """Resolve and validate every local input before any Jev/model call.
+
+        The deterministic worked-application prototype is used only to exercise
+        the exact production blueprint builder and validator.  Live prototype
+        selection remains a later, optional semantic decision; therefore a bad
+        objective or evidence binding cannot consume even a shadow Jev call.
+        This method intentionally creates no operation or reservation rows.
+        """
+
+        if not 8 <= len(operation_id.strip()) <= 100:
+            raise QuestionEngineRuntimeError(
+                "QUESTION_OPERATION_REQUIRED",
+                "A stable exercise operation id between 8 and 100 characters is required.",
+            )
+        try:
+            self._check_cancelled(should_cancel)
+            workspace = workspace_for(self.database, workspace_id, owner_user_id)
+            if (
+                str(workspace["course_id"]) != course_id
+                or str(workspace["private_course_id"]) != private_course_id
+            ):
+                raise QuestionEngineRuntimeError(
+                    "QUESTION_WORKSPACE_MISMATCH",
+                    "The exercise request does not match the learner workspace.",
+                )
+            with self.database.connect() as connection:
+                objective = resolve_objective(connection, node_id=node_id)
+            evidence = build_evidence_pack(
+                self.database,
+                objective=objective,
+                access=EvidencePackAccess(
+                    owner_user_id=owner_user_id,
+                    course_id=course_id,
+                    private_course_id=private_course_id,
+                ),
+            )
+            blueprint = self._blueprint(
+                course_id=course_id,
+                objective=objective,
+                evidence=evidence,
+                prototype=_PROTOTYPES["worked_application"],
+                operation_id=operation_id,
+            )
+            return objective, evidence, blueprint
+        except QuestionEngineRuntimeError:
+            raise
+        except ValidationError as error:
+            raise QuestionEngineRuntimeError(
+                "QUESTION_BLUEPRINT_INVALID",
+                "The local question blueprint failed its field contract before any provider call.",
+            ) from error
+        except (ObjectiveResolutionError, EvidencePackError) as error:
+            raise QuestionEngineRuntimeError(
+                getattr(error, "code", "QUESTION_PREFLIGHT_FAILED"),
+                "The question inputs failed local preflight before any provider call.",
+            ) from error
+
+    def preflight_generate_one(
+        self,
+        *,
+        owner_user_id: str,
+        workspace_id: str,
+        course_id: str,
+        private_course_id: str,
+        node_id: str,
+        operation_id: str,
+    ) -> dict[str, Any]:
+        """Return a content-safe, zero-transport proof of the actual blueprint."""
+
+        objective, evidence, blueprint = self._preflight_generate_one_inputs(
+            owner_user_id=owner_user_id,
+            workspace_id=workspace_id,
+            course_id=course_id,
+            private_course_id=private_course_id,
+            node_id=node_id,
+            operation_id=operation_id,
+        )
+        return {
+            "status": "STATIC_PREFLIGHT_PASSED",
+            "objective_id": objective.item_id,
+            "blueprint": blueprint.model_dump(mode="json"),
+            "blueprint_hash": blueprint.identity(),
+            "evidence_pack_hash": evidence.identity(),
+            "evidence_count": len(evidence.fragments),
+        }
+
+    def generate_one(
+        self,
+        *,
+        owner_user_id: str,
+        workspace_id: str,
+        course_id: str,
+        private_course_id: str,
+        node_id: str,
+        operation_id: str,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
+        """Generate, independently solve, validate and persist one question."""
+
+        objective, evidence, preflight_blueprint = self._preflight_generate_one_inputs(
+            owner_user_id=owner_user_id,
+            workspace_id=workspace_id,
+            course_id=course_id,
+            private_course_id=private_course_id,
+            node_id=node_id,
+            operation_id=operation_id,
+            should_cancel=should_cancel,
+        )
+        operation_claimed = False
+        try:
+            self._check_cancelled(should_cancel)
+            if self.metered_generate is not None:
+                self._claim_generation_operation(
+                    workspace_id=workspace_id,
+                    operation_id=operation_id,
+                    request_hash=_hash(
+                        "question-generation.v1",
+                        owner_user_id,
+                        course_id,
+                        private_course_id,
+                        node_id,
+                    ),
+                )
+                operation_claimed = True
+            self._check_cancelled(should_cancel)
+            prototype = self._select_prototype(
+                owner_user_id=owner_user_id,
+                course_id=course_id,
+                workspace_id=workspace_id,
+                objective=objective,
+            )
+            self._check_cancelled(should_cancel)
+            blueprint = (
+                preflight_blueprint
+                if prototype.prototype_id == "worked_application"
+                else self._blueprint(
+                    course_id=course_id,
+                    objective=objective,
+                    evidence=evidence,
+                    prototype=prototype,
+                    operation_id=operation_id,
+                )
+            )
+            if self.source_bound_student_entry:
+                persisted, candidate = self._execute_source_bound_author(
+                    owner_user_id=owner_user_id,
+                    workspace_id=workspace_id,
+                    course_id=course_id,
+                    node_id=node_id,
+                    objective=objective,
+                    evidence=evidence,
+                    blueprint=blueprint,
+                    should_cancel=should_cancel,
+                    model_operation_id=operation_id,
+                )
+                blind = report = None
+            else:
+                persisted, candidate, blind, report = self._execute_pipeline(
+                    owner_user_id=owner_user_id,
+                    workspace_id=workspace_id,
+                    course_id=course_id,
+                    node_id=node_id,
+                    objective=objective,
+                    evidence=evidence,
+                    blueprint=blueprint,
+                    should_cancel=should_cancel,
+                    model_operation_id=operation_id,
+                )
+        except QuestionEngineRuntimeError:
+            if operation_claimed:
+                self._fail_generation_operation(
+                    workspace_id=workspace_id,
+                    operation_id=operation_id,
+                )
+            raise
+        except (
+            ObjectiveResolutionError,
+            EvidencePackError,
+            AuthorGenerationError,
+            BlindSolveError,
+            QuestionPersistenceError,
+            ValidationError,
+        ) as error:
+            if operation_claimed:
+                self._fail_generation_operation(
+                    workspace_id=workspace_id,
+                    operation_id=operation_id,
+                )
+            raise QuestionEngineRuntimeError(
+                getattr(error, "code", "QUESTION_ENGINE_FAILED"),
+                "The exercise could not be prepared from the current verified course evidence.",
+            ) from error
+        except ApiError as error:
+            if operation_claimed:
+                self._fail_generation_operation(
+                    workspace_id=workspace_id,
+                    operation_id=operation_id,
+                )
+            raise QuestionEngineRuntimeError(error.code, error.message) from error
+        except Exception as error:
+            if operation_claimed:
+                self._fail_generation_operation(
+                    workspace_id=workspace_id,
+                    operation_id=operation_id,
+                )
+            raise QuestionEngineRuntimeError(
+                "QUESTION_ENGINE_FAILED",
+                "The exercise failed after its operation was claimed; its exact request "
+                "state was preserved and will not be replayed automatically.",
+            ) from error
+
+        usage = [_public_run(candidate.provider_run)]
+        if blind is not None and report is not None:
+            usage.extend(
+                [
+                    _public_run(blind.provider_run),
+                    {
+                        "role": "QUESTION_VALIDATOR",
+                        "semantic_receipts": [
+                            signal.receipt_id
+                            for signal in report.semantic_signals
+                            if signal.receipt_id is not None
+                        ],
+                    },
+                ]
+            )
+        else:
+            usage.extend(
+                [
+                    {
+                        "role": "QUESTION_BLIND_SOLVER",
+                        "status": "NOT_CALLED_STUDENT_ENTRY_POLICY",
+                    },
+                    {
+                        "role": "QUESTION_VALIDATOR",
+                        "status": "HOST_SOURCE_AND_STRUCTURE_VALIDATED",
+                    },
+                ]
+            )
+        generated = GeneratedExercise(
+            question_revision_id=persisted.question_revision_id,
+            blueprint_id=blueprint.blueprint_id,
+            status="READY",
+            verification_status=persisted.verification_method,
+            generation_version=GENERATION_VERSION,
+            prototype_id=prototype.prototype_id,
+            public=candidate.public_payload(),
+            private=PrivateExerciseProjection(
+                answer=candidate.private_solution.candidate_answer,
+                steps=self._steps(candidate),
+            ),
+            references=self._references(evidence),
+            usage=usage,
+        )
+        if operation_claimed:
+            self._finish_generation_operation(
+                workspace_id=workspace_id,
+                operation_id=operation_id,
+                question_revision_id=persisted.question_revision_id,
+            )
+        return generated.model_dump(mode="json")

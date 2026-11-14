@@ -1,0 +1,515 @@
+from __future__ import annotations
+
+import base64
+import io
+import json
+from dataclasses import replace
+from pathlib import Path
+
+import httpx
+import pytest
+from PIL import Image
+from pydantic import SecretStr
+
+from app.config import Settings
+from app.visual.providers.aliyun_eas import (
+    AlibabaEASComfyProvider,
+    ProviderAuthenticationError,
+    ProviderProtocolError,
+)
+from app.visual.providers.base import ProviderState
+from app.visual.spec import Renderer
+from app.visual.workflows import WorkflowRegistry
+
+REGISTRY = Path(__file__).parents[1] / "app" / "visual" / "workflows" / "registry.example.json"
+
+
+def test_native_wan_savevideo_downloads_mp4_from_images_collection() -> None:
+    video_bytes = b"\x00\x00\x00\x18ftypisom" + b"transport-fixture"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/history/wan-job":
+            return httpx.Response(
+                200,
+                json={
+                    "wan-job": {
+                        "status": {"completed": True},
+                        "outputs": {
+                            "9": {
+                                "images": [
+                                    {
+                                        "filename": "wan_00001.mp4",
+                                        "subfolder": "coursejesus/video",
+                                        "type": "output",
+                                    }
+                                ],
+                                "animated": [True],
+                            }
+                        },
+                    }
+                },
+            )
+        assert request.url.path == "/view"
+        assert request.url.params["filename"] == "wan_00001.mp4"
+        return httpx.Response(200, content=video_bytes, headers={"content-type": "video/mp4"})
+
+    provider = _provider(handler)
+    provider.workflow = replace(provider.workflow, renderer_type=Renderer.COMFY_VIDEO)
+    result = provider.get_result("wan-job")
+    assert result.content == video_bytes
+    assert result.mime_type == "video/mp4"
+
+
+@pytest.mark.parametrize(
+    "filename,mime",
+    [("image.png", "image/png"), ("../wan.mp4", "video/mp4"), ("wan.mp4", "text/html")],
+)
+def test_video_output_rejects_wrong_media_and_unsafe_references(filename, mime) -> None:
+    view_calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/history/"):
+            return httpx.Response(
+                200,
+                json={
+                    "wan-job": {
+                        "status": {"completed": True},
+                        "outputs": {"9": {"images": [{"filename": filename, "type": "output"}]}},
+                    }
+                },
+            )
+        view_calls.append(request.url)
+        return httpx.Response(200, content=b"fixture", headers={"content-type": mime})
+
+    provider = _provider(handler)
+    provider.workflow = replace(provider.workflow, renderer_type=Renderer.COMFY_VIDEO)
+    with pytest.raises(ProviderProtocolError):
+        provider.get_result("wan-job")
+    if filename.startswith("../"):
+        assert not view_calls
+
+
+def _provider(handler) -> AlibabaEASComfyProvider:
+    registry = WorkflowRegistry.load(REGISTRY)
+    # Keep the legacy transport fixture without enabling it for production.
+    workflow = next(
+        item for item in registry._workflows if item.workflow_id == "coursejesus-comfy-image-v1"
+    )
+    return AlibabaEASComfyProvider(
+        endpoint="https://eas.example.invalid",
+        token="secret-token-must-not-leak",
+        workflow=workflow,
+        timeout_seconds=3.0,
+        max_output_bytes=1024 * 1024,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+
+def _video_provider(handler) -> AlibabaEASComfyProvider:
+    registry = WorkflowRegistry.load(REGISTRY)
+    return AlibabaEASComfyProvider(
+        endpoint="https://eas.example.invalid",
+        token="secret-token-must-not-leak",
+        workflow=registry.select(Renderer.COMFY_VIDEO, "aliyun_eas"),
+        timeout_seconds=3.0,
+        max_output_bytes=1024 * 1024,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+
+def _compiled() -> dict[str, object]:
+    return {
+        "positive_prompt": "a grounded CPU pipeline illustration",
+        "negative_prompt": "watermark, unsafe text",
+        "seed": 123,
+        "width": 768,
+        "height": 512,
+        "steps": 24,
+        "cfg": 7.5,
+    }
+
+
+def _start_frame_b64(*, width: int = 1280, height: int = 704) -> str:
+    image = Image.new("RGB", (width, height), "white")
+    image.putpixel((width // 2, height // 2), (20, 40, 60))
+    output = io.BytesIO()
+    image.save(output, format="PNG")
+    return base64.b64encode(output.getvalue()).decode("ascii")
+
+
+def _end_frame_b64(*, width: int = 1280, height: int = 704) -> str:
+    image = Image.new("RGB", (width, height), "white")
+    image.putpixel((width // 3, height // 2), (60, 40, 20))
+    output = io.BytesIO()
+    image.save(output, format="PNG")
+    return base64.b64encode(output.getvalue()).decode("ascii")
+
+
+def _video_compiled() -> dict[str, object]:
+    return {
+        **_compiled(),
+        "width": 1280,
+        "height": 704,
+        "frames": 121,
+        "start_image_png_b64": _start_frame_b64(),
+    }
+
+
+def test_readiness_probe_uses_a_non_billable_comfy_queue_request() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        assert request.method == "GET"
+        assert request.url.path == "/queue"
+        assert request.headers["authorization"] == "secret-token-must-not-leak"
+        return httpx.Response(
+            200,
+            json={"queue_running": [], "queue_pending": []},
+        )
+
+    assert _provider(handler).probe_ready() is True
+    assert calls == 1
+
+
+@pytest.mark.parametrize("status", [429, 450, 502, 503, 504])
+def test_readiness_probe_waits_for_gateway_startup(status: int) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, text="starting")
+
+    assert _provider(handler).probe_ready() is False
+
+
+def test_readiness_probe_never_treats_authentication_failure_as_ready() -> None:
+    provider = _provider(lambda _request: httpx.Response(401, text="denied"))
+    with pytest.raises(ProviderAuthenticationError):
+        provider.probe_ready()
+
+
+def test_readiness_probe_fails_closed_for_malformed_success_response() -> None:
+    provider = _provider(lambda _request: httpx.Response(200, text="not-json"))
+    assert provider.probe_ready() is False
+
+
+def test_submit_uses_raw_eas_authorization_and_only_allowlisted_bindings() -> None:
+    expected_prompt_id = _provider(lambda _request: httpx.Response(500)).job_id_for("visual-job-1")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST" and request.url.path == "/prompt"
+        assert request.headers["authorization"] == "secret-token-must-not-leak"
+        body = json.loads(request.content)
+        assert set(body) == {"prompt", "client_id", "prompt_id"}
+        assert body["prompt_id"] == expected_prompt_id
+        assert body["client_id"] == expected_prompt_id
+        prompt = body["prompt"]
+        assert prompt["4"]["inputs"]["ckpt_name"] == "Anything-v5.0-PRT-RE.safetensors"
+        assert prompt["6"]["inputs"]["text"] == _compiled()["positive_prompt"]
+        assert prompt["7"]["inputs"]["text"] == _compiled()["negative_prompt"]
+        assert prompt["3"]["inputs"]["seed"] == 123
+        assert prompt["3"]["inputs"]["steps"] == 24
+        assert prompt["3"]["inputs"]["cfg"] == 7.5
+        assert prompt["5"]["inputs"]["width"] == 768
+        assert prompt["5"]["inputs"]["height"] == 512
+        return httpx.Response(200, json={"prompt_id": expected_prompt_id})
+
+    job = _provider(handler).submit(_compiled(), idempotency_key="visual-job-1")
+    assert job.id == expected_prompt_id
+
+
+def test_video_submit_uses_the_official_wan22_5b_start_image_latent_node() -> None:
+    expected_prompt_id = _video_provider(
+        lambda _request: httpx.Response(500)
+    ).job_id_for("video-job-1")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["authorization"] == "secret-token-must-not-leak"
+        assert request.url.path == "/prompt"
+        prompt = json.loads(request.content)["prompt"]
+        assert prompt["59"]["class_type"] == "ETN_LoadImageBase64"
+        assert prompt["59"]["inputs"]["image"] == _start_frame_b64()
+        assert "60" not in prompt
+        assert prompt["55"]["class_type"] == "Wan22ImageToVideoLatent"
+        assert prompt["55"]["inputs"]["start_image"] == ["59", 0]
+        assert prompt["55"]["inputs"]["width"] == 1280
+        assert prompt["55"]["inputs"]["height"] == 704
+        assert prompt["55"]["inputs"]["length"] == 121
+        assert prompt["3"]["inputs"]["positive"] == ["6", 0]
+        assert prompt["3"]["inputs"]["negative"] == ["7", 0]
+        assert prompt["3"]["inputs"]["latent_image"] == ["55", 0]
+        return httpx.Response(200, json={"prompt_id": expected_prompt_id})
+
+    job = _video_provider(handler).submit(_video_compiled(), idempotency_key="video-job-1")
+
+    assert job.id == expected_prompt_id
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("start_image_png_b64", "not-base64"),
+        ("end_image_png_b64", "not-base64"),
+        ("start_image_png_b64", base64.b64encode(b"not a png").decode("ascii")),
+        ("end_image_png_b64", base64.b64encode(b"not a png").decode("ascii")),
+        ("start_image_png_b64", _start_frame_b64(width=320, height=180)),
+        ("end_image_png_b64", _end_frame_b64(width=320, height=180)),
+    ],
+)
+def test_video_submit_rejects_invalid_bound_frames_before_network_io(
+    field: str, value: str
+) -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(500)
+
+    compiled = {**_video_compiled(), field: value}
+    expected = "START_IMAGE_INVALID" if field == "start_image_png_b64" else "END_IMAGE_INVALID"
+    with pytest.raises(ProviderProtocolError, match=expected):
+        _video_provider(handler).submit(compiled, idempotency_key="video-job-1")
+    assert calls == 0
+
+
+def test_video_submit_without_a_start_frame_removes_the_optional_image_node() -> None:
+    expected_prompt_id = _video_provider(
+        lambda _request: httpx.Response(500)
+    ).job_id_for("video-job-2")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        prompt = json.loads(request.content)["prompt"]
+        assert "59" not in prompt
+        assert "start_image" not in prompt["55"]["inputs"]
+        assert prompt["55"]["class_type"] == "Wan22ImageToVideoLatent"
+        assert prompt["3"]["inputs"]["latent_image"] == ["55", 0]
+        return httpx.Response(200, json={"prompt_id": expected_prompt_id})
+
+    compiled = _video_compiled()
+    compiled.pop("start_image_png_b64")
+    job = _video_provider(handler).submit(compiled, idempotency_key="video-job-2")
+
+    assert job.id == expected_prompt_id
+
+
+@pytest.mark.parametrize(
+    ("binding", "field", "expected"),
+    [
+        ("start_image_base64", "start_image_png_b64", "START_IMAGE_INVALID"),
+        ("end_image_base64", "end_image_png_b64", "END_IMAGE_INVALID"),
+    ],
+)
+def test_bound_frames_are_rejected_when_the_workflow_cannot_accept_them(
+    binding: str, field: str, expected: str
+) -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(500)
+
+    provider = _video_provider(handler)
+    assert provider.workflow is not None
+    provider.workflow = replace(
+        provider.workflow,
+        allowed_inputs=tuple(
+            value for value in provider.workflow.allowed_inputs if value != binding
+        ),
+    )
+    with pytest.raises(ProviderProtocolError, match=expected):
+        value = (
+            _end_frame_b64()
+            if field == "end_image_png_b64"
+            else _start_frame_b64()
+        )
+        provider.submit(
+            {**_video_compiled(), field: value},
+            idempotency_key="video-job-1",
+        )
+    assert calls == 0
+
+
+def test_submit_rejects_a_different_prompt_id_from_comfyui() -> None:
+    provider = _provider(
+        lambda _request: httpx.Response(
+            200, json={"prompt_id": "11111111-1111-4111-8111-111111111111"}
+        )
+    )
+    with pytest.raises(ProviderProtocolError, match="PROMPT_ID_MISMATCH"):
+        provider.submit(_compiled(), idempotency_key="visual-job-1")
+
+
+@pytest.mark.parametrize("status", [429, 450, 503])
+def test_explicit_gateway_rejection_is_a_safe_renderer_wait(status: int) -> None:
+    from app.visual.providers.aliyun_eas import ProviderRendererUnavailable
+
+    provider = _provider(lambda _request: httpx.Response(status, text="not accepted"))
+    with pytest.raises(ProviderRendererUnavailable) as caught:
+        provider.submit(_compiled(), idempotency_key="visual-job-1")
+    assert caught.value.safe_to_retry is True
+    assert caught.value.status_code == status
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_submit_rejects_invalid_eas_token_without_exposing_it(status: int) -> None:
+    provider = _provider(lambda _request: httpx.Response(status, text="denied"))
+    with pytest.raises(ProviderAuthenticationError) as caught:
+        provider.submit(_compiled(), idempotency_key="visual-job-1")
+    assert "secret-token" not in str(caught.value)
+
+
+def test_history_and_view_complete_the_exact_output_node() -> None:
+    png = b"\x89PNG\r\n\x1a\n" + b"safe-image"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["authorization"] == "secret-token-must-not-leak"
+        if request.url.path == "/history/provider-job-1":
+            return httpx.Response(
+                200,
+                json={
+                    "provider-job-1": {
+                        "status": {"completed": True, "status_str": "success"},
+                        "outputs": {
+                            "9": {
+                                "images": [
+                                    {
+                                        "filename": "ComfyUI_00001_.png",
+                                        "subfolder": "",
+                                        "type": "output",
+                                    }
+                                ]
+                            }
+                        },
+                    }
+                },
+            )
+        assert request.url.path == "/view"
+        assert request.url.params["filename"] == "ComfyUI_00001_.png"
+        return httpx.Response(200, content=png, headers={"content-type": "image/png"})
+
+    provider = _provider(handler)
+    assert provider.get_status("provider-job-1").state is ProviderState.COMPLETED
+    result = provider.get_result("provider-job-1")
+    assert result.content == png
+    assert result.mime_type == "image/png"
+    assert result.model_version == "Anything-v5.0-PRT-RE.safetensors"
+
+
+def test_empty_history_is_running_and_malformed_history_fails_closed() -> None:
+    running = _provider(lambda _request: httpx.Response(200, json={}))
+    assert running.get_status("provider-job-1").state is ProviderState.RUNNING
+
+    malformed = _provider(lambda _request: httpx.Response(200, json={"unexpected": []}))
+    with pytest.raises(ProviderProtocolError, match="MALFORMED_HISTORY"):
+        malformed.get_status("provider-job-1")
+
+
+def test_output_size_limit_is_enforced_before_publication() -> None:
+    huge = b"\x89PNG\r\n\x1a\n" + b"x" * (1024 * 1024)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/history/"):
+            return httpx.Response(
+                200,
+                json={
+                    "provider-job-1": {
+                        "status": {"completed": True},
+                        "outputs": {
+                            "9": {
+                                "images": [
+                                    {"filename": "large.png", "subfolder": "", "type": "output"}
+                                ]
+                            }
+                        },
+                    }
+                },
+            )
+        return httpx.Response(200, content=huge, headers={"content-type": "image/png"})
+
+    with pytest.raises(ProviderProtocolError, match="OUTPUT_TOO_LARGE"):
+        _provider(handler).get_result("provider-job-1")
+
+
+def test_cancel_is_local_only_and_makes_no_network_request() -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(500)
+
+    provider = _provider(handler)
+    provider.cancel("provider-job-1")
+    assert calls == 0
+    assert provider.get_status("provider-job-1").state is ProviderState.CANCELLED
+
+
+def test_submit_refuses_a_workflow_changed_after_registry_load(tmp_path: Path) -> None:
+    registry = WorkflowRegistry.load(REGISTRY)
+    workflow = registry.select_by_id("coursejesus-flux2-klein-image-v1", "1")
+    assert workflow.workflow_file is not None
+    copied = tmp_path / "workflow.json"
+    copied.write_bytes(workflow.workflow_file.read_bytes())
+    provider = AlibabaEASComfyProvider(
+        endpoint="https://eas.example.invalid",
+        token="secret-token-must-not-leak",
+        workflow=replace(workflow, workflow_file=copied),
+        client=httpx.Client(
+            transport=httpx.MockTransport(
+                lambda _request: pytest.fail("a changed workflow must not reach the network")
+            )
+        ),
+    )
+    copied.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ProviderProtocolError, match="WORKFLOW_SHA256_MISMATCH"):
+        provider.submit(_compiled(), idempotency_key="visual-job-1")
+
+
+def test_image_and_video_jobs_keep_their_own_pinned_workflow() -> None:
+    registry = WorkflowRegistry.load(REGISTRY)
+    submitted = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        submitted.append(body["prompt"])
+        return httpx.Response(200, json={"prompt_id": body["prompt_id"]})
+
+    image = AlibabaEASComfyProvider(
+        endpoint="https://eas.example.invalid",
+        token="fixture-token",
+        workflow=registry.select(Renderer.COMFY_IMAGE, "aliyun_eas"),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    video = image.for_workflow(registry.select(Renderer.COMFY_VIDEO, "aliyun_eas"))
+    video.submit(_compiled(), idempotency_key="video-job")
+    image.submit(_compiled(), idempotency_key="image-job")
+    assert submitted[0]["58"]["class_type"] == "SaveVideo"
+    assert submitted[1]["output_save"]["class_type"] == "SaveImage"
+
+
+def test_settings_allow_only_the_official_eas_shared_gateway_over_http() -> None:
+    endpoint = "http://synthetic-visual-service.1234567890123456.cn-hangzhou.pai-eas.aliyuncs.com"
+    settings = Settings(
+        v3_enabled=True,
+        visual_engine_enabled=True,
+        visual_provider="aliyun_eas",
+        visual_eas_endpoint=endpoint,
+        visual_eas_token=SecretStr("secret-token-must-not-leak"),
+    )
+    assert settings.visual_eas_endpoint == endpoint
+
+    for rejected in (
+        "http://example.com",
+        endpoint + "/prompt",
+        endpoint + "?token=not-allowed",
+    ):
+        with pytest.raises(ValueError, match="COMFYUI_EAS_ENDPOINT"):
+            Settings(
+                v3_enabled=True,
+                visual_engine_enabled=True,
+                visual_provider="aliyun_eas",
+                visual_eas_endpoint=rejected,
+                visual_eas_token=SecretStr("secret-token-must-not-leak"),
+            )

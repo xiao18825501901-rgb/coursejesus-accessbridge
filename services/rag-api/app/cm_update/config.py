@@ -1,0 +1,168 @@
+from dataclasses import dataclass, field
+from pathlib import Path
+import os
+import json
+from urllib.parse import urlparse
+
+from app.evaluation.provider_safety import validate_deepseek_base_url
+from .budget import BudgetPolicyError, parse_usd
+
+
+def flag(name: str, default: bool = False) -> bool:
+    return os.getenv(name, str(default)).lower() == 'true'
+
+
+@dataclass
+class Settings:
+    data_dir: Path = field(default_factory=lambda: Path(os.getenv('CMUI_DATA_DIR', './work/local-data')).resolve())
+    environment: str = field(default_factory=lambda: os.getenv('CMUI_ENV', 'development'))
+    auth_mode: str = field(default_factory=lambda: os.getenv('CMUI_AUTH_MODE', 'development'))
+    allowed_origins: tuple[str, ...] = field(default_factory=lambda: tuple(x.strip() for x in os.getenv('CMUI_ALLOWED_ORIGINS', 'http://127.0.0.1:8787,http://localhost:8787').split(',') if x.strip()))
+    clerk_issuer: str = field(default_factory=lambda: os.getenv('CLERK_ISSUER', ''))
+    clerk_jwt_key: str = field(default_factory=lambda: os.getenv('CLERK_JWT_KEY', '').replace('\\n', '\n'))
+    clerk_audience: str = field(default_factory=lambda: os.getenv('CLERK_AUDIENCE', ''))
+    clerk_publishable_key: str = field(default_factory=lambda: os.getenv('CLERK_PUBLISHABLE_KEY', ''))
+    admin_ids: tuple[str, ...] = field(default_factory=lambda: tuple(x for x in os.getenv('CMUI_ADMIN_IDS', '').split(',') if x))
+    provider_mode: str = field(default_factory=lambda: os.getenv('CMUI_PROVIDER_MODE', 'disabled'))
+    allow_billable: bool = field(default_factory=lambda: flag('CMUI_ALLOW_BILLABLE'))
+    qwen_base_url: str = field(default_factory=lambda: os.getenv('CMUI_QWEN_BASE_URL', ''))
+    qwen_key: str = field(default_factory=lambda: os.getenv('CMUI_QWEN_API_KEY', ''))
+    qwen_model: str = field(default_factory=lambda: os.getenv('CMUI_QWEN_MODEL', 'qwen3.8-max'))
+    qwen_protocol: str = field(default_factory=lambda: os.getenv('CMUI_QWEN_PROTOCOL', 'chat_completions'))
+    # DeepSeek generation path (default model deepseek-flash / DeepSeek-V4.1-Flash).
+    deepseek_base_url: str = field(default_factory=lambda: os.getenv('CMUI_DEEPSEEK_BASE_URL', 'https://api.deepseek.com'))
+    deepseek_key: str = field(default_factory=lambda: os.getenv('CMUI_DEEPSEEK_API_KEY', ''))
+    deepseek_model: str = field(default_factory=lambda: os.getenv('CMUI_DEEPSEEK_MODEL', 'deepseek-flash'))
+    deepseek_protocol: str = field(default_factory=lambda: os.getenv('CMUI_DEEPSEEK_PROTOCOL', 'responses'))
+    timeout: float = field(default_factory=lambda: float(os.getenv("CMUI_MODEL_TIMEOUT", "180")))
+    # The stage-one planner must reproduce the complete versioned teaching
+    # template as a natural-language prompt.  The former 2,500-token ceiling
+    # repeatedly ended otherwise valid production runs with
+    # response.incomplete/max_output_tokens before stage two could begin.
+    # 6,000 remains below the reviewed 12,000 hard bound and below the visible
+    # answer ceiling, while billing still follows actual provider usage.
+    prompt_tokens: int = field(default_factory=lambda: int(os.getenv("CMUI_PROMPT_TOKENS", "6000")))
+    answer_tokens: int = field(default_factory=lambda: int(os.getenv("CMUI_ANSWER_TOKENS", "6500")))
+    operation_usd_baseline: str = field(default_factory=lambda: os.getenv('CMUI_OPERATION_USD_BASELINE', ''))
+    # Prices are explicitly configured by the deployment owner for the selected
+    # Model Studio region. The deprecated global operation estimate is retained
+    # only for safe diagnostics; production no longer uses it to price runs.
+    operation_estimated_usd: str = field(default_factory=lambda: os.getenv('CMUI_OPERATION_ESTIMATED_USD', ''))
+    operation_input_usd_per_million: str = field(default_factory=lambda: os.getenv('CMUI_OPERATION_INPUT_USD_PER_MILLION', ''))
+    operation_output_usd_per_million: str = field(default_factory=lambda: os.getenv('CMUI_OPERATION_OUTPUT_USD_PER_MILLION', ''))
+    image_max_pixels: int = field(default_factory=lambda: int(os.getenv('CMUI_IMAGE_MAX_PIXELS', '2621440')))
+    max_upload_bytes: int = 20 * 1024 * 1024
+    max_user_bytes: int = 250 * 1024 * 1024
+    max_files: int = 100
+    integration_mode: str = field(default_factory=lambda: os.getenv('CMUI_INTEGRATION_MODE', 'standalone'))
+    api_base: str = field(default_factory=lambda: os.getenv('CMUI_PUBLIC_API_BASE', '/api/ui/v1'))
+    web_dir: Path = field(default_factory=lambda: Path(__file__).resolve().parents[2] / 'web' / 'dist')
+    verification_secret: str = field(default_factory=lambda: os.getenv('CMUI_VERIFICATION_SECRET', ''))
+    auto_verify_new_users: bool = field(default_factory=lambda: flag('CMUI_AUTO_VERIFY_NEW_USERS'))
+    # Campus access is independent from the retained student-verification data.
+    # The current owner policy admits every active authenticated account.  A
+    # future switch is valid only with an explicit effective timestamp and then
+    # grandfathers accounts created before it.
+    campus_access_mode: str = field(default_factory=lambda: os.getenv(
+        'CMUI_CAMPUS_ACCESS_MODE', 'open_to_registered').lower())
+    verification_effective_at: str = field(default_factory=lambda: os.getenv(
+        'CMUI_VERIFICATION_EFFECTIVE_AT', '').strip())
+    visual_engine_enabled: bool = False
+    visual_auto_enabled: bool = False
+    visual_video_enabled: bool = False
+
+    def validate(self) -> None:
+        if self.environment not in {'development','test','production'}: raise ValueError('Unknown environment')
+        if self.provider_mode not in {'disabled','qwen','deepseek','test'}: raise ValueError('Unknown provider mode')
+        if not 256<=self.prompt_tokens<=12000 or not 256<=self.answer_tokens<=16000: raise ValueError('Model output bounds invalid')
+        if not 1024<=self.image_max_pixels<=16777216: raise ValueError('Image pixel bound invalid')
+        if not 10<=self.timeout<=300: raise ValueError('Model timeout invalid')
+        if self.auth_mode not in {'development', 'clerk', 'injected'}:
+            raise ValueError('Unsupported authentication mode')
+        from .campus_access import validate_policy
+        validate_policy(self.campus_access_mode, self.verification_effective_at or None)
+        if self.environment == 'production':
+            marker=self.web_dir/'build-info.json'
+            if marker.exists() and json.loads(
+                marker.read_text(encoding='utf-8')
+            ).get('not_for_production'):
+                raise ValueError('Offline browser-verification runtime cannot be deployed; build the real React application')
+            if self.auth_mode == 'development':
+                raise ValueError('Development login is forbidden in production')
+            if self.provider_mode == 'test':
+                raise ValueError('Test provider is forbidden in production')
+            if self.integration_mode != 'integrated':
+                raise ValueError('Production requires the reviewed V3 domain adapter; do not seed a replacement database')
+            if any(urlparse(x).scheme != 'https' for x in self.allowed_origins):
+                raise ValueError('Production origins must be HTTPS')
+            if not self.verification_secret:
+                raise ValueError('CMUI_VERIFICATION_SECRET is required in production')
+            if self.auto_verify_new_users:
+                raise ValueError('CMUI_AUTO_VERIFY_NEW_USERS is a test/dev convenience and is forbidden in production')
+        if self.auth_mode == 'clerk' and not (self.clerk_issuer and self.clerk_jwt_key):
+            raise ValueError('Clerk issuer and public verification key are required')
+        if self.provider_mode == 'qwen':
+            p = urlparse(self.qwen_base_url)
+            if p.scheme != 'https' or not p.hostname or p.username or p.password or p.query or p.fragment:
+                raise ValueError('An explicit HTTPS provider base URL without credentials/query/fragment is required')
+            if not self.qwen_key:
+                raise ValueError('Backend Qwen credential is missing')
+            if self.environment == 'production':
+                try:
+                    parse_usd(
+                        self.operation_usd_baseline,
+                        required=True,
+                        field='CMUI_OPERATION_USD_BASELINE',
+                        missing_error=BudgetPolicyError,
+                    )
+                    parse_usd(
+                        self.operation_input_usd_per_million,
+                        required=True,
+                        field='CMUI_OPERATION_INPUT_USD_PER_MILLION',
+                        missing_error=BudgetPolicyError,
+                    )
+                    parse_usd(
+                        self.operation_output_usd_per_million,
+                        required=True,
+                        field='CMUI_OPERATION_OUTPUT_USD_PER_MILLION',
+                        missing_error=BudgetPolicyError,
+                    )
+                except BudgetPolicyError as error:
+                    raise ValueError('Production Qwen pricing configuration is required') from error
+        if self.provider_mode == 'deepseek':
+            # Dedicated DeepSeek host/path policy alongside the Model Studio
+            # validator above; it never loosens the HTTPS/credential checks.
+            try:
+                validate_deepseek_base_url(self.deepseek_base_url)
+            except ValueError as error:
+                raise ValueError('An explicit HTTPS DeepSeek base URL (api.deepseek.com) is required') from error
+            if not self.deepseek_key:
+                raise ValueError('Backend DeepSeek credential is missing')
+            if self.deepseek_model != 'deepseek-flash':
+                raise ValueError('Only the verified deepseek-flash model is accepted for generation')
+            if self.environment == 'production':
+                try:
+                    parse_usd(
+                        self.operation_usd_baseline,
+                        required=True,
+                        field='CMUI_OPERATION_USD_BASELINE',
+                        missing_error=BudgetPolicyError,
+                    )
+                    parse_usd(
+                        self.operation_input_usd_per_million,
+                        required=True,
+                        field='CMUI_OPERATION_INPUT_USD_PER_MILLION',
+                        missing_error=BudgetPolicyError,
+                    )
+                    parse_usd(
+                        self.operation_output_usd_per_million,
+                        required=True,
+                        field='CMUI_OPERATION_OUTPUT_USD_PER_MILLION',
+                        missing_error=BudgetPolicyError,
+                    )
+                except BudgetPolicyError as error:
+                    raise ValueError('Production DeepSeek pricing configuration is required') from error
+        if self.qwen_protocol not in {'chat_completions', 'responses'}:
+            raise ValueError('Unknown model protocol')
+        if self.deepseek_protocol not in {'chat_completions', 'responses'}:
+            raise ValueError('Unknown DeepSeek protocol')

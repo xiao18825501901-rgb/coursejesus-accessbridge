@@ -1,0 +1,128 @@
+[build]
+  # Production deploys (CONTEXT=production) must pass the release preflight and
+  # artifact verification; non-production builds skip both and stay usable.
+  command = "node scripts/preflight_release_build.mjs && npm run build --workspace @coursemate/web && node scripts/verify_release_build.mjs"
+  publish = "apps/web/dist"
+
+[build.environment]
+  NODE_VERSION = "24.14.0"
+
+# Configure VITE_CLERK_PUBLISHABLE_KEY (must be the real pk_live_... key for
+# production builds - the preflight rejects fake or test keys), VITE_RAG_API_URL,
+# VITE_AGENT_API_URL, VITE_UI_API_BASE and VITE_V3_ENABLED in the Netlify UI.
+# Never place Clerk secret keys here.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Document routing (first match wins, top to bottom).
+#
+#   / and unknown paths  → ui.html   (the refreshed shell is the DEFAULT entry;
+#                                     sign-in returns to its dashboard)
+#   /app, /app/*         → ui.html   (compatibility alias)
+#   legacy deep links    → index.html (the previous V3 site keeps its paths so
+#                                     history reading and the admin/publication
+#                                     surfaces stay reachable)
+#
+# Deployed asset files always win over these rewrite rules, so the hashed
+# /assets/* bundles are never rewritten. Keep this list in sync with
+# `scripts/serve_web_dist.mjs` and the Vite dev plugin in `apps/web/vite.config.ts`.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[redirects]]
+  from = "/"
+  to = "/ui.html"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/app"
+  to = "/ui.html"
+  status = 200
+
+[[redirects]]
+  from = "/app/*"
+  to = "/ui.html"
+  status = 200
+
+[[redirects]]
+  from = "/qa"
+  to = "/index.html"
+  status = 200
+
+[[redirects]]
+  from = "/qa/*"
+  to = "/index.html"
+  status = 200
+
+[[redirects]]
+  from = "/learn"
+  to = "/index.html"
+  status = 200
+
+[[redirects]]
+  from = "/learn/*"
+  to = "/index.html"
+  status = 200
+
+[[redirects]]
+  from = "/courses"
+  to = "/index.html"
+  status = 200
+
+[[redirects]]
+  from = "/courses/*"
+  to = "/index.html"
+  status = 200
+
+[[redirects]]
+  from = "/tasks"
+  to = "/index.html"
+  status = 200
+
+[[redirects]]
+  from = "/tasks/*"
+  to = "/index.html"
+  status = 200
+
+[[redirects]]
+  from = "/documents"
+  to = "/index.html"
+  status = 200
+
+[[redirects]]
+  from = "/documents/*"
+  to = "/index.html"
+  status = 200
+
+[[redirects]]
+  from = "/admin"
+  to = "/index.html"
+  status = 200
+
+[[redirects]]
+  from = "/admin/*"
+  to = "/index.html"
+  status = 200
+
+[[redirects]]
+  from = "/about"
+  to = "/index.html"
+  status = 200
+
+[[redirects]]
+  from = "/about/*"
+  to = "/index.html"
+  status = 200
+
+[[redirects]]
+  from = "/*"
+  to = "/ui.html"
+  status = 200
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    Strict-Transport-Security = "max-age=31536000; includeSubDomains"
+    X-Content-Type-Options = "nosniff"
+    X-Frame-Options = "DENY"
+    Referrer-Policy = "strict-origin-when-cross-origin"
+    Permissions-Policy = "camera=(), microphone=(), geolocation=()"

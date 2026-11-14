@@ -1,0 +1,564 @@
+"""Offline contract tests for the bounded P5 Question Engine live runner.
+
+The CLI is exercised only in preflight/refusal modes.  No provider transport is
+constructed and no network request can occur in this module.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from types import ModuleType
+
+import pytest
+
+ROOT = Path(__file__).parents[3]
+RUNNER = ROOT / "scripts" / "run_question_engine_p5_live.py"
+RECOVERY_RUNNER = ROOT / "scripts" / "resume_question_engine_p5_c2.py"
+
+
+def load_runner() -> ModuleType:
+    spec = importlib.util.spec_from_file_location("p5_runner", RUNNER)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_recovery_runner() -> ModuleType:
+    spec = importlib.util.spec_from_file_location("p5_recovery_runner", RECOVERY_RUNNER)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(RUNNER), *args],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_preflight_is_default_and_lists_the_finite_c1_c2_plan(tmp_path: Path) -> None:
+    result = run_cli("--run-dir", str(tmp_path / "unused"))
+
+    assert result.returncode == 0, result.stderr
+    assert "PREFLIGHT_ONLY" in result.stdout
+    assert "DeepSeek calls: at most 8" in result.stdout
+    assert "Jev calls: at most 4" in result.stdout
+    assert "C1" in result.stdout and "C2" in result.stdout
+    assert '"status": "STATIC_PREFLIGHT_PASSED"' in result.stdout
+    assert '"network_calls": 0' in result.stdout
+    assert not (tmp_path / "unused").exists()
+
+
+def test_billable_run_requires_both_protected_credentials(tmp_path: Path) -> None:
+    result = run_cli(
+        "--allow-billable",
+        "--run-dir",
+        str(tmp_path / "run"),
+        "--cost-policy",
+        "owner_authorized_unlimited_for_this_workflow",
+        "--input-price-per-million",
+        "1",
+        "--output-price-per-million",
+        "2",
+        "--deepseek-key-env",
+        "P5_TEST_MISSING_DEEPSEEK_KEY",
+        "--jev-key-env",
+        "P5_TEST_MISSING_JEV_KEY",
+    )
+
+    assert result.returncode == 2
+    assert "Missing protected credential" in result.stdout
+    assert not (tmp_path / "run").exists()
+
+
+def test_capped_policy_refuses_without_a_positive_max_cost(tmp_path: Path) -> None:
+    result = run_cli(
+        "--allow-billable",
+        "--run-dir",
+        str(tmp_path / "run"),
+        "--input-price-per-million",
+        "1",
+        "--output-price-per-million",
+        "2",
+    )
+
+    assert result.returncode == 2
+    assert "--max-cost is required" in result.stdout
+    assert not (tmp_path / "run").exists()
+
+
+def test_required_jev_modes_are_exactly_the_four_p5_gates() -> None:
+    runner = load_runner()
+
+    assert runner.REQUIRED_JEV_MODES == {
+        "question.ambiguity.v1": "on",
+        "question.answer_agreement.v1": "on",
+        "question.mcq_distractor_quality.v1": "on",
+        "question.rule_violation_quality.v1": "on",
+    }
+    assert runner.NON_REQUIRED_JEV_MODES_OFF == {
+        "retrieval.support.v1": "off",
+        "source.select_span.v1": "off",
+        "exercise.prototype.v1": "off",
+    }
+    assert runner.C1_C2_PLAN.deepseek_calls == 8
+    assert runner.C1_C2_PLAN.jev_calls == 4
+
+
+def test_cost_ceiling_is_computed_from_finite_call_and_token_caps() -> None:
+    runner = load_runner()
+
+    ceiling = runner.conservative_cost_ceiling(
+        runner.C1_C2_PLAN,
+        input_price_per_million=1.0,
+        output_price_per_million=2.0,
+    )
+
+    assert ceiling == 8 * ((15_000 * 1.0 + 4_000 * 2.0) / 1_000_000)
+
+
+def test_call_budgets_refuse_before_an_extra_provider_attempt() -> None:
+    runner = load_runner()
+    budget = runner.CallBudget.create(deepseek_limit=2, jev_limit=1)
+
+    budget.claim_deepseek("QUESTION_AUTHOR")
+    budget.claim_deepseek("QUESTION_BLIND_SOLVER")
+    budget.claim_jev("question.ambiguity.v1")
+
+    with pytest.raises(RuntimeError, match="P5_DEEPSEEK_CALL_CAP_REACHED"):
+        budget.claim_deepseek("PRACTICE_HINT")
+    with pytest.raises(RuntimeError, match="P5_JEV_CALL_CAP_REACHED"):
+        budget.claim_jev("question.answer_agreement.v1")
+    assert budget.deepseek_roles == ["QUESTION_AUTHOR", "QUESTION_BLIND_SOLVER"]
+    assert budget.jev_definitions == ["question.ambiguity.v1"]
+    assert budget.audit_snapshot() == {
+        "deepseek_limit": 2,
+        "deepseek_attempted_roles": ["QUESTION_AUTHOR", "QUESTION_BLIND_SOLVER"],
+        "jev_limit": 1,
+        "jev_attempted_definitions": ["question.ambiguity.v1"],
+    }
+
+
+def test_jev_transport_persists_intent_before_complete_result(tmp_path: Path) -> None:
+    runner = load_runner()
+    from app.jev.models import JevAnswer, JevCall, JevQuestion, JevResult
+
+    class Inner:
+        model_version = "jev-fake-ledger-v1"
+
+        def call(self, _call, *, timeout_seconds: float):
+            assert timeout_seconds == 7.0
+            return JevResult(
+                answers={"question.ambiguity.v1": JevAnswer(choice="CLEAR")},
+                request_id="jev-ledger-response",
+                model_version=self.model_version,
+            )
+
+    ledger = runner.DurableTransportLedger.create(tmp_path / "private-ledger.json")
+    transport = runner.BoundedJevTransport(
+        Inner(),
+        runner.CallBudget.create(deepseek_limit=1, jev_limit=1),
+        ledger,
+    )
+    result = transport.call(
+        JevCall(
+            state={"synthetic": True},
+            questions={
+                "question.ambiguity.v1": JevQuestion(
+                    "question.ambiguity.v1",
+                    "Choice",
+                    "Is the synthetic question clear?",
+                    {"CLEAR": "clear", "AMBIGUOUS": "ambiguous"},
+                )
+            },
+        ),
+        timeout_seconds=7.0,
+    )
+
+    assert result.answers["question.ambiguity.v1"].choice == "CLEAR"
+    payload = json.loads((tmp_path / "private-ledger.json").read_text(encoding="utf-8"))
+    assert [event["phase"] for event in payload["events"]] == [
+        "SEND_INTENT",
+        "RESPONSE_COMPLETE",
+    ]
+    assert payload["events"][1]["answers"]["question.ambiguity.v1"]["choice"] == "CLEAR"
+
+
+def test_existing_transport_ledger_is_appended_without_replacing_evidence(
+    tmp_path: Path,
+) -> None:
+    runner = load_runner()
+    path = tmp_path / "private-ledger.json"
+    ledger = runner.DurableTransportLedger.create(path)
+    ledger.record("deepseek", {"phase": "SEND_INTENT", "role": "QUESTION_AUTHOR"})
+    original_hash = __import__("hashlib").sha256(path.read_bytes()).hexdigest()
+
+    reopened = runner.DurableTransportLedger.open_existing(path)
+    reopened.record(
+        "deepseek", {"phase": "RESPONSE_COMPLETE", "role": "QUESTION_AUTHOR"}
+    )
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert [event["sequence"] for event in payload["events"]] == [1, 2]
+    assert payload["events"][0]["phase"] == "SEND_INTENT"
+    assert original_hash != __import__("hashlib").sha256(path.read_bytes()).hexdigest()
+
+
+def test_c2_recovery_accepts_only_the_frozen_completed_rejected_response(
+    tmp_path: Path,
+) -> None:
+    recovery = load_recovery_runner()
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "run-state.json").write_text(
+        json.dumps(
+            {
+                "status": "FAILED_SAFE",
+                "error_code": "C2_ASSISTED_ATTEMPT_HTTP_409",
+                "call_budget_audit": {
+                    "deepseek_attempted_roles": [
+                        "QUESTION_AUTHOR",
+                        "QUESTION_BLIND_SOLVER",
+                        "PRACTICE_FEEDBACK",
+                        "PRACTICE_HINT",
+                        "PRACTICE_FEEDBACK",
+                    ],
+                    "jev_attempted_definitions": [
+                        "question.ambiguity.v1",
+                        "question.answer_agreement.v1",
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "first-ready-checkpoint.json").write_text(
+        json.dumps(
+            {
+                "status": "FIRST_READY_QUESTION_SAVED",
+                "question_revision_id": "question-1",
+            }
+        ),
+        encoding="utf-8",
+    )
+    response = json.dumps(
+        {
+            "verdict": "PARTIAL",
+            "feedback": "Useful overall feedback.",
+            "strengths": ["Correct conclusion."],
+            "gaps": ["Missing comparison."],
+            "next_step": "Show the comparison.",
+            "criteria": [
+                {
+                    "criterion_id": "criterion_1",
+                    "met": False,
+                    "feedback": "x" * 512,
+                }
+            ],
+        }
+    )
+    events = [
+        {
+            "sequence": 1,
+            "recorded_at": "2026-09-25T00:00:00Z",
+            "source": "deepseek",
+            "phase": "RESPONSE_COMPLETE",
+            "role": "PRACTICE_FEEDBACK",
+            "input_hash": "a" * 64,
+            "provider_response_id": "first",
+            "output_text": response,
+            "provider": "DEEPSEEK_API",
+            "model": "deepseek-flash",
+            "protocol": "responses",
+            "input_tokens": 1,
+            "output_tokens": 1,
+        },
+        {
+            "sequence": 2,
+            "recorded_at": "2026-09-25T00:00:01Z",
+            "source": "deepseek",
+            "phase": "SEND_INTENT",
+            "role": "PRACTICE_FEEDBACK",
+            "input_hash": "b" * 64,
+        },
+        {
+            "sequence": 3,
+            "recorded_at": "2026-09-25T00:00:02Z",
+            "source": "deepseek",
+            "phase": "RESPONSE_COMPLETE",
+            "role": "PRACTICE_FEEDBACK",
+            "input_hash": "b" * 64,
+            "provider_response_id": "recovered",
+            "output_text": response,
+            "provider": "DEEPSEEK_API",
+            "model": "deepseek-flash",
+            "protocol": "responses",
+            "input_tokens": 100,
+            "output_tokens": 50,
+        },
+        {
+            "sequence": 4,
+            "recorded_at": "2026-09-25T00:00:02Z",
+            "source": "deepseek",
+            "phase": "CONTRACT_REJECTED",
+            "role": "PRACTICE_FEEDBACK",
+            "input_hash": "b" * 64,
+            "provider_response_id": "recovered",
+            "reason": "ValidationError",
+        },
+    ]
+    (run_dir / "private-transport-ledger.json").write_text(
+        json.dumps(
+            {
+                "format_version": "coursejesus.p5.private-transport-ledger.v1",
+                "classification": "PRIVATE_PROVIDER_RESULT_EVIDENCE",
+                "events": events,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = recovery._load_recovery_evidence(run_dir)
+
+    assert loaded["checkpoint"]["question_revision_id"] == "question-1"
+    assert len(loaded["output"].criteria[0].feedback) == 512
+    assert loaded["provider_run"].provider_response_id == "recovered"
+
+    source_state = (run_dir / "run-state.json").read_bytes()
+    (run_dir / "failed-safe-state-before-c2-recovery.json").write_bytes(source_state)
+    stopped = json.loads(source_state)
+    stopped.update(
+        {
+            "status": "RECOVERY_FAILED_SAFE",
+            "recovery_error_code": "P5_C2_RECOVERY_SOURCE_CLASSIFICATION_MISMATCH",
+            "recovery_new_network_calls": 0,
+            "deepseek_calls": 5,
+            "jev_calls": 2,
+            "transport_ledger": {"event_count": 4},
+        }
+    )
+    (run_dir / "run-state.json").write_text(json.dumps(stopped), encoding="utf-8")
+
+    resumed_after_pre_network_stop = recovery._load_recovery_evidence(run_dir)
+
+    assert resumed_after_pre_network_stop["resuming_after_pre_network_stop"] is True
+    assert resumed_after_pre_network_stop["state_bytes"] == source_state
+
+
+def test_mounted_ui_environment_uses_the_same_frozen_price_and_output_bounds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner = load_runner()
+    args = runner.parse_args(
+        [
+            "--run-dir",
+            str(tmp_path / "run"),
+            "--input-price-per-million",
+            "0.3",
+            "--output-price-per-million",
+            "1.2",
+            "--max-output-tokens",
+            "4000",
+            "--operation-usd-baseline",
+            "0.20",
+        ]
+    )
+    configured_names = (
+        "TYPESAFE_API_KEY",
+        "CMUI_DATA_DIR",
+        "CMUI_ENV",
+        "CMUI_PROVIDER_MODE",
+        "CMUI_ALLOW_BILLABLE",
+        "CMUI_DEEPSEEK_API_KEY",
+        "CMUI_DEEPSEEK_BASE_URL",
+        "CMUI_DEEPSEEK_MODEL",
+        "CMUI_DEEPSEEK_PROTOCOL",
+        "CMUI_MODEL_TIMEOUT",
+        "CMUI_OPERATION_USD_BASELINE",
+        "CMUI_OPERATION_INPUT_USD_PER_MILLION",
+        "CMUI_OPERATION_OUTPUT_USD_PER_MILLION",
+        "CMUI_ANSWER_TOKENS",
+        "CMUI_AUTO_VERIFY_NEW_USERS",
+    )
+    environment_before = {name: os.environ.get(name) for name in configured_names}
+
+    # The live runner deliberately configures the current process. Register every
+    # key with a bounded monkeypatch context so this contract test cannot silently
+    # switch later UI tests to a billable provider mode.
+    with monkeypatch.context() as scoped_environment:
+        for name in configured_names:
+            # ``delenv(..., raising=False)`` does not register an absent key for
+            # restoration, so a direct ``os.environ`` write by the runner would
+            # survive the context. A sentinel ``setenv`` records both absent and
+            # pre-existing states; the runner overwrites every listed key below.
+            scoped_environment.setenv(name, "P5_TEST_ENVIRONMENT_SENTINEL")
+
+        runner._configure_process_environment(
+            args,
+            run_dir=(tmp_path / "run").resolve(),
+            deepseek_key="test-deepseek",
+            jev_key="test-jev",
+            conservative_ceiling=0.0744,
+        )
+
+        assert os.environ["CMUI_OPERATION_USD_BASELINE"] == "0.20000000"
+        assert os.environ["CMUI_OPERATION_INPUT_USD_PER_MILLION"] == "0.3"
+        assert os.environ["CMUI_OPERATION_OUTPUT_USD_PER_MILLION"] == "1.2"
+        assert os.environ["CMUI_ANSWER_TOKENS"] == "4000"
+
+        from app.cm_update.budget import evaluate_operation_budget
+        from app.cm_update.config import Settings as UiSettings
+        from app.cm_update.provider import DeepSeekProvider
+
+        ui_settings = UiSettings()
+        ui_settings.validate()
+        estimate = DeepSeekProvider(ui_settings).estimate_question_engine()
+        decision = evaluate_operation_budget(
+            "medium", ui_settings.operation_usd_baseline, estimate.usd
+        )
+        assert decision.application_usd_cap is not None
+        assert estimate.output_tokens == 8_000
+
+    assert {name: os.environ.get(name) for name in configured_names} == environment_before
+
+
+def test_operator_workflow_ceiling_is_not_reused_as_the_product_baseline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner = load_runner()
+    args = runner.parse_args(
+        [
+            "--run-dir",
+            str(tmp_path / "run"),
+            "--input-price-per-million",
+            "0.3",
+            "--output-price-per-million",
+            "1.2",
+            "--operation-usd-baseline",
+            "0.20",
+        ]
+    )
+    with monkeypatch.context() as environment:
+        for name in (
+            "TYPESAFE_API_KEY",
+            "CMUI_DATA_DIR",
+            "CMUI_ENV",
+            "CMUI_PROVIDER_MODE",
+            "CMUI_ALLOW_BILLABLE",
+            "CMUI_DEEPSEEK_API_KEY",
+            "CMUI_DEEPSEEK_BASE_URL",
+            "CMUI_DEEPSEEK_MODEL",
+            "CMUI_DEEPSEEK_PROTOCOL",
+            "CMUI_MODEL_TIMEOUT",
+            "CMUI_OPERATION_USD_BASELINE",
+            "CMUI_OPERATION_INPUT_USD_PER_MILLION",
+            "CMUI_OPERATION_OUTPUT_USD_PER_MILLION",
+            "CMUI_ANSWER_TOKENS",
+            "CMUI_AUTO_VERIFY_NEW_USERS",
+        ):
+            environment.setenv(name, "sentinel")
+        runner._configure_process_environment(
+            args,
+            run_dir=(tmp_path / "run").resolve(),
+            deepseek_key="test-deepseek",
+            jev_key="test-jev",
+            conservative_ceiling=99.0,
+        )
+        assert os.environ["CMUI_OPERATION_USD_BASELINE"] == "0.20000000"
+
+
+def test_billable_run_requires_an_explicit_product_baseline(tmp_path: Path) -> None:
+    runner = load_runner()
+    args = runner.parse_args(
+        [
+            "--allow-billable",
+            "--run-dir",
+            str(tmp_path / "run"),
+            "--cost-policy",
+            "owner_authorized_unlimited_for_this_workflow",
+            "--input-price-per-million",
+            "0.3",
+            "--output-price-per-million",
+            "1.2",
+        ]
+    )
+
+    _ceiling, errors = runner._validate(args)
+
+    assert "--operation-usd-baseline is required and must be positive." in errors
+
+
+def test_prior_failed_attempt_is_hash_linked_without_private_material(tmp_path: Path) -> None:
+    runner = load_runner()
+    state = tmp_path / "run-state.json"
+    state.write_text(
+        json.dumps(
+            {
+                "status": "FAILED_SAFE",
+                "application_sha": "abc123",
+                "deepseek_calls": 0,
+                "jev_calls": 2,
+                "call_budget_audit": {
+                    "deepseek_attempted_roles": [],
+                    "jev_attempted_definitions": [
+                        "retrieval.support.v1",
+                        "source.select_span.v1",
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = runner._prior_attempt_summary(state)
+
+    assert summary is not None
+    assert summary["status"] == "FAILED_SAFE"
+    assert summary["jev_calls"] == 2
+    assert summary["state_sha256"] == __import__("hashlib").sha256(
+        state.read_bytes()
+    ).hexdigest()
+
+
+def test_upstream_unknown_reconciliation_requires_a_new_operation_id(tmp_path: Path) -> None:
+    runner = load_runner()
+    reconciliation = tmp_path / "reconciliation.json"
+    reconciliation.write_text(
+        json.dumps(
+            {
+                "disposition": "UPSTREAM_UNKNOWN",
+                "attempt": {
+                    "potential_unmetered_deepseek_calls": 1,
+                    "deepseek_charge": "UNKNOWN",
+                },
+                "corrective_application_sha": "fix-sha",
+                "retry_policy": {
+                    "reuse_old_operation_id": False,
+                    "automatic_retry": False,
+                    "new_attempt_requires_new_operation_id": True,
+                    "preserve_unknown_charge": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = runner._prior_reconciliation_summary(reconciliation)
+
+    assert summary is not None
+    assert summary["disposition"] == "UPSTREAM_UNKNOWN"
+    assert summary["deepseek_charge"] == "UNKNOWN"
+    assert summary["retry_policy"]["reuse_old_operation_id"] is False

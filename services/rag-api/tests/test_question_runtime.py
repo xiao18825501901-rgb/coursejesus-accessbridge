@@ -1,0 +1,1285 @@
+"""One real node reaches a READY, private, reusable exercise projection.
+
+This is an offline contract test: the author and blind solver are the labelled
+deterministic fixtures and TypeSafe Jev is an injected fake transport.  It
+proves orchestration and persistence, not live model quality.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from dataclasses import replace
+from pathlib import Path
+from typing import Any
+
+import pytest
+from test_question_persistence import (
+    COURSE,
+    NODE,
+    OWNER,
+    PRIVATE_COURSE,
+    WORKSPACE,
+    database_with_objective,
+    persist,
+    pipeline,
+)
+
+import app.learning.question_runtime as question_runtime_module
+from app.errors import ApiError
+from app.jev.catalog import load_catalog
+from app.jev.gateway import FakeTransport, JevGateway
+from app.jev.models import JevAnswer, JevResult
+from app.jev.receipt_store import SqlReceiptStore
+from app.jev.service import SemanticDecisionService
+from app.learning.blind_solve import BlindSolveError
+from app.learning.provider import LearningProvider, ProviderCallFailure
+from app.learning.question_author import RULE_VIOLATION_POLICY_VERSION, AuthorGenerationError
+from app.learning.question_runtime import (
+    QuestionEngineRuntime,
+    QuestionEngineRuntimeError,
+)
+
+
+def test_non_ready_assessment_candidate_does_not_permanently_block_slot_recovery(
+    tmp_path: Path,
+) -> None:
+    """Immutable failed evidence stays auditable but must not masquerade as a reusable slot."""
+
+    values = pipeline(tmp_path)
+    receipt_id = values["report"].semantic_signals[0].receipt_id
+    with values["database"].connect() as connection:
+        connection.execute("DELETE FROM jev_decision_receipts WHERE id=?", (receipt_id,))
+    failed = persist(values)
+    assert failed.status == "NEEDS_REVIEW"
+
+    runtime = object.__new__(QuestionEngineRuntime)
+    runtime.database = values["database"]
+    assert runtime._existing_assessment_slot(
+        owner_user_id=OWNER,
+        workspace_id=WORKSPACE,
+        blueprint=values["blueprint"],
+        evidence=values["evidence"],
+    ) is None
+
+
+def decisions(
+    database: Any, *, prototype_id: str = "worked_application"
+) -> SemanticDecisionService:
+    def responder(call: Any) -> JevResult:
+        key = next(iter(call.questions))
+        verdict = {
+            "exercise.prototype.v1": prototype_id,
+            "question.ambiguity.v1": "CLEAR",
+            "question.answer_agreement.v1": "AGREE",
+            "question.mcq_distractor_quality.v1": "ACCEPTABLE",
+            "question.rule_violation_quality.v1": "SUPPORTED",
+        }[key]
+        return JevResult(answers={key: JevAnswer(choice=verdict)})
+
+    return SemanticDecisionService(
+        JevGateway(
+            transport=FakeTransport(responder),
+            catalog=load_catalog(),
+            modes={
+                "exercise.prototype.v1": "on",
+                "question.ambiguity.v1": "on",
+                "question.answer_agreement.v1": "on",
+                "question.mcq_distractor_quality.v1": "on",
+                "question.rule_violation_quality.v1": "on",
+            },
+            receipt_store=SqlReceiptStore(database),
+        )
+    )
+
+
+def test_runtime_generates_ready_private_exercise_for_exact_workspace_node(
+    tmp_path: Path,
+) -> None:
+    database, config = database_with_objective(tmp_path)
+    runtime = QuestionEngineRuntime(
+        database=database,
+        provider=LearningProvider(config),
+        semantic_decisions=decisions(database),
+    )
+
+    result = runtime.generate_one(
+        owner_user_id=OWNER,
+        workspace_id=WORKSPACE,
+        course_id=COURSE,
+        private_course_id=PRIVATE_COURSE,
+        node_id=NODE,
+        operation_id="do-one-question-0001",
+    )
+
+    assert result["status"] == "READY"
+    assert result["verification_status"] == "AI_REVIEWED"
+    assert result["generation_version"] == "exercise.v2+question-engine.v1"
+    assert result["prototype_id"] == "worked_application"
+    assert result["public"]["schema_version"] == "exercise.v2"
+    assert "answer" not in result["public"]
+    assert "solution" not in result["public"]
+    assert result["private"]["answer"]
+    assert result["private"]["steps"][0]["step_id"] == "step_1"
+    assert result["private"]["steps"][0]["title"]
+    assert result["private"]["steps"][0]["text"]
+    assert result["references"][0]["id"] == "chunk-course"
+    assert "content" not in result["references"][0]
+
+    with database.connect() as connection:
+        provenance = connection.execute(
+            "SELECT * FROM question_engine_provenance WHERE question_revision_id=?",
+            (result["question_revision_id"],),
+        ).fetchone()
+        question = connection.execute(
+            "SELECT owner_user_id FROM assessment_question_revisions WHERE id=?",
+            (result["question_revision_id"],),
+        ).fetchone()
+    assert provenance["workspace_id"] == WORKSPACE
+    assert provenance["publication_status"] == "READY"
+    assert question["owner_user_id"] == OWNER
+
+
+def test_student_entry_authors_once_without_blind_or_formal_review_gate(
+    tmp_path: Path,
+) -> None:
+    database, config = database_with_objective(tmp_path)
+    provider = LearningProvider(config)
+    calls: list[str] = []
+
+    def metered_generate(
+        workspace_id: str,
+        operation_id: str,
+        schema: type[Any],
+        **kwargs: Any,
+    ) -> tuple[Any, dict[str, Any]]:
+        assert workspace_id == WORKSPACE
+        assert operation_id == "student-entry-do-one-0001"
+        calls.append(str(kwargs["role"]))
+        output, run = provider.generate(schema, **kwargs)
+        payload = output.model_dump(mode="json")
+        # Historical author responses sometimes carried a malformed optional
+        # qualification contract while the actual question/reference/rubric
+        # fields were complete.  The normal student-entry path must ignore that
+        # retired approval payload instead of buying the same question again.
+        payload["task_contract"] = {"legacy": "not-a-current-contract"}
+        return payload, run
+
+    runtime = QuestionEngineRuntime(
+        database=database,
+        provider=provider,
+        semantic_decisions=None,
+        metered_generate=metered_generate,
+        source_bound_student_entry=True,
+    )
+
+    result = runtime.generate_one(
+        owner_user_id=OWNER,
+        workspace_id=WORKSPACE,
+        course_id=COURSE,
+        private_course_id=PRIVATE_COURSE,
+        node_id=NODE,
+        operation_id="student-entry-do-one-0001",
+    )
+    reused = runtime.reuse_ready_or_generate(
+        owner_user_id=OWNER,
+        workspace_id=WORKSPACE,
+        course_id=COURSE,
+        private_course_id=PRIVATE_COURSE,
+        node_id=NODE,
+        operation_id="student-entry-do-one-0002",
+    )
+
+    assert calls == ["QUESTION_AUTHOR"]
+    assert reused["question_revision_id"] == result["question_revision_id"]
+    assert reused["usage"] == [
+        {"role": "QUESTION_READY_POOL", "status": "REUSED"},
+        {"role": "QUESTION_AUTHOR", "status": "NOT_CALLED_READY_REUSE"},
+        {"role": "QUESTION_BLIND_SOLVER", "status": "NOT_CALLED_READY_REUSE"},
+    ]
+    assert result["status"] == "READY"
+    assert result["verification_status"] == "MODEL_ONLY"
+    assert "answer" not in result["public"]
+    assert result["private"]["answer"]
+    assert result["usage"][1]["status"] == "NOT_CALLED_STUDENT_ENTRY_POLICY"
+    with database.connect() as connection:
+        row = connection.execute(
+            "SELECT question.verification_method,provenance.publication_status,"
+            "provenance.readiness_reason FROM assessment_question_revisions AS question "
+            "JOIN question_engine_provenance AS provenance "
+            "ON provenance.question_revision_id=question.id WHERE question.id=?",
+            (result["question_revision_id"],),
+        ).fetchone()
+    assert tuple(row) == ("MODEL_ONLY", "READY", "SOURCE_BOUND_AUTHOR_COMPLETE")
+
+
+def test_generate_one_routes_author_and_blind_solver_through_metered_operation(
+    tmp_path: Path,
+) -> None:
+    database, config = database_with_objective(tmp_path)
+    provider = LearningProvider(config)
+    calls: list[tuple[str, str, str]] = []
+
+    def metered_generate(
+        workspace_id: str,
+        operation_id: str,
+        schema: type[Any],
+        **kwargs: Any,
+    ) -> tuple[Any, dict[str, Any]]:
+        calls.append((workspace_id, operation_id, str(kwargs["role"])))
+        return provider.generate(schema, **kwargs)
+
+    semantic_decisions = decisions(database)
+    semantic_decisions.gateway.modes["exercise.prototype.v1"] = "off"
+    runtime = QuestionEngineRuntime(
+        database=database,
+        provider=provider,
+        semantic_decisions=semantic_decisions,
+        metered_generate=metered_generate,
+    )
+
+    runtime.generate_one(
+        owner_user_id=OWNER,
+        workspace_id=WORKSPACE,
+        course_id=COURSE,
+        private_course_id=PRIVATE_COURSE,
+        node_id=NODE,
+        operation_id="metered-do-one-question-0001",
+    )
+
+    assert calls == [
+        (WORKSPACE, "metered-do-one-question-0001", "QUESTION_AUTHOR"),
+        (WORKSPACE, "metered-do-one-question-0001", "QUESTION_BLIND_SOLVER"),
+    ]
+    with database.connect() as connection:
+        operation = connection.execute(
+            "SELECT kind,status,result_json FROM learning_operations "
+            "WHERE workspace_id=? AND id=?",
+            (WORKSPACE, "metered-do-one-question-0001"),
+        ).fetchone()
+    assert operation["kind"] == "QUESTION_GENERATION"
+    assert operation["status"] == "COMPLETED"
+    assert json.loads(operation["result_json"])["status"] == "READY"
+
+    with pytest.raises(QuestionEngineRuntimeError) as replayed:
+        runtime.generate_one(
+            owner_user_id=OWNER,
+            workspace_id=WORKSPACE,
+            course_id=COURSE,
+            private_course_id=PRIVATE_COURSE,
+            node_id=NODE,
+            operation_id="metered-do-one-question-0001",
+        )
+    assert replayed.value.code == "QUESTION_OPERATION_REPLAY"
+    assert len(calls) == 2
+
+
+def test_unexpected_error_after_claim_settles_exact_operation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, config = database_with_objective(tmp_path)
+    runtime = QuestionEngineRuntime(
+        database=database,
+        provider=LearningProvider(config),
+        semantic_decisions=decisions(database),
+        metered_generate=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("provider should not be reached")
+        ),
+    )
+    monkeypatch.setattr(
+        runtime, "_execute_pipeline", lambda **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("synthetic unexpected failure")
+        )
+    )
+
+    with pytest.raises(QuestionEngineRuntimeError) as raised:
+        runtime.generate_one(
+            owner_user_id=OWNER,
+            workspace_id=WORKSPACE,
+            course_id=COURSE,
+            private_course_id=PRIVATE_COURSE,
+            node_id=NODE,
+            operation_id="unexpected-runtime-failure-0001",
+        )
+
+    assert raised.value.code == "QUESTION_ENGINE_FAILED"
+    with database.connect() as connection:
+        status = connection.execute(
+            "SELECT status FROM learning_operations WHERE workspace_id=? AND id=?",
+            (WORKSPACE, "unexpected-runtime-failure-0001"),
+        ).fetchone()["status"]
+    assert status == "FAILED"
+
+
+def test_terminal_ui_reconciliation_preserves_unknown_and_owner_boundary(
+    tmp_path: Path,
+) -> None:
+    database, config = database_with_objective(tmp_path)
+    runtime = QuestionEngineRuntime(
+        database=database,
+        provider=LearningProvider(config),
+        semantic_decisions=decisions(database),
+    )
+    operation_id = "terminal-ui-reconcile-0001"
+    runtime._claim_generation_operation(
+        workspace_id=WORKSPACE,
+        operation_id=operation_id,
+        request_hash="request-hash",
+    )
+    with database.connect() as connection:
+        connection.execute(
+            "INSERT INTO learning_model_call_reservations("
+            "id,workspace_id,operation_id,owner_user_id,course_id,role,"
+            "reserved_output_tokens,status,quota_scope) "
+            "VALUES('reservation-1',?,?,?,?,?,1000,'RESERVED','INTERACTIVE')",
+            (WORKSPACE, operation_id, OWNER, COURSE, "QUESTION_AUTHOR"),
+        )
+
+    wrong_owner = runtime.reconcile_terminal_ui_operation(
+        owner_user_id="different-owner",
+        operation_id=operation_id,
+        ui_status="failed",
+    )
+    reconciled = runtime.reconcile_terminal_ui_operation(
+        owner_user_id=OWNER,
+        operation_id=operation_id,
+        ui_status="failed",
+    )
+
+    assert wrong_owner == {"reconciled": False, "status": None}
+    assert reconciled == {"reconciled": True, "status": "UNKNOWN"}
+    with database.connect() as connection:
+        row = connection.execute(
+            "SELECT status,result_json FROM learning_operations WHERE id=?",
+            (operation_id,),
+        ).fetchone()
+    assert row["status"] == "UNKNOWN"
+    assert json.loads(row["result_json"])["reservation_states"] == ["RESERVED"]
+
+
+def test_generate_one_retries_one_known_author_schema_rejection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, config = database_with_objective(tmp_path)
+    runtime = QuestionEngineRuntime(
+        database=database,
+        provider=LearningProvider(config),
+        semantic_decisions=decisions(database),
+    )
+    original = question_runtime_module.author_question
+    calls = 0
+
+    def flaky_author(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise AuthorGenerationError(
+                "AUTHOR_PROVIDER_FAILED",
+                "synthetic known schema rejection",
+                provider_run={"error_class": "SCHEMA_INVALID"},
+            )
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(question_runtime_module, "author_question", flaky_author)
+
+    result = runtime.generate_one(
+        owner_user_id=OWNER,
+        workspace_id=WORKSPACE,
+        course_id=COURSE,
+        private_course_id=PRIVATE_COURSE,
+        node_id=NODE,
+        operation_id="author-schema-retry-0001",
+    )
+
+    assert result["status"] == "READY"
+    assert calls == 2
+
+
+def test_generate_one_retries_one_known_blind_solver_schema_rejection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, config = database_with_objective(tmp_path)
+    runtime = QuestionEngineRuntime(
+        database=database,
+        provider=LearningProvider(config),
+        semantic_decisions=decisions(database),
+    )
+    original = question_runtime_module.run_blind_solve
+    calls = 0
+
+    def flaky_blind_solver(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise BlindSolveError(
+                "BLIND_SOLVER_PROVIDER_FAILED",
+                "synthetic known schema rejection",
+                provider_run={"error_class": "SCHEMA_INVALID"},
+            )
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(question_runtime_module, "run_blind_solve", flaky_blind_solver)
+
+    result = runtime.generate_one(
+        owner_user_id=OWNER,
+        workspace_id=WORKSPACE,
+        course_id=COURSE,
+        private_course_id=PRIVATE_COURSE,
+        node_id=NODE,
+        operation_id="blind-schema-retry-0001",
+    )
+
+    assert result["status"] == "READY"
+    assert calls == 2
+
+
+def test_ready_question_is_reused_without_a_second_model_operation(tmp_path: Path) -> None:
+    database, config = database_with_objective(tmp_path)
+    provider = LearningProvider(config)
+    calls: list[tuple[str, str, str]] = []
+
+    def metered_generate(
+        workspace_id: str,
+        operation_id: str,
+        schema: type[Any],
+        **kwargs: Any,
+    ) -> tuple[Any, dict[str, Any]]:
+        calls.append((workspace_id, operation_id, str(kwargs["role"])))
+        return provider.generate(schema, **kwargs)
+
+    semantic_decisions = decisions(database)
+    semantic_decisions.gateway.modes["exercise.prototype.v1"] = "off"
+    runtime = QuestionEngineRuntime(
+        database=database,
+        provider=provider,
+        semantic_decisions=semantic_decisions,
+        metered_generate=metered_generate,
+    )
+    seeded = runtime.generate_one(
+        owner_user_id=OWNER,
+        workspace_id=WORKSPACE,
+        course_id=COURSE,
+        private_course_id=PRIVATE_COURSE,
+        node_id=NODE,
+        operation_id="seed-ready-question-0001",
+    )
+
+    reused = runtime.reuse_ready_or_generate(
+        owner_user_id=OWNER,
+        workspace_id=WORKSPACE,
+        course_id=COURSE,
+        private_course_id=PRIVATE_COURSE,
+        node_id=NODE,
+        operation_id="deliver-ready-question-0001",
+    )
+
+    assert reused["question_revision_id"] == seeded["question_revision_id"]
+    assert reused["public"] == seeded["public"]
+    assert reused["private"] == seeded["private"]
+    assert reused["references"] == seeded["references"]
+    assert reused["usage"] == [
+        {"role": "QUESTION_READY_POOL", "status": "REUSED"},
+        {"role": "QUESTION_AUTHOR", "status": "NOT_CALLED_READY_REUSE"},
+        {"role": "QUESTION_BLIND_SOLVER", "status": "NOT_CALLED_READY_REUSE"},
+    ]
+    assert calls == [
+        (WORKSPACE, "seed-ready-question-0001", "QUESTION_AUTHOR"),
+        (WORKSPACE, "seed-ready-question-0001", "QUESTION_BLIND_SOLVER"),
+    ]
+    with database.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM learning_operations WHERE workspace_id=? AND id=?",
+            (WORKSPACE, "deliver-ready-question-0001"),
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM learning_model_call_reservations "
+            "WHERE workspace_id=? AND operation_id=?",
+            (WORKSPACE, "deliver-ready-question-0001"),
+        ).fetchone()[0] == 0
+
+
+def test_compatible_assessment_ready_blueprint_projects_as_practice() -> None:
+    compatible = {
+        "blueprint_id": "assessment_compatible_short_answer",
+        "generation_policy_version": "assessment-generation.v1",
+        "bloom_target": "UNDERSTAND",
+        "target_difficulty": 2,
+        "question_type": "SHORT_TEXT",
+        "expected_answer_form": "SHORT_ANSWER",
+    }
+    assert (
+        QuestionEngineRuntime._prototype_id_for_blueprint(compatible)
+        == "concept_short_answer"
+    )
+
+    assessment_mcq = {
+        **compatible,
+        "blueprint_id": "assessment_ready_mcq",
+        "bloom_target": "REMEMBER",
+        "target_difficulty": 1,
+        "question_type": "MCQ_SINGLE",
+        "expected_answer_form": "SINGLE_CHOICE",
+    }
+    assert (
+        QuestionEngineRuntime._prototype_id_for_blueprint(assessment_mcq)
+        == "assessment_ready"
+    )
+
+
+def test_validated_assessment_mcq_is_reused_as_practice_without_authoring(
+    tmp_path: Path,
+) -> None:
+    database, config = database_with_objective(tmp_path)
+    provider = LearningProvider(config)
+    calls: list[str] = []
+
+    def metered_generate(
+        _workspace_id: str,
+        _operation_id: str,
+        schema: type[Any],
+        **kwargs: Any,
+    ) -> tuple[Any, dict[str, Any]]:
+        calls.append(str(kwargs["role"]))
+        return provider.generate(schema, **kwargs)
+
+    semantic_decisions = decisions(database)
+    semantic_decisions.gateway.modes["exercise.prototype.v1"] = "off"
+    runtime = QuestionEngineRuntime(
+        database=database,
+        provider=provider,
+        semantic_decisions=semantic_decisions,
+        metered_generate=metered_generate,
+    )
+    seeded = runtime.generate_one(
+        owner_user_id=OWNER,
+        workspace_id=WORKSPACE,
+        course_id=COURSE,
+        private_course_id=PRIVATE_COURSE,
+        node_id=NODE,
+        operation_id="seed-assessment-mcq-0001",
+    )
+    with database.connect() as connection:
+        # Build an assessment-shaped immutable fixture from the generated row.
+        # Production never mutates these records; this isolated database drops
+        # only the two update guards needed to avoid duplicating the full
+        # assessment authoring setup in a projection unit test.
+        connection.execute("DROP TRIGGER immutable_question_engine_provenance_update")
+        connection.execute("DROP TRIGGER immutable_assessment_question_content")
+        row = connection.execute(
+            "SELECT blueprint_json FROM question_engine_provenance "
+            "WHERE question_revision_id=?",
+            (seeded["question_revision_id"],),
+        ).fetchone()
+        blueprint = json.loads(row["blueprint_json"])
+        blueprint.update(
+            {
+                "blueprint_id": "assessment_ready_mcq",
+                "generation_policy_version": "assessment-generation.v1",
+                "bloom_target": "REMEMBER",
+                "target_difficulty": 1,
+                "question_type": "MCQ_SINGLE",
+                "expected_answer_form": "SINGLE_CHOICE",
+            }
+        )
+        connection.execute(
+            "UPDATE question_engine_provenance SET blueprint_id=?,blueprint_json=? "
+            "WHERE question_revision_id=?",
+            (
+                "assessment_ready_mcq",
+                json.dumps(blueprint, ensure_ascii=False, sort_keys=True),
+                seeded["question_revision_id"],
+            ),
+        )
+        connection.execute(
+            "UPDATE assessment_question_revisions SET question_type='MCQ_SINGLE',"
+            "options_json=? WHERE id=?",
+            (json.dumps(["Correct", "Distractor"]), seeded["question_revision_id"]),
+        )
+        connection.execute(
+            "UPDATE assessment_reference_solutions SET answer_json=? "
+            "WHERE question_revision_id=?",
+            (json.dumps("Correct"), seeded["question_revision_id"]),
+        )
+
+    reused = runtime.reuse_ready_or_generate(
+        owner_user_id=OWNER,
+        workspace_id=WORKSPACE,
+        course_id=COURSE,
+        private_course_id=PRIVATE_COURSE,
+        node_id=NODE,
+        operation_id="reuse-assessment-mcq-0001",
+    )
+
+    assert reused["question_revision_id"] == seeded["question_revision_id"]
+    assert reused["prototype_id"] == "assessment_ready"
+    assert reused["public"]["question_type"] == "MCQ_SINGLE"
+    assert reused["public"]["options"] == ["Correct", "Distractor"]
+    assert "A. Correct" in reused["public"]["question_text"]
+    assert "B. Distractor" in reused["public"]["question_text"]
+
+    correct = runtime.grade_practice_attempt(
+        owner_user_id=OWNER,
+        workspace_id=WORKSPACE,
+        question_revision_id=seeded["question_revision_id"],
+        operation_id="grade-assessment-mcq-correct-0001",
+        submitted_answer="A",
+    )
+    incorrect = runtime.grade_practice_attempt(
+        owner_user_id=OWNER,
+        workspace_id=WORKSPACE,
+        question_revision_id=seeded["question_revision_id"],
+        operation_id="grade-assessment-mcq-incorrect-0001",
+        submitted_answer="B",
+    )
+
+    assert correct["verdict"] == "CORRECT"
+    assert incorrect["verdict"] == "INCORRECT"
+    assert correct["usage"]["provider"] == "HOST_DETERMINISTIC"
+    assert correct["usage"]["input_tokens"] == 0
+    assert correct["usage"]["output_tokens"] == 0
+    assert calls == ["QUESTION_AUTHOR", "QUESTION_BLIND_SOLVER"]
+
+
+def test_exposed_ready_family_falls_back_to_one_new_generation(tmp_path: Path) -> None:
+    database, config = database_with_objective(tmp_path)
+    provider = LearningProvider(config)
+    calls: list[tuple[str, str]] = []
+
+    def metered_generate(
+        _workspace_id: str,
+        operation_id: str,
+        schema: type[Any],
+        **kwargs: Any,
+    ) -> tuple[Any, dict[str, Any]]:
+        calls.append((operation_id, str(kwargs["role"])))
+        return provider.generate(schema, **kwargs)
+
+    semantic_decisions = decisions(database)
+    semantic_decisions.gateway.modes["exercise.prototype.v1"] = "off"
+    runtime = QuestionEngineRuntime(
+        database=database,
+        provider=provider,
+        semantic_decisions=semantic_decisions,
+        metered_generate=metered_generate,
+    )
+    seeded = runtime.generate_one(
+        owner_user_id=OWNER,
+        workspace_id=WORKSPACE,
+        course_id=COURSE,
+        private_course_id=PRIVATE_COURSE,
+        node_id=NODE,
+        operation_id="seed-exposed-question-0001",
+    )
+    with database.connect() as connection:
+        question = connection.execute(
+            "SELECT family_id,content_hash FROM assessment_question_revisions WHERE id=?",
+            (seeded["question_revision_id"],),
+        ).fetchone()
+        connection.execute(
+            "INSERT INTO learning_loop_exposures("
+            "id,owner_user_id,workspace_id,question_revision_id,family_id,"
+            "question_content_hash,kind,channel,assignment_id,ordering,receipt) "
+            "VALUES('exposure-ready-pool',?,?,?,?,?,'STEM','PROBLEM_PANE',NULL,"
+            "'SERVER_ORDERED','ready-pool-exposure')",
+            (
+                OWNER,
+                WORKSPACE,
+                seeded["question_revision_id"],
+                question["family_id"],
+                question["content_hash"],
+            ),
+        )
+
+    replenished = runtime.reuse_ready_or_generate(
+        owner_user_id=OWNER,
+        workspace_id=WORKSPACE,
+        course_id=COURSE,
+        private_course_id=PRIVATE_COURSE,
+        node_id=NODE,
+        operation_id="replenish-exposed-question-0001",
+    )
+
+    assert replenished["question_revision_id"] != seeded["question_revision_id"]
+    assert calls == [
+        ("seed-exposed-question-0001", "QUESTION_AUTHOR"),
+        ("seed-exposed-question-0001", "QUESTION_BLIND_SOLVER"),
+        ("replenish-exposed-question-0001", "QUESTION_AUTHOR"),
+        ("replenish-exposed-question-0001", "QUESTION_BLIND_SOLVER"),
+    ]
+
+
+def test_invalid_blueprint_fails_static_preflight_before_parent_or_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, config = database_with_objective(tmp_path)
+    provider = LearningProvider(config)
+    calls: list[str] = []
+
+    def metered_generate(*_args: Any, **kwargs: Any) -> tuple[Any, dict[str, Any]]:
+        calls.append(str(kwargs["role"]))
+        return provider.generate(_args[2], **kwargs)
+
+    runtime = QuestionEngineRuntime(
+        database=database,
+        provider=provider,
+        semantic_decisions=decisions(database),
+        metered_generate=metered_generate,
+    )
+    original_blueprint = runtime._blueprint
+
+    def invalid_blueprint(**kwargs: Any) -> Any:
+        kwargs["objective"] = replace(
+            kwargs["objective"], objective="Density clustering"
+        )
+        return original_blueprint(**kwargs)
+
+    monkeypatch.setattr(runtime, "_blueprint", invalid_blueprint)
+
+    with pytest.raises(QuestionEngineRuntimeError) as refused:
+        runtime.generate_one(
+            owner_user_id=OWNER,
+            workspace_id=WORKSPACE,
+            course_id=COURSE,
+            private_course_id=PRIVATE_COURSE,
+            node_id=NODE,
+            operation_id="invalid-blueprint-operation",
+        )
+
+    assert refused.value.code == "QUESTION_BLUEPRINT_INVALID"
+    assert calls == []
+    with database.connect() as connection:
+        operation = connection.execute(
+            "SELECT status FROM learning_operations WHERE workspace_id=? AND id=?",
+            (WORKSPACE, "invalid-blueprint-operation"),
+        ).fetchone()
+        reservations = connection.execute(
+            "SELECT COUNT(*) FROM learning_model_call_reservations "
+            "WHERE workspace_id=? AND operation_id=?",
+            (WORKSPACE, "invalid-blueprint-operation"),
+        ).fetchone()[0]
+    assert operation is None
+    assert reservations == 0
+
+
+def test_static_preflight_builds_the_real_blueprint_without_claiming_or_calling(
+    tmp_path: Path,
+) -> None:
+    database, config = database_with_objective(tmp_path)
+    semantic_decisions = decisions(database)
+    transport = semantic_decisions.gateway.transport
+    runtime = QuestionEngineRuntime(
+        database=database,
+        provider=LearningProvider(config),
+        semantic_decisions=semantic_decisions,
+        metered_generate=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("static preflight attempted a model call")
+        ),
+    )
+
+    result = runtime.preflight_generate_one(
+        owner_user_id=OWNER,
+        workspace_id=WORKSPACE,
+        course_id=COURSE,
+        private_course_id=PRIVATE_COURSE,
+        node_id=NODE,
+        operation_id="static-preflight-question-0001",
+    )
+
+    assert result["status"] == "STATIC_PREFLIGHT_PASSED"
+    assert result["blueprint"]["schema_version"] == "question-blueprint.v1"
+    assert result["blueprint"]["objective_id"] == "objective-density"
+    assert result["blueprint_hash"]
+    assert result["evidence_pack_hash"]
+    assert getattr(transport, "calls", []) == []
+    with database.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM learning_operations WHERE id=?",
+            ("static-preflight-question-0001",),
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM learning_model_call_reservations WHERE operation_id=?",
+            ("static-preflight-question-0001",),
+        ).fetchone()[0] == 0
+
+
+def test_invalid_objective_is_refused_before_operation_claim_and_jev(
+    tmp_path: Path,
+) -> None:
+    database, config = database_with_objective(tmp_path)
+    invalid_node = "node-invalid-objective"
+    invalid_item = {
+        "item_id": "objective-invalid",
+        "requirement": "REQUIRED",
+        "objective": "Density clustering",
+        "acceptance": "Describe the supplied rule accurately",
+        "evidence_ids": ["chunk-course"],
+    }
+    invalid_spec = json.dumps([invalid_item], ensure_ascii=False)
+    with database.connect() as connection:
+        connection.execute(
+            "INSERT INTO knowledge_nodes(id,course_id,owner_user_id,title,description,major,kind,status) "
+            "VALUES(?,?,?,'Invalid objective','Synthetic','CS','ATOMIC','PRIVATE')",
+            (invalid_node, COURSE, OWNER),
+        )
+        connection.execute(
+            "INSERT INTO teaching_specs(node_id,version,content_json,content_hash) VALUES(?,1,?,?)",
+            (invalid_node, invalid_spec, __import__("hashlib").sha256(invalid_spec.encode()).hexdigest()),
+        )
+    semantic_decisions = decisions(database)
+    transport = semantic_decisions.gateway.transport
+    runtime = QuestionEngineRuntime(
+        database=database,
+        provider=LearningProvider(config),
+        semantic_decisions=semantic_decisions,
+        metered_generate=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("invalid local input attempted a model call")
+        ),
+    )
+
+    with pytest.raises(QuestionEngineRuntimeError) as refusal:
+        runtime.generate_one(
+            owner_user_id=OWNER,
+            workspace_id=WORKSPACE,
+            course_id=COURSE,
+            private_course_id=PRIVATE_COURSE,
+            node_id=invalid_node,
+            operation_id="invalid-objective-preflight-0001",
+        )
+
+    assert refusal.value.code == "QUESTION_BLUEPRINT_INVALID"
+    assert getattr(transport, "calls", []) == []
+    with database.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM learning_operations WHERE id=?",
+            ("invalid-objective-preflight-0001",),
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM learning_model_call_reservations WHERE operation_id=?",
+            ("invalid-objective-preflight-0001",),
+        ).fetchone()[0] == 0
+
+
+def test_runtime_rule_violation_prototype_persists_an_exact_course_rule(
+    tmp_path: Path,
+) -> None:
+    database, config = database_with_objective(tmp_path)
+    runtime = QuestionEngineRuntime(
+        database=database,
+        provider=LearningProvider(config),
+        semantic_decisions=decisions(database, prototype_id="rule_violation_analysis"),
+    )
+
+    result = runtime.generate_one(
+        owner_user_id=OWNER,
+        workspace_id=WORKSPACE,
+        course_id=COURSE,
+        private_course_id=PRIVATE_COURSE,
+        node_id=NODE,
+        operation_id="rule-violation-question-0001",
+    )
+
+    assert result["status"] == "READY"
+    assert result["prototype_id"] == "rule_violation_analysis"
+    assert "violated rule" in result["public"]["question_text"]
+    assert "rule_violation_analysis" not in result["public"]
+    with database.connect() as connection:
+        row = connection.execute(
+            "SELECT provenance.blueprint_json,provenance.validation_report_json,"
+            "question.answer_json "
+            "FROM question_engine_provenance AS provenance "
+            "JOIN assessment_question_revisions AS question "
+            "ON question.id=provenance.question_revision_id "
+            "WHERE provenance.question_revision_id=?",
+            (result["question_revision_id"],),
+        ).fetchone()
+    blueprint = json.loads(row["blueprint_json"])
+    validation_report = json.loads(row["validation_report_json"])
+    answer = json.loads(row["answer_json"])
+    analysis = answer["rule_violation_analysis"]
+    assert blueprint["generation_policy_version"] == RULE_VIOLATION_POLICY_VERSION
+    assert analysis["rule_source_ref"] == "chunk-course"
+    assert analysis["rule_quote"] == (
+        "A core point has at least MinPts points in its epsilon neighbourhood."
+    )
+    assert analysis["proposed_statement"] in result["public"]["question_text"]
+    assert [signal["dimension"] for signal in validation_report["semantic_signals"]] == [
+        "AMBIGUITY",
+        "AUTHOR_BLIND_AGREEMENT",
+        "RULE_VIOLATION_QUALITY",
+    ]
+    assert validation_report["semantic_signals"][2]["verdict"] == "SUPPORTED"
+
+
+def test_rule_quality_shadow_signal_cannot_publish_a_question(tmp_path: Path) -> None:
+    database, config = database_with_objective(tmp_path)
+    semantic_decisions = decisions(database, prototype_id="rule_violation_analysis")
+    semantic_decisions.gateway.modes["question.rule_violation_quality.v1"] = "shadow"
+    runtime = QuestionEngineRuntime(
+        database=database,
+        provider=LearningProvider(config),
+        semantic_decisions=semantic_decisions,
+    )
+
+    with pytest.raises(QuestionEngineRuntimeError) as raised:
+        runtime.generate_one(
+            owner_user_id=OWNER,
+            workspace_id=WORKSPACE,
+            course_id=COURSE,
+            private_course_id=PRIVATE_COURSE,
+            node_id=NODE,
+            operation_id="rule-violation-shadow-quality",
+        )
+
+    assert raised.value.code == "QUESTION_NOT_READY"
+    with database.connect() as connection:
+        status = connection.execute(
+            "SELECT publication_status FROM question_engine_provenance"
+        ).fetchone()["publication_status"]
+    assert status == "NEEDS_REVIEW"
+
+
+def test_runtime_repractice_uses_a_new_family_without_changing_the_objective(
+    tmp_path: Path,
+) -> None:
+    database, config = database_with_objective(tmp_path)
+    runtime = QuestionEngineRuntime(
+        database=database,
+        provider=LearningProvider(config),
+        semantic_decisions=decisions(database),
+    )
+
+    first = runtime.generate_one(
+        owner_user_id=OWNER,
+        workspace_id=WORKSPACE,
+        course_id=COURSE,
+        private_course_id=PRIVATE_COURSE,
+        node_id=NODE,
+        operation_id="do-one-question-variant-a",
+    )
+    second = runtime.generate_one(
+        owner_user_id=OWNER,
+        workspace_id=WORKSPACE,
+        course_id=COURSE,
+        private_course_id=PRIVATE_COURSE,
+        node_id=NODE,
+        operation_id="do-one-question-variant-b",
+    )
+
+    assert first["question_revision_id"] != second["question_revision_id"]
+    with database.connect() as connection:
+        rows = connection.execute(
+            "SELECT question.family_id,provenance.objective_id "
+            "FROM assessment_question_revisions AS question "
+            "JOIN question_engine_provenance AS provenance "
+            "ON provenance.question_revision_id=question.id ORDER BY question.rowid"
+        ).fetchall()
+    assert len({row["family_id"] for row in rows}) == 2
+    assert {row["objective_id"] for row in rows} == {"objective-density"}
+
+
+def test_practice_hint_and_attempt_are_owner_scoped_idempotent_and_not_grades(
+    tmp_path: Path,
+) -> None:
+    database, config = database_with_objective(tmp_path)
+    provider = LearningProvider(config)
+    runtime = QuestionEngineRuntime(
+        database=database,
+        provider=provider,
+        semantic_decisions=decisions(database),
+    )
+    generated = runtime.generate_one(
+        owner_user_id=OWNER,
+        workspace_id=WORKSPACE,
+        course_id=COURSE,
+        private_course_id=PRIVATE_COURSE,
+        node_id=NODE,
+        operation_id="practice-interaction-question",
+    )
+    question_id = generated["question_revision_id"]
+
+    calls: list[str] = []
+    metered_calls: list[tuple[str, str, str]] = []
+    original_generate = provider.generate
+
+    def counted_generate(schema: Any, **kwargs: Any) -> Any:
+        calls.append(schema.__name__)
+        return original_generate(schema, **kwargs)
+
+    provider.generate = counted_generate  # type: ignore[method-assign]
+
+    def metered_generate(
+        workspace_id: str,
+        operation_id: str,
+        schema: Any,
+        **kwargs: Any,
+    ) -> Any:
+        metered_calls.append((workspace_id, operation_id, kwargs["role"]))
+        return provider.generate(schema, **kwargs)
+
+    runtime.metered_generate = metered_generate
+    hint = runtime.generate_hint(
+        owner_user_id=OWNER,
+        workspace_id=WORKSPACE,
+        question_revision_id=question_id,
+        operation_id="practice-hint-operation",
+    )
+    replayed_hint = runtime.generate_hint(
+        owner_user_id=OWNER,
+        workspace_id=WORKSPACE,
+        question_revision_id=question_id,
+        operation_id="practice-hint-operation",
+    )
+    attempt = runtime.grade_practice_attempt(
+        owner_user_id=OWNER,
+        workspace_id=WORKSPACE,
+        question_revision_id=question_id,
+        operation_id="practice-attempt-operation",
+        submitted_answer="A learner-specific synthetic answer.",
+        answer_revealed=False,
+    )
+    replayed_attempt = runtime.grade_practice_attempt(
+        owner_user_id=OWNER,
+        workspace_id=WORKSPACE,
+        question_revision_id=question_id,
+        operation_id="practice-attempt-operation",
+        submitted_answer="A learner-specific synthetic answer.",
+        answer_revealed=False,
+    )
+
+    assert hint == replayed_hint
+    assert attempt == replayed_attempt
+    assert calls == ["PracticeHintOutput", "PracticeFeedbackOutput"]
+    assert metered_calls == [
+        (WORKSPACE, "practice-hint-operation", "PRACTICE_HINT"),
+        (WORKSPACE, "practice-attempt-operation", "PRACTICE_FEEDBACK"),
+    ]
+    assert hint["assistance"] == "HINT"
+    assert "Synthetic candidate answer" not in hint["hint"]
+    assert attempt["assistance"] == "HINT"
+    assert attempt["verdict"] in {"CORRECT", "PARTIAL", "INCORRECT", "NEEDS_REVIEW"}
+    assert attempt["feedback"]
+
+    with database.connect() as connection:
+        stored_hint = connection.execute(
+            "SELECT * FROM practice_hint_events WHERE operation_id=?",
+            ("practice-hint-operation",),
+        ).fetchone()
+        stored_attempt = connection.execute(
+            "SELECT * FROM practice_question_attempts WHERE operation_id=?",
+            ("practice-attempt-operation",),
+        ).fetchone()
+        grade_count = connection.execute("SELECT COUNT(*) FROM grade_snapshots").fetchone()[0]
+        evidence_count = connection.execute(
+            "SELECT COUNT(*) FROM performance_evidence"
+        ).fetchone()[0]
+        coverage_count = connection.execute(
+            "SELECT COUNT(*) FROM learning_coverage"
+        ).fetchone()[0]
+        guards = connection.execute(
+            "SELECT operation_id,guard_version FROM practice_operation_metering_guards "
+            "ORDER BY operation_id"
+        ).fetchall()
+    assert stored_hint["owner_user_id"] == OWNER
+    assert stored_attempt["owner_user_id"] == OWNER
+    assert stored_attempt["assistance"] == "HINT"
+    assert [tuple(row) for row in guards] == [
+        ("practice-attempt-operation", "metered-practice.v1"),
+        ("practice-hint-operation", "metered-practice.v1"),
+    ]
+    assert grade_count == evidence_count == coverage_count == 0
+
+
+def test_practice_attempt_after_reveal_is_never_independent(tmp_path: Path) -> None:
+    database, config = database_with_objective(tmp_path)
+    runtime = QuestionEngineRuntime(
+        database=database,
+        provider=LearningProvider(config),
+        semantic_decisions=decisions(database),
+    )
+    generated = runtime.generate_one(
+        owner_user_id=OWNER,
+        workspace_id=WORKSPACE,
+        course_id=COURSE,
+        private_course_id=PRIVATE_COURSE,
+        node_id=NODE,
+        operation_id="revealed-practice-question",
+    )
+
+    result = runtime.grade_practice_attempt(
+        owner_user_id=OWNER,
+        workspace_id=WORKSPACE,
+        question_revision_id=generated["question_revision_id"],
+        operation_id="revealed-practice-attempt",
+        submitted_answer="Answer written after the reference solution was shown.",
+        answer_revealed=True,
+    )
+
+    assert result["assistance"] == "ANSWER_REVEALED"
+    assert result["independent"] is False
+
+
+def test_failed_practice_operation_is_not_billed_again_on_replay(tmp_path: Path) -> None:
+    database, config = database_with_objective(tmp_path)
+    provider = LearningProvider(config)
+    runtime = QuestionEngineRuntime(
+        database=database,
+        provider=provider,
+        semantic_decisions=decisions(database),
+    )
+    generated = runtime.generate_one(
+        owner_user_id=OWNER,
+        workspace_id=WORKSPACE,
+        course_id=COURSE,
+        private_course_id=PRIVATE_COURSE,
+        node_id=NODE,
+        operation_id="failed-practice-question",
+    )
+    calls = 0
+
+    def blocked_generate(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        raise ProviderCallFailure(
+            ApiError(503, "MODEL_LIVE_BLOCKED", "synthetic blocked provider"), {}
+        )
+
+    provider.generate = blocked_generate  # type: ignore[method-assign]
+    for _ in range(2):
+        with pytest.raises(QuestionEngineRuntimeError) as raised:
+            runtime.generate_hint(
+                owner_user_id=OWNER,
+                workspace_id=WORKSPACE,
+                question_revision_id=generated["question_revision_id"],
+                operation_id="blocked-practice-hint",
+            )
+        assert raised.value.code == "PRACTICE_HINT_PROVIDER_BLOCKED"
+    assert calls == 1
+
+
+def test_metered_practice_refusal_is_terminal_and_not_retried(tmp_path: Path) -> None:
+    database, config = database_with_objective(tmp_path)
+    runtime = QuestionEngineRuntime(
+        database=database,
+        provider=LearningProvider(config),
+        semantic_decisions=decisions(database),
+    )
+    generated = runtime.generate_one(
+        owner_user_id=OWNER,
+        workspace_id=WORKSPACE,
+        course_id=COURSE,
+        private_course_id=PRIVATE_COURSE,
+        node_id=NODE,
+        operation_id="metered-refusal-question",
+    )
+    calls = 0
+
+    def refused_generate(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        raise ApiError(429, "DAILY_MODEL_CALL_QUOTA", "synthetic quota refusal")
+
+    runtime.metered_generate = refused_generate
+    for _ in range(2):
+        with pytest.raises(QuestionEngineRuntimeError) as raised:
+            runtime.generate_hint(
+                owner_user_id=OWNER,
+                workspace_id=WORKSPACE,
+                question_revision_id=generated["question_revision_id"],
+                operation_id="metered-refusal-hint",
+            )
+        assert raised.value.code == "PRACTICE_HINT_PROVIDER_BLOCKED"
+    assert calls == 1
+
+
+def test_hint_strategy_cannot_leak_the_hidden_reference_answer(tmp_path: Path) -> None:
+    database, config = database_with_objective(tmp_path)
+    provider = LearningProvider(config)
+    runtime = QuestionEngineRuntime(
+        database=database,
+        provider=provider,
+        semantic_decisions=decisions(database),
+    )
+    generated = runtime.generate_one(
+        owner_user_id=OWNER,
+        workspace_id=WORKSPACE,
+        course_id=COURSE,
+        private_course_id=PRIVATE_COURSE,
+        node_id=NODE,
+        operation_id="hint-leak-practice-question",
+    )
+    original_generate = provider.generate
+
+    def leaking_strategy(schema: Any, **kwargs: Any) -> Any:
+        output, run = original_generate(schema, **kwargs)
+        if schema.__name__ == "PracticeHintOutput":
+            output = output.model_copy(
+                update={"strategy": "[FAKE TEST FIXTURE] Synthetic candidate answer."}
+            )
+        return output, run
+
+    provider.generate = leaking_strategy  # type: ignore[method-assign]
+    with pytest.raises(QuestionEngineRuntimeError) as raised:
+        runtime.generate_hint(
+            owner_user_id=OWNER,
+            workspace_id=WORKSPACE,
+            question_revision_id=generated["question_revision_id"],
+            operation_id="hint-strategy-leak-operation",
+        )
+    assert raised.value.code == "PRACTICE_HINT_ANSWER_LEAK"
+
+
+def test_hint_event_must_match_its_claimed_hint_operation(tmp_path: Path) -> None:
+    database, config = database_with_objective(tmp_path)
+    runtime = QuestionEngineRuntime(
+        database=database,
+        provider=LearningProvider(config),
+        semantic_decisions=decisions(database),
+    )
+    generated = runtime.generate_one(
+        owner_user_id=OWNER,
+        workspace_id=WORKSPACE,
+        course_id=COURSE,
+        private_course_id=PRIVATE_COURSE,
+        node_id=NODE,
+        operation_id="hint-operation-correlation-question",
+    )
+    question_id = generated["question_revision_id"]
+    input_hash = "a" * 64
+
+    with database.connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO practice_interaction_operations(
+                workspace_id,operation_id,question_revision_id,owner_user_id,
+                kind,input_hash,status
+            ) VALUES(?,?,?,?,?,?,?)
+            """,
+            (
+                WORKSPACE,
+                "mismatched-attempt-operation",
+                question_id,
+                OWNER,
+                "ATTEMPT",
+                input_hash,
+                "CLAIMED",
+            ),
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="Practice hint does not match"):
+            connection.execute(
+                """
+                INSERT INTO practice_hint_events(
+                    id,workspace_id,question_revision_id,owner_user_id,
+                    operation_id,input_hash,hint_json,provider_run_json
+                ) VALUES(?,?,?,?,?,?,?,?)
+                """,
+                (
+                    "invalid-hint-event",
+                    WORKSPACE,
+                    question_id,
+                    OWNER,
+                    "mismatched-attempt-operation",
+                    input_hash,
+                    "{}",
+                    "{}",
+                ),
+            )

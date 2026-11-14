@@ -1,0 +1,578 @@
+import asyncio
+import logging
+from contextlib import asynccontextmanager, suppress
+
+from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from app.api.canvas import router as canvas_router
+from app.api.canvas_local import router as canvas_local_router
+from app.api.feedback import router as feedback_router
+from app.api.ingestion import router as ingestion_router
+from app.api.learning import router as learning_router
+from app.api.publication import router as publication_router
+from app.api.qa import router as qa_router
+from app.api.teaching_profiles import router as teaching_profiles_router
+from app.api.tool_intent import router as tool_intent_router
+from app.auth import AuthVerifier, ClerkAuthVerifier, TestAuthVerifier
+from app.brand import BRAND
+from app.canvas.credentials import CredentialStoreUnavailable, credential_store_from_settings
+from app.canvas.oauth import CanvasOAuthClient, SqlStateStore
+from app.canvas.registry import InstitutionConnectionRegistry
+from app.canvas.transient_credential import TransientCanvasCredentialStore
+from app.config import Settings
+from app.db import Database
+from app.errors import ApiError
+from app.jev.gateway import DisabledTransport, JevGateway, OpenJevTransport, Transport
+from app.jev.receipt_store import SqlReceiptStore
+from app.jev.service import SemanticDecisionService
+from app.learning.assessment_entry_source_catalog import AssessmentEntrySourceCatalogReader
+from app.learning.assessment_point_configuration import AssessmentPointPolicyService
+from app.learning.deepseek_reviewer import DeepSeekStrongReviewer
+from app.learning.deterministic_graph_point_catalog import (
+    DeterministicGraphPointCatalogReader,
+)
+from app.learning.generic_provider import build_generic_provider, generic_model_settings
+from app.learning.hybrid_quality import HybridQualityService
+from app.learning.openjev_observer import OpenJevLocalObserver
+from app.learning.orchestrator import LearningOrchestrator
+from app.learning.provider import LearningProvider
+from app.rag.answers import (
+    AnswerProvider,
+    DeepSeekAnswerProvider,
+    ExtractiveAnswerProvider,
+    MissingAnswerProvider,
+    QwenAnswerProvider,
+)
+from app.rag.embeddings import (
+    DeterministicEmbeddingProvider,
+    EmbeddingProvider,
+    OpenAIEmbeddingProvider,
+)
+from app.rag.retrieval import HybridRetriever
+from app.repositories.chunks import ChunkRepository
+from app.services.auto_knowledge_map import AutoKnowledgeMapService
+from app.services.ingestion import IngestionService, MissingEmbeddingProvider
+from app.services.knowledge_publication import KnowledgePublicationService
+from app.services.official_knowledge_draft_builder import OfficialKnowledgeDraftBuilder
+from app.services.overlay_publication import OverlayPublicationService
+from app.services.publication import PublicationService
+from app.services.qa import QaService
+from app.services.teaching_profiles import TeachingProfileService
+
+LOGGER = logging.getLogger(__name__)
+
+
+def jev_transport_from_settings(settings: Settings) -> Transport:
+    """Build the only live semantic transport allowed for new requests.
+
+    Historical TypeSafe receipts remain readable, but there is deliberately no
+    TypeSafe construction or fallback here. A deployment either names the
+    pinned loopback OpenJev service or receives a local typed-disabled result.
+    """
+    if settings.jev_provider != "openjev":
+        return DisabledTransport()
+    token = settings.openjev_bearer_token
+    if token is None:  # guarded by Settings; retain a fail-closed boundary here.
+        raise RuntimeError("OPENJEV_BEARER_TOKEN is required")
+    return OpenJevTransport(
+        endpoint=settings.openjev_endpoint,
+        bearer_token=token.get_secret_value(),
+        expected_model_revision=settings.openjev_model_revision,
+    )
+
+
+def hybrid_reviewer_from_settings(
+    settings: Settings,
+    database: Database,
+    *,
+    jev_service: SemanticDecisionService | None = None,
+) -> HybridQualityService | None:
+    """Build the ``hybrid-strict-v1`` reviewer chain, or ``None`` when disabled.
+
+    Off unless the deployment explicitly opts in, so the default Question Engine
+    path keeps its previous local-review-only behaviour and never makes an
+    unrequested paid call.  The reviewer reuses the already configured DeepSeek
+    generation role and its protected credential: no second provider, no second
+    key, and no silent downgrade of the configured quality.
+    """
+    if not settings.hybrid_quality_enabled:
+        return None
+    provider = (
+        build_generic_provider(settings)
+        if settings.generic_llm_enabled
+        else LearningProvider(settings)
+    )
+    reviewer = DeepSeekStrongReviewer(
+        provider,
+        model_alias=provider.cache_model,
+        provider_label=(
+            "DEEPSEEK_API"
+            if provider.cache_model == "deepseek-flash"
+            else "ALIBABA_MODEL_STUDIO_COMPATIBLE"
+        ),
+        protocol=provider.cache_protocol,
+        max_output_tokens=settings.hybrid_review_max_output_tokens,
+    )
+    observer = (
+        OpenJevLocalObserver(jev_service) if jev_service is not None else None
+    )
+    return HybridQualityService(database, reviewer, local_observer=observer)
+
+
+def create_app(
+    *,
+    settings: Settings | None = None,
+    embedding_provider: EmbeddingProvider | None = None,
+    answer_provider: AnswerProvider | None = None,
+    auth_verifier: AuthVerifier | None = None,
+    ui_provider: object | None = None,
+    ui_coverage_reviewer: object | None = None,
+    assessment_point_policy: AssessmentPointPolicyService | None = None,
+) -> FastAPI:
+    resolved_settings = settings or Settings()
+    if resolved_settings.auth_test_user_id and (
+        resolved_settings.app_env != "test"
+        or resolved_settings.rag_provider_mode != "deterministic"
+    ):
+        raise RuntimeError("AUTH_TEST_USER_ID is allowed only in test deterministic mode.")
+    if (
+        auth_verifier is None
+        and not resolved_settings.auth_test_user_id
+        and not (resolved_settings.clerk_secret_key or resolved_settings.clerk_jwt_key)
+    ):
+        raise RuntimeError("CLERK_SECRET_KEY or CLERK_JWT_KEY is required.")
+    database = Database(resolved_settings)
+    database.initialize()
+    # Canvas private import: the registry is always present (it reports NOT_CONFIGURED per
+    # school, which is what the UI shows), while the credential store only exists when the
+    # deployment holds an encryption key. A missing key is a missing capability, never a
+    # plaintext fallback.
+    canvas_registry = InstitutionConnectionRegistry()
+    try:
+        canvas_credentials = credential_store_from_settings(resolved_settings)
+    except CredentialStoreUnavailable:
+        LOGGER.warning("CANVAS_CREDENTIAL_KEY is set but unusable; Canvas import stays off")
+        canvas_credentials = None
+    embedding_secret = resolved_settings.rag_embedding_api_key
+    embedding_api_key = embedding_secret.get_secret_value() if embedding_secret else ""
+    deepseek_chat_secret = resolved_settings.deepseek_chat_api_key
+    deepseek_chat_api_key = (
+        deepseek_chat_secret.get_secret_value() if deepseek_chat_secret else ""
+    )
+    if embedding_provider is None:
+        if resolved_settings.rag_provider_mode == "deterministic":
+            embedding_provider = DeterministicEmbeddingProvider()
+        else:
+            embedding_provider = (
+                OpenAIEmbeddingProvider(
+                    api_key=embedding_api_key,
+                    model=resolved_settings.rag_embedding_model,
+                    base_url=resolved_settings.rag_embedding_base_url,
+                )
+                if embedding_api_key
+                else MissingEmbeddingProvider()
+            )
+    if answer_provider is None:
+        if resolved_settings.rag_provider_mode == "deterministic":
+            answer_provider = ExtractiveAnswerProvider()
+        elif resolved_settings.generic_llm_enabled:
+            generic_settings = generic_model_settings(resolved_settings)
+            generic_secret = generic_settings.v3_model_api_key
+            answer_provider = QwenAnswerProvider(
+                api_key=(generic_secret.get_secret_value() if generic_secret else ""),
+                model=generic_settings.v3_model,
+                base_url=generic_settings.v3_model_base_url or "",
+            )
+        else:
+            # Grounded QA uses DeepSeek explicitly.  There is no OpenAI/Qwen
+            # fallback: without a DeepSeek credential the role stays missing.
+            answer_provider = (
+                DeepSeekAnswerProvider(
+                    api_key=deepseek_chat_api_key,
+                    model=resolved_settings.deepseek_chat_model,
+                    base_url=resolved_settings.deepseek_chat_base_url,
+                )
+                if deepseek_chat_api_key
+                else MissingAnswerProvider()
+            )
+
+    application = FastAPI(title=f"{BRAND.name} RAG API", version="0.1.0")
+    ingestion_service = IngestionService(
+        database,
+        resolved_settings,
+        embedding_provider,
+    )
+    application.state.ingestion_service = ingestion_service
+    database.storage_path_resolver = ingestion_service.ensure_stored_path
+    database.storage_object_probe = ingestion_service.has_stored_object
+    database.storage_range_resolver = ingestion_service.read_stored_range
+    application.state.database = database
+    generic_provider = (
+        build_generic_provider(resolved_settings)
+        if resolved_settings.v3_enabled and resolved_settings.generic_llm_enabled
+        else None
+    )
+    if resolved_settings.visual_engine_enabled:
+        from app.learning.structured_calls import GenericStructuredCalls
+        from app.visual.language_planner import VisualLanguagePlannerProvider
+        from app.visual.planner import GroundedPolicyVisualPlannerProvider
+        from app.visual.providers.aliyun_eas import AlibabaEASComfyProvider
+        from app.visual.providers.mock_comfy import MockComfyProvider
+        from app.visual.service import VisualService
+        from app.visual.spec import Renderer
+        from app.visual.store import VisualJobStore
+        from app.visual.workflows import WorkflowRegistry
+
+        workflow_registry = WorkflowRegistry.default_mock()
+        if resolved_settings.visual_provider == "aliyun_eas":
+            provider = AlibabaEASComfyProvider(
+                endpoint=resolved_settings.visual_eas_endpoint,
+                token=resolved_settings.visual_eas_token.get_secret_value()
+                if resolved_settings.visual_eas_token
+                else None,
+                workflow=workflow_registry.select(Renderer.COMFY_IMAGE, "aliyun_eas"),
+                timeout_seconds=resolved_settings.visual_provider_request_timeout_seconds,
+                max_output_bytes=resolved_settings.visual_max_output_bytes,
+            )
+        else:
+            provider = MockComfyProvider(
+                complete_after_polls=resolved_settings.visual_mock_complete_after_polls
+            )
+        fallback_planner = GroundedPolicyVisualPlannerProvider()
+        visual_planner = (
+            VisualLanguagePlannerProvider(
+                calls=GenericStructuredCalls(
+                    database,
+                    resolved_settings,
+                    generic_provider,
+                ),
+                fallback=fallback_planner,
+            )
+            if generic_provider is not None
+            else fallback_planner
+        )
+        application.state.visual_service = VisualService(
+            store=VisualJobStore(database),
+            planner=visual_planner,
+            provider=provider,
+            storage=ingestion_service.storage_backend,
+            workflows=workflow_registry,
+            settings=resolved_settings,
+        )
+    # One shared semantic-decision layer for the whole app. TypeSafe/Jev is not
+    # constructed here and is not an automatic fallback. Unconfigured deployments
+    # stay local/off; a configured deployment can call only the pinned private
+    # OpenJev endpoint.
+    #
+    # `jev_definition_mode_map` is empty unless the deployment says otherwise, and it is validated
+    # against the catalogue when it is not (an unknown definition or mode refuses at startup). It is
+    # the mechanism a promotion needs; it must stay empty until the quality gate for a definition
+    # has passed — see the note on the setting in `config.py` and §9 of
+    # `JEV_CALIBRATION_AND_ABLATION_REPORT.md`.
+    application.state.jev_service = SemanticDecisionService(
+        JevGateway(
+            transport=jev_transport_from_settings(resolved_settings),
+            receipt_store=SqlReceiptStore(database),
+            modes=resolved_settings.jev_definition_mode_map,
+            # Soft semantic helpers return to their deterministic implementation.
+            # Only explicitly qualified/configured definitions may make a model call.
+            default_mode="off",
+        )
+    )
+    if resolved_settings.v3_enabled:
+        resolved_point_policy = assessment_point_policy
+        if (
+            resolved_point_policy is None
+            and resolved_settings.assessment_point_policy_enabled
+        ):
+            resolved_point_policy = AssessmentPointPolicyService(
+                AssessmentEntrySourceCatalogReader(
+                    specialized=DeterministicGraphPointCatalogReader()
+                )
+            )
+        # The learning orchestrator gets the same shared service: pedagogy (call
+        # site 6), the assessment criterion review (8) and the prerequisite review
+        # (11) live in here, and without it those three call sites would never be
+        # reached in a real deployment. Shadow is the default mode, so this changes
+        # no user-visible result; the receipt store above is deliberately
+        # best-effort because grading calls the criterion review from inside its own
+        # write transaction.
+        application.state.learning = LearningOrchestrator(
+            database, resolved_settings,
+            HybridRetriever(ChunkRepository(database), embedding_provider),
+            jev=application.state.jev_service,
+            hybrid_reviewer=hybrid_reviewer_from_settings(
+                resolved_settings, database, jev_service=application.state.jev_service
+            ),
+            assessment_point_policy=resolved_point_policy,
+            generic_provider=generic_provider,
+        )
+        application.state.official_knowledge_draft_builder = OfficialKnowledgeDraftBuilder(
+            database, resolved_settings, application.state.learning
+        )
+        application.state.auto_knowledge_map = AutoKnowledgeMapService(
+            database, resolved_settings, application.state.learning
+        )
+
+        async def auto_knowledge_worker() -> None:
+            service: AutoKnowledgeMapService = application.state.auto_knowledge_map
+            worker_id = f"auto-map-{id(application)}"
+            last_reconcile = 0.0
+            first_pass = True
+            while True:
+                try:
+                    now = asyncio.get_running_loop().time()
+                    if (
+                        first_pass
+                        or now - last_reconcile
+                        >= resolved_settings.auto_knowledge_map_reconcile_seconds
+                    ):
+                        await asyncio.to_thread(service.reconcile_background)
+                        first_pass = False
+                        last_reconcile = now
+                    else:
+                        # New uploads and completed import batches must not wait
+                        # for the legacy inventory sweep interval. This pass is
+                        # event-only and never recovers historical failed jobs.
+                        await asyncio.to_thread(
+                            service.reconcile,
+                            full=False,
+                            recover_safe_failures=False,
+                        )
+                    # Reconcile new uploads between jobs even when historical
+                    # backfill never empties. Each job retains its full lease.
+                    await asyncio.to_thread(service.run_once, worker_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    LOGGER.exception("Automatic knowledge-map worker iteration failed")
+                await asyncio.sleep(resolved_settings.auto_knowledge_map_poll_seconds)
+
+        async def configured_assessment_worker() -> None:
+            """Advance user-confirmed Assessment preparations outside HTTP requests."""
+
+            service: LearningOrchestrator = application.state.learning
+            worker_id = f"assessment-preparation-{id(application)}"
+            while True:
+                try:
+                    result = await asyncio.to_thread(
+                        service.run_configured_preparation_once, worker_id
+                    )
+                    if result is None:
+                        await asyncio.sleep(1.0)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    LOGGER.exception("Configured Assessment worker iteration failed")
+                    await asyncio.sleep(2.0)
+
+        @asynccontextmanager
+        async def application_lifespan(_application: FastAPI):
+            task = None
+            visual_task = None
+            assessment_task = asyncio.create_task(
+                configured_assessment_worker(), name="configured-assessment-worker"
+            )
+            application.state.configured_assessment_task = assessment_task
+            if resolved_settings.visual_engine_enabled:
+                from app.visual.worker import visual_worker_loop
+
+                visual_task = asyncio.create_task(
+                    visual_worker_loop(
+                        application.state.visual_service,
+                        worker_id=f"visual-{id(application)}",
+                        poll_seconds=resolved_settings.visual_worker_poll_seconds,
+                    ),
+                    name="visual-learning-worker",
+                )
+                application.state.visual_worker_task = visual_task
+            if resolved_settings.auto_knowledge_map_enabled:
+                if resolved_settings.auto_knowledge_map_allow_billable:
+                    task = asyncio.create_task(
+                        auto_knowledge_worker(), name="auto-knowledge-map-worker"
+                    )
+                    application.state.auto_knowledge_map.worker_running = True
+                    task.add_done_callback(
+                        lambda _task: setattr(
+                            application.state.auto_knowledge_map, "worker_running", False
+                        )
+                    )
+                    application.state.auto_knowledge_map_task = task
+                else:
+                    LOGGER.warning(
+                        "Automatic knowledge maps enabled without billable worker authorization; "
+                        "no background worker was started"
+                    )
+            try:
+                yield
+            finally:
+                if task is not None:
+                    task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await task
+                if visual_task is not None:
+                    visual_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await visual_task
+                assessment_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await assessment_task
+
+        application.router.lifespan_context = application_lifespan
+    teaching_profile_service = TeachingProfileService(database)
+    application.state.teaching_profile_service = teaching_profile_service
+    application.state.publication_service = PublicationService(database)
+    application.state.knowledge_publication_service = KnowledgePublicationService(database)
+    application.state.overlay_publication_service = OverlayPublicationService(database)
+    application.state.settings = resolved_settings
+    application.state.auth_verifier = (
+        auth_verifier
+        or (
+            TestAuthVerifier(resolved_settings.auth_test_user_id)
+            if resolved_settings.auth_test_user_id
+            else ClerkAuthVerifier(resolved_settings)
+        )
+    )
+    application.state.qa_service = QaService(
+        database,
+        HybridRetriever(ChunkRepository(database), embedding_provider),
+        answer_provider,
+        top_k=resolved_settings.top_k,
+        max_context_chars=resolved_settings.max_context_chars,
+        teaching_profiles=teaching_profile_service,
+        jev=application.state.jev_service,
+    )
+    cors_origins = list(resolved_settings.web_allowed_origin_tuple)
+    cors_methods = ["GET", "HEAD", "POST", "PATCH", "DELETE", "OPTIONS"]
+    if resolved_settings.ui_extension_enabled:
+        from app.ui_extension.mount import ui_allowed_origins
+
+        for origin in ui_allowed_origins(resolved_settings):
+            if origin not in cors_origins:
+                cors_origins.append(origin)
+        # The refreshed shell pins courses with PUT, which the host policy did not
+        # previously need. Only added when the extension is actually mounted.
+        cors_methods.insert(2, "PUT")
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins,
+        allow_credentials=False,
+        allow_methods=cors_methods,
+        allow_headers=["Authorization", "Content-Type"],
+    )
+
+    @application.middleware("http")
+    async def security_headers(request: Request, call_next: object) -> object:
+        response = await call_next(request)  # type: ignore[operator]
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'none'; frame-ancestors 'none'"
+        )
+        response.headers["Strict-Transport-Security"] = (
+            "max-age=31536000; includeSubDomains"
+        )
+        response.headers["Permissions-Policy"] = (
+            "camera=(), microphone=(), geolocation=()"
+        )
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        if (
+            request.url.path.startswith("/api/learning")
+            or request.url.path.startswith("/api/admin")
+            or request.url.path.startswith("/api/shared-overlays")
+            or request.url.path.startswith("/api/integrations/canvas/local-sessions")
+            or "publication-requests" in request.url.path
+        ):
+            response.headers["Cache-Control"] = "private, no-store"
+            response.headers["Vary"] = "Authorization"
+        return response
+
+    @application.exception_handler(ApiError)
+    async def api_error_handler(request: Request, error: ApiError) -> JSONResponse:
+        return JSONResponse(
+            status_code=error.status_code,
+            content={
+                "error": {
+                    "code": error.code,
+                    "message": error.message,
+                    "details": error.details,
+                }
+            },
+        )
+
+    @application.exception_handler(RequestValidationError)
+    async def validation_error_handler(
+        request: Request,
+        error: RequestValidationError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": {
+                    "code": "VALIDATION_ERROR",
+                    "message": "The request did not pass validation.",
+                    "details": {"issues": jsonable_encoder(error.errors())},
+                }
+            },
+        )
+
+    @application.exception_handler(Exception)
+    async def unexpected_error_handler(request: Request, error: Exception) -> JSONResponse:
+        LOGGER.exception("Unhandled RAG API error", exc_info=error)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": {
+                    "code": "INTERNAL_ERROR",
+                    "message": "An internal error occurred.",
+                    "details": {},
+                }
+            },
+        )
+
+    application.include_router(ingestion_router)
+    application.include_router(qa_router)
+    application.include_router(teaching_profiles_router)
+    application.include_router(publication_router)
+    application.include_router(feedback_router)
+    application.include_router(tool_intent_router)
+    application.include_router(canvas_router)
+    application.include_router(canvas_local_router)
+    # The Canvas integration is wired with one shared registry and one shared OAuth client, so a
+    # state issued by one request is the state another request validates. The credential store is
+    # absent when no key is configured, and the routes report NOT_CONFIGURED rather than storing
+    # a token in the clear.
+    #
+    # The state store is `SqlStateStore`, not the in-memory one: a browser starts an authorisation
+    # on whichever worker answers `/connect` and the school's callback can land on another, so the
+    # state has to live where every worker reads it (migration 034). The in-memory store stays as
+    # the test double.
+    application.state.canvas_registry = canvas_registry
+    # The task credential is a different thing from `canvas_credentials` and is deliberately not
+    # gated on a credential key: it is never written to disk, so no key is needed to hold one.
+    # It is per process, because that is the whole design — a restart loses it, and the job says
+    # so rather than pretending the credential is still there.
+    application.state.canvas_task_credentials = TransientCanvasCredentialStore()
+    if canvas_credentials is not None:
+        application.state.canvas_credentials = canvas_credentials
+        application.state.canvas_oauth = CanvasOAuthClient(
+            registry=canvas_registry,
+            state_store=SqlStateStore(database),
+            credential_store=canvas_credentials,
+        )
+    if resolved_settings.v3_enabled:
+        application.include_router(learning_router)
+    if resolved_settings.ui_extension_enabled:
+        from app.ui_extension.mount import mount_ui_extension
+
+        mount_ui_extension(
+            application,
+            provider=ui_provider,
+            coverage_reviewer=ui_coverage_reviewer,
+            jev=application.state.jev_service,
+        )
+    return application

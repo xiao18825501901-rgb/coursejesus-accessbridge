@@ -1,0 +1,408 @@
+import React from 'react';
+import { fireEvent, render, screen } from '@testing-library/react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+// @ts-ignore delivered JSX component
+import { AssessmentWorkspace } from './ui/pages.jsx';
+// @ts-ignore delivered JS API
+import { getAssessment, getAssessmentSetup, getAssessmentPreparation, getAssessmentSession, loadAssessmentDraft, startAssessment, submitAssessment } from './ui/api.js';
+
+vi.mock('./ui/api.js', () => ({
+  getAssessment: vi.fn(),
+  getAssessmentSetup: vi.fn(),
+  getAssessmentPreparation: vi.fn(),
+  startAssessment: vi.fn(),
+  getAssessmentSession: vi.fn(),
+  submitAssessment: vi.fn(),
+  abandonAssessment: vi.fn(),
+  saveAssessmentDraft: vi.fn(),
+  loadAssessmentDraft: vi.fn(),
+  cancelPreparation: vi.fn(),
+  resumePreparation: vi.fn(),
+  createAssessmentExplanation: vi.fn(),
+  key: () => 'key-1',
+}));
+
+const questions = [
+  { id: 'b1', ordinal: 1, marks: 10, question_type: 'NUMERIC', prompt: '计算 2 + 3', options: [], verification_method: 'DETERMINISTIC' },
+  { id: 'b2', ordinal: 2, marks: 15, question_type: 'MCQ_SINGLE', prompt: '选择结果', options: ['5', '6'], verification_method: 'DETERMINISTIC' },
+  { id: 'b3', ordinal: 3, marks: 20, question_type: 'SHORT_TEXT', prompt: '写出英文', options: [], verification_method: 'DETERMINISTIC' },
+  { id: 'b4', ordinal: 4, marks: 25, question_type: 'NUMERIC', prompt: '计算 7 + 2', options: [], verification_method: 'AI_REVIEWED' },
+  { id: 'b5', ordinal: 5, marks: 30, question_type: 'EXPLANATION', prompt: '解释原理', options: [], verification_method: 'AI_REVIEWED' },
+];
+
+const setup = {
+  schema_version: 'assessment-setup.v1', minimum_questions: 5, maximum_questions: 30,
+  supported_types: [
+    { id: 'MCQ_SINGLE', label: '单项选择' },
+    { id: 'NUMERIC', label: '数值计算' },
+    { id: 'SHORT_TEXT', label: '简短回答' },
+    { id: 'EXPLANATION', label: '分析与解释' },
+    { id: 'CODE', label: '代码应用' },
+  ],
+  task_forms: [
+    { id: 'concept', label: '概念识别' }, { id: 'definition', label: '定义与条件' },
+    { id: 'calculation', label: '计算与推导' }, { id: 'analysis', label: '分析与解释' },
+    { id: 'evaluation', label: '找错与评价' }, { id: 'code', label: '代码应用' },
+  ],
+  default_slots: [
+    { slot_id: 's1', question_type: 'MCQ_SINGLE', task_form: 'concept' },
+    { slot_id: 's2', question_type: 'SHORT_TEXT', task_form: 'definition' },
+    { slot_id: 's3', question_type: 'EXPLANATION', task_form: 'calculation' },
+    { slot_id: 's4', question_type: 'EXPLANATION', task_form: 'analysis' },
+    { slot_id: 's5', question_type: 'EXPLANATION', task_form: 'evaluation' },
+  ],
+};
+
+const pointSetup = {
+  ...setup,
+  schema_version: 'assessment-setup.points.v1',
+  policy_version: 'cj.assessment.points.v1',
+  status: 'READY',
+  minimum_questions: 1,
+  maximum_questions: 2,
+  points: [{ point_id: 'point-degree', allowed_forms: ['SHORT_TEXT'] }],
+  default_slots: [{
+    slot_id: 'point-item-1', question_type: 'SHORT_TEXT', task_form: 'definition',
+    primary_point_id: 'point-degree', variation_purpose: null, independently_scored_parts: 1,
+  }],
+};
+
+describe('AssessmentWorkspace', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getAssessment).mockResolvedValue({ status: 'NOT_ASSESSED', session: null });
+    vi.mocked(getAssessmentSetup).mockResolvedValue(setup);
+    vi.mocked(getAssessmentSession).mockResolvedValue({
+      id: 's1',
+      status: 'IN_PROGRESS',
+      questions,
+      raw_score: null,
+      grade: { label: null },
+      node_id: 'n1',
+    });
+    vi.mocked(loadAssessmentDraft).mockResolvedValue({ draft: null });
+    vi.mocked(startAssessment).mockResolvedValue({ id: 's1', status: 'IN_PROGRESS' });
+  });
+
+  it('renders a fullscreen workspace with course, node, status and exit', async () => {
+    render(<AssessmentWorkspace course={{ code: 'CS3481' }} node={{ title: 'DBSCAN' }} toast={vi.fn()} onExit={vi.fn()} />);
+    expect(screen.getByRole('dialog', { name: '测评工作区' })).toBeVisible();
+    expect(screen.getByText('CS3481')).toBeVisible();
+    expect(screen.getByText(/DBSCAN/)).toBeVisible();
+    expect(screen.getByRole('button', { name: '退出' })).toBeVisible();
+    expect(await screen.findByRole('button', { name: '确认配置并开始测评' })).toBeVisible();
+    expect(screen.getAllByLabelText(/第 \d+ 题题型/)).toHaveLength(5);
+    expect(screen.queryByText('计算 2 + 3')).not.toBeInTheDocument();
+  });
+
+  it('shows all five questions with marks and per-question answer controls', async () => {
+    vi.mocked(getAssessment).mockResolvedValue({ status: 'IN_PROGRESS', session: 's1' });
+    render(<AssessmentWorkspace course={{ code: 'CS3481' }} node={{ title: 'DBSCAN' }} toast={vi.fn()} onExit={vi.fn()} />);
+    expect(await screen.findByText('计算 2 + 3')).toBeVisible();
+    expect(screen.getByText('选择结果')).toBeVisible();
+    expect(screen.getByText('写出英文')).toBeVisible();
+    expect(screen.getByText('解释原理')).toBeVisible();
+    expect(screen.getByText(/10 分/)).toBeVisible();
+    expect(screen.getByText(/30 分/)).toBeVisible();
+    expect(screen.getByLabelText('第 1 题答案')).toBeVisible();
+    expect(screen.getByLabelText('第 2 题选项 1：5')).toBeVisible();
+    expect(screen.queryByLabelText('统一答案')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '保存草稿' })).toBeVisible();
+    expect(screen.getByRole('button', { name: '提交答案' })).toBeVisible();
+    // Reference solutions must not be rendered before submit.
+    expect(screen.queryByText(/参考解/)).not.toBeInTheDocument();
+  });
+
+  it('marks AI-reviewed diagnostic questions without pretending an official grade', async () => {
+    vi.mocked(getAssessment).mockResolvedValue({ status: 'IN_PROGRESS', session: 's1' });
+    render(<AssessmentWorkspace course={{ code: 'CS3481' }} node={{ title: 'DBSCAN' }} toast={vi.fn()} onExit={vi.fn()} />);
+    await screen.findByText('解释原理');
+    expect(screen.getAllByText(/AI参考自测/).length).toBe(2);
+  });
+
+  it('shows raw score without a school grade mapping', async () => {
+    vi.mocked(getAssessment).mockResolvedValue({ status: 'IN_PROGRESS', session: 's1' });
+    vi.mocked(getAssessmentSession).mockResolvedValue({
+      id: 's1',
+      status: 'GRADED',
+      questions,
+      raw_score: 78,
+      grade: { label: null, mapping_status: 'UNCONFIGURED', numeric_value: null, message: '评分映射待配置' },
+      node_id: 'n1',
+    });
+    render(<AssessmentWorkspace course={{ code: 'CS3481' }} node={{ title: 'DBSCAN' }} toast={vi.fn()} onExit={vi.fn()} />);
+    expect(await screen.findByText('原始分：78 / 100')).toBeVisible();
+  });
+
+  it('opens the latest graded result from history even when a newer attempt is active', async () => {
+    vi.mocked(getAssessment).mockResolvedValue({
+      status: 'IN_PROGRESS',
+      session: 'active-session',
+      latest_result: { session_id: 'graded-session', raw_score: 100 },
+    });
+    vi.mocked(getAssessmentSession).mockResolvedValue({
+      id: 'graded-session',
+      status: 'GRADED',
+      questions,
+      raw_score: 100,
+      grade: { label: null },
+      node_id: 'n1',
+    });
+
+    render(<AssessmentWorkspace mode="history" course={{ id: 'cs3481', code: 'CS3481' }} node={{ id: 'n1', title: 'DBSCAN' }} toast={vi.fn()} onExit={vi.fn()} />);
+
+    expect(await screen.findByText('原始分：100 / 100')).toBeVisible();
+    expect(getAssessmentSession).toHaveBeenCalledWith('cs3481', 'graded-session');
+    expect(startAssessment).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: '返回历史列表' }));
+    await vi.waitFor(() => expect(getAssessment).toHaveBeenCalledTimes(2));
+    expect(getAssessmentSession).toHaveBeenLastCalledWith('cs3481', 'graded-session');
+    expect(startAssessment).not.toHaveBeenCalled();
+  });
+
+  it('shows a clearly provisional total when question grading awaits review', async () => {
+    vi.mocked(getAssessment).mockResolvedValue({ status: 'NEEDS_REVIEW', session: 's1' });
+    vi.mocked(getAssessmentSession).mockResolvedValue({
+      id: 's1',
+      status: 'SUBMITTED',
+      questions: questions.map((question, index) => ({
+        ...question,
+        review: { awarded_marks: index + 1, submitted_answer: 'answer' },
+      })),
+      raw_score: null,
+      grade: { label: null },
+      node_id: 'n1',
+    });
+    render(<AssessmentWorkspace course={{ code: 'CS3481' }} node={{ title: 'DBSCAN' }} toast={vi.fn()} onExit={vi.fn()} />);
+
+    expect(await screen.findByText('暂计：15 / 100（待复核，不是正式 Raw Score）')).toBeVisible();
+    expect(screen.queryByText(/原始分：/)).not.toBeInTheDocument();
+  });
+
+  it('collects one answer per frozen question and submits the stable item ids', async () => {
+    vi.mocked(getAssessment).mockResolvedValue({ status: 'IN_PROGRESS', session: 's1' });
+    vi.mocked(submitAssessment).mockResolvedValue({ status: 'GRADED' });
+    render(<AssessmentWorkspace course={{ id: 'cs3481', code: 'CS3481' }} node={{ id: 'n1', title: 'DBSCAN' }} toast={vi.fn()} onExit={vi.fn()} />);
+
+    fireEvent.change(await screen.findByLabelText('第 1 题答案'), { target: { value: '5' } });
+    fireEvent.click(screen.getByLabelText('第 2 题选项 1：5'));
+    fireEvent.change(screen.getByLabelText('第 3 题答案'), { target: { value: 'two' } });
+    fireEvent.change(screen.getByLabelText('第 4 题答案'), { target: { value: '9' } });
+    fireEvent.change(screen.getByLabelText('第 5 题答案'), { target: { value: '解释内容' } });
+    fireEvent.click(screen.getByRole('button', { name: '提交答案' }));
+
+    await vi.waitFor(() => expect(submitAssessment).toHaveBeenCalledTimes(1));
+    const submitCall = vi.mocked(submitAssessment).mock.calls[0];
+    expect(submitCall).toBeDefined();
+    expect(submitCall![2]).toMatchObject({
+      answers: [
+        { blueprint_item_id: 'b1', answer: '5' },
+        { blueprint_item_id: 'b2', answer: '0' },
+        { blueprint_item_id: 'b3', answer: 'two' },
+        { blueprint_item_id: 'b4', answer: '9' },
+        { blueprint_item_id: 'b5', answer: '解释内容' },
+      ],
+    });
+  });
+
+  it('submits five explicit blank answers after the learner confirms', async () => {
+    vi.mocked(getAssessment).mockResolvedValue({ status: 'IN_PROGRESS', session: 's1' });
+    vi.mocked(submitAssessment).mockResolvedValue({ status: 'GRADED' });
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    render(<AssessmentWorkspace course={{ id: 'cs3481', code: 'CS3481' }} node={{ id: 'n1', title: 'DBSCAN' }} toast={vi.fn()} onExit={vi.fn()} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '提交答案' }));
+
+    await vi.waitFor(() => expect(submitAssessment).toHaveBeenCalledTimes(1));
+    const submitCall = vi.mocked(submitAssessment).mock.calls[0];
+    expect(submitCall).toBeDefined();
+    const payload = submitCall![2];
+    expect(payload.answers).toHaveLength(5);
+    expect(payload.answers.every((answer: { answer: string }) => answer.answer === '')).toBe(true);
+  });
+
+  it('renders structured multiple-choice options once when the prompt repeats them', async () => {
+    vi.mocked(getAssessment).mockResolvedValue({ status: 'IN_PROGRESS', session: 's1' });
+    vi.mocked(getAssessmentSession).mockResolvedValue({
+      id: 's1',
+      status: 'IN_PROGRESS',
+      questions: [
+        {
+          id: 'b1', ordinal: 1, marks: 20, question_type: 'MCQ_SINGLE',
+          prompt: '选择正确答案。\n\nA) 甲\nB) 乙', options: ['甲', '乙'], verification_method: 'DETERMINISTIC',
+        },
+      ],
+      raw_score: null,
+      grade: { label: null },
+      node_id: 'n1',
+    });
+    render(<AssessmentWorkspace course={{ id: 'cs3481', code: 'CS3481' }} node={{ id: 'n1', title: 'DBSCAN' }} toast={vi.fn()} onExit={vi.fn()} />);
+
+    expect(await screen.findByText('选择正确答案。')).toBeVisible();
+    expect(screen.queryByText(/A\) 甲/)).not.toBeInTheDocument();
+    expect(screen.getAllByText('甲')).toHaveLength(1);
+    expect(screen.getAllByText('乙')).toHaveLength(1);
+  });
+
+  it('automatically starts from a compatible READY pool after preparation is blocked', async () => {
+    vi.mocked(startAssessment)
+      .mockResolvedValueOnce({
+        preparation_job_id: 'prep-1',
+        status: 'BLOCKED',
+        eligible_families: 5,
+        can_start_from_ready_pool: true,
+        error_code: 'AUTHOR_PROVIDER_BLOCKED',
+      })
+      .mockResolvedValueOnce({ id: 's1', status: 'IN_PROGRESS' });
+    render(<AssessmentWorkspace course={{ id: 'cs3481', code: 'CS3481' }} node={{ id: 'n1', title: 'DBSCAN' }} toast={vi.fn()} onExit={vi.fn()} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '确认配置并开始测评' }));
+
+    expect(await screen.findByLabelText('第 1 题答案')).toBeVisible();
+    expect(startAssessment).toHaveBeenCalledTimes(2);
+  });
+
+  it('polls the same durable preparation and opens it automatically when READY', async () => {
+    vi.mocked(getAssessmentPreparation).mockResolvedValue({
+      preparation_job_id: 'prep-1',
+      configuration_id: 'config-1',
+      status: 'READY',
+      prepared_questions: 5,
+      question_count: 5,
+      slots: setup.default_slots,
+    });
+    const workspace: any = new AssessmentWorkspace({
+      course: { id: 'cs3481', code: 'CS3481' },
+      node: { id: 'n1', title: 'DBSCAN' },
+      toast: vi.fn(),
+      onExit: vi.fn(),
+    });
+    workspace.state = { ...workspace.state, configurationId: 'config-1' };
+    workspace.setState = (value: any, callback?: () => void) => {
+      const patch = typeof value === 'function' ? value(workspace.state) : value;
+      workspace.state = { ...workspace.state, ...patch };
+      callback?.();
+    };
+
+    await workspace.pollPreparation();
+
+    expect(getAssessmentPreparation).toHaveBeenCalledWith('cs3481', 'n1', 'config-1');
+    expect(startAssessment).toHaveBeenCalledWith('cs3481', 'n1', {
+      configuration_id: 'config-1',
+      slots: [],
+    });
+    expect(workspace.state.view.status).toBe('IN_PROGRESS');
+  });
+
+  it('adds a sixth stable slot and sends only the content-free configuration', async () => {
+    render(<AssessmentWorkspace course={{ id: 'cs3481', code: 'CS3481' }} node={{ id: 'n1', title: 'DBSCAN' }} toast={vi.fn()} onExit={vi.fn()} />);
+    fireEvent.click(await screen.findByRole('button', { name: '添加题目' }));
+    expect(screen.getAllByLabelText(/第 \d+ 题题型/)).toHaveLength(6);
+    expect(screen.getAllByText('16.66 分')).toHaveLength(2);
+    fireEvent.click(screen.getByRole('button', { name: '确认配置并开始测评' }));
+    await vi.waitFor(() => expect(startAssessment).toHaveBeenCalled());
+    const payload = vi.mocked(startAssessment).mock.calls[0]![2] as { slots: unknown[] };
+    expect(payload.slots).toHaveLength(6);
+    expect(JSON.stringify(payload)).not.toMatch(/prompt|options|answer|question_revision/i);
+  });
+
+  it('preserves trusted point selection fields and adds only a legal second item', async () => {
+    vi.mocked(getAssessmentSetup).mockResolvedValue(pointSetup);
+    render(<AssessmentWorkspace course={{ id: 'cs3481', code: 'CS3481' }} node={{ id: 'n1', title: 'Graph degree' }} toast={vi.fn()} onExit={vi.fn()} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '添加题目' }));
+    expect(screen.getAllByLabelText(/第 \d+ 题题型/)).toHaveLength(2);
+    fireEvent.click(screen.getByRole('button', { name: '确认配置并开始测评' }));
+
+    await vi.waitFor(() => expect(startAssessment).toHaveBeenCalled());
+    const payload = vi.mocked(startAssessment).mock.calls[0]![2] as any;
+    expect(payload.content_language).toBe('zh-CN');
+    expect(payload.client_intent_id).toBeTruthy();
+    expect(payload.intent_action).toBe('CONFIGURE');
+    expect(payload.slots).toEqual([
+      expect.objectContaining({
+        primary_point_id: 'point-degree', variation_purpose: null,
+        independently_scored_parts: 1,
+      }),
+      expect.objectContaining({
+        primary_point_id: 'point-degree', variation_purpose: 'APPLICATION',
+        independently_scored_parts: 1,
+      }),
+    ]);
+  });
+
+  it('shows point preparation as unavailable instead of opening a zero-question paper', async () => {
+    vi.mocked(getAssessmentSetup).mockResolvedValue({
+      ...pointSetup,
+      status: 'ASSESSMENT_POINTS_NOT_READY',
+      minimum_questions: 0,
+      maximum_questions: 0,
+      points: [],
+      default_slots: [],
+    });
+    render(<AssessmentWorkspace course={{ id: 'cs3481', code: 'CS3481' }} node={{ id: 'n1', title: 'Graph degree' }} toast={vi.fn()} onExit={vi.fn()} />);
+
+    expect(await screen.findByText('考点尚未整理完成；请依据当前课程资料准备，完成后即可配置测评。')).toBeVisible();
+    expect(screen.queryByRole('button', { name: '确认配置并开始测评' })).not.toBeInTheDocument();
+  });
+
+  it('shows the truthful one-call authoring stage while a missing slot is prepared', async () => {
+    vi.mocked(getAssessmentSetup).mockResolvedValue({
+      ...pointSetup,
+      active_preparation: {
+        preparation_job_id: 'prep-point-authoring',
+        configuration_id: 'config-point-authoring',
+        policy_version: 'cj.assessment.points.v1',
+        content_language: 'zh-CN',
+        client_intent_id: 'frozen-intent-authoring',
+        status: 'PREPARING',
+        prepared_questions: 0,
+        question_count: 1,
+        current_ordinal: 1,
+        current_stage: 'AUTHORING_COMPLETE_QUESTION',
+        slots: pointSetup.default_slots,
+      },
+    });
+    render(<AssessmentWorkspace course={{ id: 'cs3481', code: 'CS3481' }} node={{ id: 'n1', title: 'Graph degree' }} toast={vi.fn()} onExit={vi.fn()} />);
+
+    expect(await screen.findByText('正在准备第 1 题的题干、参考解与评分项')).toBeVisible();
+    expect(screen.getByText('已准备 0/1 题')).toBeVisible();
+  });
+
+  it('reuses the server-frozen intent when resuming a dynamic preparation after reload', async () => {
+    vi.mocked(getAssessmentSetup).mockResolvedValue({
+      ...pointSetup,
+      active_preparation: {
+        preparation_job_id: 'prep-point-1',
+        configuration_id: 'config-point-1',
+        policy_version: 'cj.assessment.points.v1',
+        content_language: 'zh-CN',
+        client_intent_id: 'frozen-intent-1',
+        status: 'BLOCKED',
+        prepared_questions: 0,
+        question_count: 1,
+        slots: pointSetup.default_slots,
+        error_code: 'ASSESSMENT_POINT_METHOD_NOT_QUALIFIED',
+      },
+    });
+    const workspace: any = new AssessmentWorkspace({
+      course: { id: 'cs3481', code: 'CS3481' },
+      node: { id: 'n1', title: 'Graph degree' },
+      toast: vi.fn(),
+      onExit: vi.fn(),
+    });
+    workspace.setState = (value: any, callback?: () => void) => {
+      const patch = typeof value === 'function' ? value(workspace.state) : value;
+      workspace.state = { ...workspace.state, ...patch };
+      callback?.();
+    };
+
+    await workspace.loadSetup();
+    const payload = workspace.configurationPayload('OPEN', false);
+
+    expect(payload.client_intent_id).toBe('frozen-intent-1');
+    expect(payload.configuration_id).toBe('config-point-1');
+    expect(payload.slots).toEqual([]);
+  });
+});

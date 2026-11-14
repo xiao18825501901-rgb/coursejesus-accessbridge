@@ -1,0 +1,794 @@
+"""Qwen teaching engine.
+
+teaching_mode contract:
+  normal   — one direct model call (course-faithful answer for the teach lane,
+             exam-style stepped answer for the problem lane). No plan stage.
+  thinking — two-stage: (1) plan: the selected professional template (or the
+             OTHER template) + course context -> a full natural-language
+             teaching prompt; (2) work: that exact prompt -> visible teaching.
+The plan text is an internal artifact: it is stored for audit but is never
+returned to users (the API layer whitelists run fields).
+
+Native model "reasoning" parameters are deliberately NOT conflated with the
+product's teaching_mode: enable_thinking stays off; the two-stage flow is the
+product feature and is recorded separately from any API-level reasoning flags.
+"""
+import json
+from pathlib import Path
+from typing import TYPE_CHECKING, AsyncIterator
+
+if TYPE_CHECKING:  # only the string annotations of `_cite_sources` need these
+    from collections.abc import Mapping, Sequence
+import httpx
+from app.evaluation.deepseek_contract import (
+    CHAT_COMPLETIONS_PATH,
+    DeepSeekCapabilityError,
+    IMAGE_TOKENS_PER_INPUT,
+    RESPONSES_PATH,
+    chat_completions_body,
+    chat_completions_image_part,
+    json_schema_text_format,
+    responses_body,
+    responses_image_part,
+)
+from .sse import events
+from . import templates
+from .budget import OperationEstimate, estimate_operation_cost
+from .exercise_contract import EXERCISE_RESPONSE_FORMAT
+from app.brand import BRAND
+
+class ProviderError(Exception):
+    pass
+
+
+def _responses_incomplete_code(response: object) -> str:
+    """Return a bounded public code without reflecting provider-controlled text."""
+
+    if not isinstance(response, dict):
+        return 'INCOMPLETE_PROVIDER_RESPONSE'
+    details = response.get('incomplete_details')
+    reason = details.get('reason') if isinstance(details, dict) else None
+    suffixes = {
+        'max_output_tokens': 'MAX_OUTPUT_TOKENS',
+        'content_filter': 'CONTENT_FILTER',
+        'server_error': 'SERVER_ERROR',
+    }
+    suffix = suffixes.get(str(reason))
+    return f'INCOMPLETE_PROVIDER_RESPONSE_{suffix}' if suffix else 'INCOMPLETE_PROVIDER_RESPONSE'
+
+TEACH_DIRECT_INSTRUCTION = (
+    f'你是 {BRAND.name} 教师。直接、简洁地回答学生当前的问题，'
+    '保留中文解释与英文术语，紧扣课程资料，引用材料时使用 [S1] 等标记。'
+    '不要生成十部分长课，不要输出教学计划或内部 Prompt，不要暴露思维链。'
+    '没有工具权限，不要声称修改了数据库、分数或发布状态。'
+)
+
+
+def conflict_note(sources: list) -> str | None:
+    """Bounded note for genuine evidence contradictions (evidence.consistency.v1).
+
+    Only a real ``SAME_CONTEXT_CONTRADICTION`` surfaces here, via the per-source
+    ``jev_conflict_with`` ids the backend attached. A DIFFERENT_ASSUMPTIONS or
+    VERSION_OR_TASK_DIFFERENCE pair never carries that field, so it is never
+    described as a conflict. Returns ``None`` when there is nothing to explain, so
+    the assembled prompt is unchanged under off/shadow/unavailable.
+    """
+    pairs: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        others = source.get("jev_conflict_with") or ()
+        sid = str(source.get("id", ""))
+        for other in others:
+            left, right = sorted((sid, str(other)))
+            if not left or not right or (left, right) in seen:
+                continue
+            seen.add((left, right))
+            pairs.append(f"{left} vs {right}")
+    if not pairs:
+        return None
+    listing = "；".join(pairs[:8])  # bounded: module C compares at most 8 pairs
+    return (
+        "注意：以下证据来源之间存在真实矛盾（相同假设下结论冲突）："
+        f"{listing}。请在回答中同时说明双方结论及其适用边界，保留全部来源，"
+        "不要丢弃、改写或合并任何一方。"
+    )
+
+
+class QwenProvider:
+    def __init__(self, settings, transport=None):
+        self.cfg=settings
+        self.transport=transport
+        self.calls=[]
+
+    # ------------------------------------------------------------------ teach
+
+    def planner_messages(self, course: dict, text: str, profile: dict, sources: list, history: list, lane: str, bridge=None, spec_items=None, template_id: str = 'OTHER'):
+        """Stage-1 plan call. The selected professional template body is the
+        planning base; the plan-writer instruction (internal role) wraps it.
+        """
+        template_body = templates.template_body(template_id) or templates.template_body('OTHER')
+        instruction = templates.plan_writer_instruction() + '\n\n【选定模板全文】\n' + template_body
+        note = conflict_note(sources)
+        if note:
+            instruction = instruction + '\n\n' + note
+        payload={'course':course.get('name',''),'code':course.get('code',''),'mode':lane,
+            'template_id':template_id,'student_preferences':profile,
+            'course_requirements':course.get('requirements',''),'student_question':text,
+            'materials':sources,'recent_conversation':history[-12:],'problem_bridge':bridge,
+            'spec_requirements':spec_items or []}
+        return [{'role':'system','content':instruction},{'role':'user','content':json.dumps(payload,ensure_ascii=False)}]
+
+    def direct_messages(self, course: dict, text: str, profile: dict, sources: list, history: list, lane: str, bridge=None):
+        """Single-stage normal-mode call. Problem lane uses the owner's 题目
+        Word prompt; the teach lane uses the compact course-faithful
+        instruction. No professional template, no plan."""
+        payload={'question':text,'course_materials':sources,'bridge':bridge,
+                 'language':profile.get('language','zh-CN')}
+        if lane=='problem':
+            instruction=templates.problem_prompt()
+        else:
+            instruction=TEACH_DIRECT_INSTRUCTION
+        note = conflict_note(sources)
+        if note:
+            instruction = instruction + '\n\n' + note
+        messages=[{'role':'system','content':instruction}]
+        messages.extend({'role':x['role'],'content':x['text'][:10000]} for x in history[-12:] if x['role'] in {'user','assistant'})
+        messages.append({'role':'user','content':json.dumps(payload,ensure_ascii=False)})
+        return messages
+
+    def work_messages(self, prompt: str, course: dict, text: str, sources: list, history: list, bridge=None):
+        """Stage-2 work call: executes the exact plan text from stage 1."""
+        instruction=(f'你是 {BRAND.name} 教师。执行下面由上一阶段生成的教学 Prompt，给出可核验的教学解释，'
+                     '不要暴露内部思维链。只使用提供的材料引用标记 [S1] 等；无材料支持时区分补充理解。'
+                     '没有工具权限，不要声称修改了数据库、分数或发布状态。\n\n'+prompt)
+        note = conflict_note(sources)
+        if note:
+            instruction = instruction + '\n\n' + note
+        messages=[{'role':'system','content':instruction}]
+        messages.extend({'role':x['role'],'content':x['text'][:10000]} for x in history[-12:] if x['role'] in {'user','assistant'})
+        messages.append({'role':'user','content':json.dumps({'question':text,'course_materials':sources,'bridge':bridge},ensure_ascii=False)})
+        return messages
+
+    # ------------------------------------------------- exercise / explanation
+
+    def exercise_messages(self, course: dict, node: dict | None, profile: dict, sources: list):
+        """做一题: generate ONE diagnostic question for the target node, and the
+        standard answer. The answer is prepared server-side and never streamed;
+        the client only receives the question."""
+        instruction=templates.exercise_prompt()+'\n\n'+templates.exercise_runtime_contract()
+        payload={'course':course.get('name',''),'code':course.get('code',''),
+                 'target_node':(node or {}).get('title','') if node else '',
+                 'node_context':node or None,'course_materials':sources,
+                 'language':profile.get('language','zh-CN')}
+        return [{'role':'system','content':instruction},{'role':'user','content':json.dumps(payload,ensure_ascii=False)}]
+
+    def explanation_messages(self, course: dict, question_text: str, answer_context: str, step_text: str, profile: dict, sources: list):
+        """详解: explain only the requested step of a concrete problem."""
+        instruction=templates.explanation_prompt()
+        payload={'course':course.get('name',''),'code':course.get('code',''),
+                 'problem':question_text,'answer_context':answer_context,'step':step_text,
+                 'course_materials':sources,'language':profile.get('language','zh-CN')}
+        return [{'role':'system','content':instruction},{'role':'user','content':json.dumps(payload,ensure_ascii=False)}]
+
+    # ----------------------------------------------------------------- stream
+
+    def attach_images(self, messages: list, images: list) -> None:
+        """Images were authorized/read server-side; data URLs are never persisted or logged."""
+        if not images:
+            return
+        content=messages[-1]['content']
+        if self.cfg.qwen_protocol=='responses':
+            parts=[{'type':'input_text','text':content}]
+            parts.extend({'type':'input_image','image_url':im['data_url'],
+                          'max_pixels':self.cfg.image_max_pixels} for im in images)
+        else:
+            parts=[{'type':'text','text':content}]
+            parts.extend({'type':'image_url','image_url':{'url':im['data_url']},
+                          'max_pixels':self.cfg.image_max_pixels} for im in images)
+        messages[-1]['content']=parts
+
+    def _estimate(self, stages: list[dict]) -> OperationEstimate:
+        return estimate_operation_cost(
+            stages=stages,
+            input_usd_per_million=self.cfg.operation_input_usd_per_million,
+            output_usd_per_million=self.cfg.operation_output_usd_per_million,
+            # Qwen3.8 visual inputs are billed as input tokens. The provider
+            # request carries this same maximum pixel setting, so the estimate
+            # reserves ceil(max_pixels / 32 / 32) + two visual delimiters.
+            image_tokens_per_input=(self.cfg.image_max_pixels + 1023) // 1024 + 2,
+        )
+
+    def _with_estimated_images(self, messages: list, attachments: list | None) -> list:
+        # Message builders return fresh objects. Do not JSON-copy multi-megabyte
+        # base64 attachments merely to count them: the estimator needs the same
+        # request shape and image count, not the image bytes themselves.
+        copied = [dict(message) for message in messages]
+        if not attachments:
+            return copied
+        content = copied[-1]['content']
+        if self.cfg.qwen_protocol == 'responses':
+            parts = [{'type': 'input_text', 'text': content}]
+            parts.extend({'type': 'input_image', 'image_url': '',
+                          'max_pixels': self.cfg.image_max_pixels} for _ in attachments)
+        else:
+            parts = [{'type': 'text', 'text': content}]
+            parts.extend({'type': 'image_url', 'image_url': {'url': ''},
+                          'max_pixels': self.cfg.image_max_pixels} for _ in attachments)
+        copied[-1]['content'] = parts
+        return copied
+
+    def estimate_generation(self, course, text, profile, sources, history, lane, bridge=None, *, attachments=None, spec_items=None, teaching_mode='normal', template_id='OTHER') -> OperationEstimate:
+        if teaching_mode == 'normal':
+            return self._estimate([{
+                'name': 'answer',
+                'messages': self._with_estimated_images(
+                    self.direct_messages(course, text, profile, sources, history, lane, bridge), attachments
+                ),
+                'max_output_tokens': self.cfg.answer_tokens,
+            }])
+        planner = self._with_estimated_images(
+            self.planner_messages(course, text, profile, sources, history, lane, bridge, spec_items, template_id),
+            attachments,
+        )
+        # The second request receives the complete first-stage prompt. Reserve
+        # its configured maximum as server-owned input, not a guessed response.
+        work = self._with_estimated_images(
+            self.work_messages('', course, text, sources, history, bridge), attachments
+        )
+        return self._estimate([
+            {'name': 'planner', 'messages': planner, 'max_output_tokens': self.cfg.prompt_tokens},
+            {'name': 'teacher', 'messages': work, 'extra_input_tokens': self.cfg.prompt_tokens,
+             'max_output_tokens': self.cfg.answer_tokens},
+        ])
+
+    def estimate_exercise(self, course, node, profile, sources) -> OperationEstimate:
+        return self._estimate([{
+            'name': 'exercise',
+            'messages': self.exercise_messages(course, node, profile, sources),
+            'max_output_tokens': self.cfg.answer_tokens,
+        }])
+
+    def estimate_question_engine(self) -> OperationEstimate:
+        """Conservative preflight for author + isolated blind-solve calls.
+
+        The V3 structured provider refuses a serialized context above 60,000
+        characters.  Reserve that complete ceiling for each of the two calls,
+        plus the exact versioned instruction bodies.  This intentionally does
+        not price the older one-call UI exercise prompt: doing so would
+        underestimate the Question Engine operation that actually runs.
+        """
+
+        from app.learning.blind_solve import PROMPT_PATH as blind_prompt
+        from app.learning.question_author import PROMPT_PATH as author_prompt
+
+        bounded_context = "x" * 60_000
+        return self._estimate([
+            {
+                'name': 'question_author',
+                'messages': [
+                    {'role': 'system', 'content': author_prompt.read_text(encoding='utf-8')},
+                    {'role': 'user', 'content': bounded_context},
+                ],
+                'max_output_tokens': self.cfg.answer_tokens,
+            },
+            {
+                'name': 'question_blind_solver',
+                'messages': [
+                    {'role': 'system', 'content': blind_prompt.read_text(encoding='utf-8')},
+                    {'role': 'user', 'content': bounded_context},
+                ],
+                'max_output_tokens': self.cfg.answer_tokens,
+            },
+        ])
+
+    def estimate_practice_interaction(self) -> OperationEstimate:
+        """Conservative ceiling for one DeepSeek hint or feedback call."""
+
+        from app.learning.practice_feedback import (
+            FEEDBACK_PROMPT_PATH,
+            HINT_PROMPT_PATH,
+        )
+
+        instruction = max(
+            (
+                FEEDBACK_PROMPT_PATH.read_text(encoding='utf-8'),
+                HINT_PROMPT_PATH.read_text(encoding='utf-8'),
+            ),
+            key=len,
+        )
+        return self._estimate([{
+            'name': 'practice_interaction',
+            'messages': [
+                {'role': 'system', 'content': instruction},
+                {'role': 'user', 'content': 'x' * 60_000},
+            ],
+            'max_output_tokens': self.cfg.answer_tokens,
+        }])
+
+    def estimate_explanation(self, course, question_text, answer_context, step_text, profile, sources) -> OperationEstimate:
+        return self._estimate([{
+            'name': 'explanation',
+            'messages': self.explanation_messages(
+                course, question_text, answer_context, step_text, profile, sources
+            ),
+            'max_output_tokens': self.cfg.answer_tokens,
+        }])
+
+    def classification_messages(self, bundle: dict) -> list[dict]:
+        """Build the one bounded automatic-classification request.
+
+        Keeping this builder shared by the estimator and caller prevents a
+        later classification prompt change from silently escaping preflight
+        accounting.
+        """
+        instruction = (Path(__file__).parent / 'prompts' / 'CLASSIFICATION_INSTRUCTION_V1.txt').read_text(encoding='utf-8')
+        return [
+            {'role': 'system', 'content': instruction},
+            {'role': 'user', 'content': json.dumps(bundle, ensure_ascii=False)},
+        ]
+
+    def estimate_classification(self, bundle: dict) -> OperationEstimate:
+        return self._estimate([{
+            'name': 'classification',
+            'messages': self.classification_messages(bundle),
+            'max_output_tokens': min(self.cfg.prompt_tokens, 1200),
+        }])
+
+    async def stream(self, messages: list, tokens: int, *, response_format: dict | None = None) -> AsyncIterator[dict]:
+        cfg=self.cfg
+        if not cfg.allow_billable: raise ProviderError('BILLING_NOT_AUTHORIZED')
+        # Alibaba documents response_format/json_schema on its OpenAI-compatible
+        # Chat Completions endpoint.  Exercise V2 therefore uses that supported
+        # endpoint even when ordinary teaching is configured for Responses.
+        protocol='chat_completions' if response_format is not None else cfg.qwen_protocol
+        endpoint=cfg.qwen_base_url.rstrip('/')+('/responses' if protocol=='responses' else '/chat/completions')
+        if protocol=='responses':
+            body={'model':cfg.qwen_model,'input':messages,'stream':True,'max_output_tokens':tokens}
+        else:
+            body={'model':cfg.qwen_model,'messages':messages,'stream':True,'max_tokens':tokens,
+                  'enable_thinking':False,'stream_options':{'include_usage':True}}
+            if response_format is not None: body['response_format']=response_format
+        self.calls.append({'model':cfg.qwen_model,'stage_tokens':tokens,'protocol':protocol,
+                           'structured':response_format is not None})
+        # Zero implicit retries, no credential echo in logs or public errors.
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(cfg.timeout,connect=12),transport=self.transport,follow_redirects=False) as client:
+                async with client.stream('POST',endpoint,headers={'Authorization':'Bearer '+cfg.qwen_key},json=body) as response:
+                    if response.status_code!=200: raise ProviderError('PROVIDER_HTTP_'+str(response.status_code))
+                    finished=False
+                    async for event_type, raw in events(response.aiter_lines()):
+                        if raw.strip()=='[DONE]':
+                            if not finished:
+                                raise ProviderError('DISCONNECTED_PROVIDER_STREAM')
+                            break
+                        try:
+                            data=json.loads(raw)
+                        except json.JSONDecodeError:
+                            raise ProviderError('INVALID_PROVIDER_STREAM') from None
+                        if not isinstance(data,dict) or data.get('error'):
+                            raise ProviderError('INVALID_PROVIDER_RESPONSE')
+                        if protocol=='responses':
+                            kind=data.get('type',event_type)
+                            if kind=='response.output_text.delta':
+                                value=data.get('delta','')
+                                if not isinstance(value,str): raise ProviderError('INVALID_PROVIDER_STREAM')
+                                if value: yield {'text':value}
+                            if kind=='response.completed':
+                                status=data.get('response',{}).get('status','completed')
+                                if status!='completed': raise ProviderError('INCOMPLETE_PROVIDER_RESPONSE')
+                                finished=True
+                                yield {'usage':data.get('response',{}).get('usage',{})}
+                            if kind in {'response.failed','response.incomplete','error'}:
+                                raise ProviderError('INCOMPLETE_PROVIDER_RESPONSE')
+                        else:
+                            choices=data.get('choices',[])
+                            if not isinstance(choices,list): raise ProviderError('INVALID_PROVIDER_STREAM')
+                            for choice in choices:
+                                if not isinstance(choice,dict): raise ProviderError('INVALID_PROVIDER_STREAM')
+                                delta=choice.get('delta',{}).get('content')
+                                if delta:
+                                    if not isinstance(delta,str): raise ProviderError('INVALID_PROVIDER_STREAM')
+                                    yield {'text':delta}
+                                reason=choice.get('finish_reason')
+                                if reason is not None and reason!='stop':
+                                    raise ProviderError('INCOMPLETE_PROVIDER_RESPONSE')
+                                if reason=='stop': finished=True
+                            if data.get('usage'): yield {'usage':data['usage']}
+                    if not finished: raise ProviderError('DISCONNECTED_PROVIDER_STREAM')
+        except ValueError:
+            raise ProviderError('INVALID_PROVIDER_STREAM') from None
+        except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError):
+            raise ProviderError('PROVIDER_TIMEOUT_OR_NETWORK') from None
+
+    # ------------------------------------------------------------- generators
+
+    async def generate(self, course, text, profile, sources, history, lane, bridge=None, *, attachments=None, spec_items=None, teaching_mode='normal', template_id='OTHER'):
+        """Chat teach/problem generation. teaching_mode selects the contract:
+        normal = single direct call; thinking = plan (template-based) -> work."""
+        if teaching_mode=='normal':
+            yield {'kind':'status','status':'generating','label':'正在输出中'}
+            messages=self.direct_messages(course,text,profile,sources,history,lane,bridge)
+            self.attach_images(messages, attachments or [])
+            async for item in self.stream(messages,self.cfg.answer_tokens):
+                if 'text' in item: yield {'kind':'delta','text':item['text']}
+                if 'usage' in item: yield {'kind':'usage','stage':'answer','value':item['usage']}
+            return
+        yield {'kind':'status','status':'planning','label':'正在思考中'}
+        prompt=''
+        planner=self.planner_messages(course,text,profile,sources,history,lane,bridge,spec_items,template_id)
+        self.attach_images(planner, attachments or [])
+        async for item in self.stream(planner,self.cfg.prompt_tokens):
+            if 'text' in item:
+                prompt+=item['text']
+                # This is an internal audit checkpoint, not visible teaching
+                # output.  If the provider reports an explicit incomplete
+                # terminal event, the already received plan and usage remain
+                # attributable to this run without being replayed or exposed.
+                yield {'kind':'prompt_checkpoint','text':prompt}
+            if 'usage' in item: yield {'kind':'usage','stage':'prompt','value':item['usage']}
+            if len(prompt)>24000: raise ProviderError('PROMPT_TOO_LONG')
+        if len(prompt.strip())<30: raise ProviderError('EMPTY_GENERATED_PROMPT')
+        yield {'kind':'prompt','text':prompt}
+        yield {'kind':'status','status':'generating','label':'正在输出中'}
+        messages=self.work_messages(prompt,course,text,sources,history,bridge)
+        self.attach_images(messages, attachments or [])
+        async for item in self.stream(messages,self.cfg.answer_tokens):
+            if 'text' in item: yield {'kind':'delta','text':item['text']}
+            if 'usage' in item: yield {'kind':'usage','stage':'answer','value':item['usage']}
+
+    async def generate_exercise(self, course, node, profile, sources, *, target_label=''):
+        """One structured call produces a public question and private answer.
+
+        No model text is exposed as a delta: the API validates the complete
+        object first and publishes only the validated question.
+        """
+        yield {'kind':'status','status':'generating','label':'正在出题中'}
+        messages=self.exercise_messages(course,node,profile,sources)
+        buffer=''
+        async for item in self.stream(messages,self.cfg.answer_tokens,response_format=EXERCISE_RESPONSE_FORMAT):
+            if 'text' in item:
+                buffer+=item['text']
+            if 'usage' in item: yield {'kind':'usage','stage':'exercise','value':item['usage']}
+        if len(buffer.strip())<20: raise ProviderError('EMPTY_EXERCISE')
+        yield {'kind':'complete','text':buffer}
+
+    async def generate_explanation(self, course, question_text, answer_context, step_text, profile, sources):
+        """详解: one provider call explaining a single answer step."""
+        yield {'kind':'status','status':'generating','label':'正在生成详解'}
+        messages=self.explanation_messages(course,question_text,answer_context,step_text,profile,sources)
+        async for item in self.stream(messages,self.cfg.answer_tokens):
+            if 'text' in item: yield {'kind':'delta','text':item['text']}
+            if 'usage' in item: yield {'kind':'usage','stage':'explanation','value':item['usage']}
+
+    async def classify_course(self, bundle: dict) -> str:
+        """Template classification: ONE provider call returning the validated
+        JSON candidate. Empty returns classify as OTHER by the caller."""
+        text, _ = await self.classify_course_with_usage(bundle)
+        return text
+
+    async def classify_course_with_usage(self, bundle: dict) -> tuple[str, list[dict]]:
+        """Classify once and return provider usage for the frozen revision.
+
+        This is deliberately separate from ``classify_course`` so existing
+        offline doubles retain their compact string-returning contract.
+        """
+        messages = self.classification_messages(bundle)
+        text = ''
+        usages: list[dict] = []
+        async for item in self.stream(messages, min(self.cfg.prompt_tokens, 1200)):
+            if 'text' in item: text += item['text']
+            if 'usage' in item: usages.append(item['usage'])
+        return text.strip(), usages
+
+class DeepSeekProvider(QwenProvider):
+    """DeepSeek generation engine (deepseek-flash / DeepSeek-V4.1-Flash).
+
+    Reuses the provider-agnostic message builders from ``QwenProvider`` (prompt
+    assembly is product logic, not a Qwen wire detail) and replaces every
+    transport/payload decision with the verified DeepSeek contract:
+
+    * Chat Completions and Responses bodies carry NO Qwen-only fields
+      (``enable_thinking``, ``max_pixels``).
+    * Images use the documented ``detail`` field; native thinking is explicitly
+      disabled; json_schema structured output goes over Responses ``text.format``.
+    * The endpoint host is pinned to ``api.deepseek.com`` by the settings
+      validator; this class never rewrites the host or falls back to Qwen.
+    """
+
+    def __init__(self, settings, transport=None):
+        super().__init__(settings, transport)
+        self.model = settings.deepseek_model
+        self.base_url = settings.deepseek_base_url.rstrip('/')
+        self.protocol = settings.deepseek_protocol
+        self.key = settings.deepseek_key
+
+    # ------------------------------------------------------------------ images
+
+    def attach_images(self, messages: list, images: list) -> None:
+        """Authorized images only; DeepSeek's ``detail`` field, never ``max_pixels``."""
+        if not images:
+            return
+        content = messages[-1]['content']
+        if self.protocol == 'responses':
+            parts = [{'type': 'input_text', 'text': content}]
+            parts.extend(responses_image_part(im['data_url']) for im in images)
+        else:
+            parts = [{'type': 'text', 'text': content}]
+            parts.extend(chat_completions_image_part(im['data_url']) for im in images)
+        messages[-1]['content'] = parts
+
+    def _with_estimated_images(self, messages: list, attachments: list | None) -> list:
+        copied = [dict(message) for message in messages]
+        if not attachments:
+            return copied
+        content = copied[-1]['content']
+        if self.protocol == 'responses':
+            parts = [{'type': 'input_text', 'text': content}]
+            parts.extend(responses_image_part('') for _ in attachments)
+        else:
+            parts = [{'type': 'text', 'text': content}]
+            parts.extend(chat_completions_image_part('') for _ in attachments)
+        copied[-1]['content'] = parts
+        return copied
+
+    def _estimate(self, stages: list[dict]) -> OperationEstimate:
+        return estimate_operation_cost(
+            stages=stages,
+            input_usd_per_million=self.cfg.operation_input_usd_per_million,
+            output_usd_per_million=self.cfg.operation_output_usd_per_million,
+            # DeepSeek resizes every image to at most 1024 tokens (documented).
+            image_tokens_per_input=IMAGE_TOKENS_PER_INPUT + 2,
+        )
+
+    # ------------------------------------------------------------- structured
+
+    def _structured_text_format(self, response_format: dict) -> dict:
+        """Map the exercise.v2 Chat-Completions json_schema into DeepSeek's
+        Responses ``text.format`` json_schema (the schema content is unchanged;
+        only the wire shape is adapted)."""
+        format_type = response_format.get('type')
+        if format_type == 'json_object':
+            return {'type': 'json_object'}
+        if format_type == 'json_schema':
+            js = response_format.get('json_schema') or {}
+            return json_schema_text_format(
+                str(js.get('name') or 'coursemate_response'),
+                js.get('schema') or {},
+            )
+        raise DeepSeekCapabilityError(
+            'exercise', f'response_format {format_type!r}', 'responses'
+        )
+
+    # ------------------------------------------------------------------ stream
+
+    async def stream(self, messages: list, tokens: int, *, response_format: dict | None = None) -> AsyncIterator[dict]:
+        cfg = self.cfg
+        if not cfg.allow_billable:
+            raise ProviderError('BILLING_NOT_AUTHORIZED')
+        # json_schema structured output is documented only on the Responses
+        # ``text.format`` field; force that protocol for structured calls.
+        protocol = 'responses' if response_format is not None else self.protocol
+        if protocol == 'responses':
+            text_format = self._structured_text_format(response_format) if response_format else None
+            body = responses_body(
+                model=self.model,
+                input=messages,
+                max_output_tokens=tokens,
+                stream=True,
+                text_format=text_format,
+            )
+            endpoint = self.base_url + RESPONSES_PATH
+        else:
+            body = chat_completions_body(
+                model=self.model,
+                messages=messages,
+                max_tokens=tokens,
+                stream=True,
+                response_format=response_format,
+            )
+            endpoint = self.base_url + CHAT_COMPLETIONS_PATH
+        self.calls.append({
+            'model': self.model,
+            'stage_tokens': tokens,
+            'protocol': protocol,
+            'structured': response_format is not None,
+        })
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(cfg.timeout, connect=12),
+                transport=self.transport,
+                follow_redirects=False,
+            ) as client:
+                async with client.stream(
+                    'POST', endpoint, headers={'Authorization': 'Bearer ' + self.key}, json=body
+                ) as response:
+                    if response.status_code != 200:
+                        raise ProviderError('PROVIDER_HTTP_' + str(response.status_code))
+                    finished = False
+                    async for event_type, raw in events(response.aiter_lines()):
+                        if raw.strip() == '[DONE]':
+                            if not finished:
+                                raise ProviderError('DISCONNECTED_PROVIDER_STREAM')
+                            break
+                        try:
+                            data = json.loads(raw)
+                        except json.JSONDecodeError:
+                            raise ProviderError('INVALID_PROVIDER_STREAM') from None
+                        if not isinstance(data, dict) or data.get('error'):
+                            raise ProviderError('INVALID_PROVIDER_RESPONSE')
+                        if protocol == 'responses':
+                            kind = data.get('type', event_type)
+                            if kind == 'response.output_text.delta':
+                                value = data.get('delta', '')
+                                if not isinstance(value, str):
+                                    raise ProviderError('INVALID_PROVIDER_STREAM')
+                                if value:
+                                    yield {'text': value}
+                            response_body = data.get('response', {})
+                            if kind == 'response.completed':
+                                status = response_body.get('status', 'completed')
+                                if status != 'completed':
+                                    usage = response_body.get('usage')
+                                    if isinstance(usage, dict) and usage:
+                                        yield {'usage': usage}
+                                    raise ProviderError(_responses_incomplete_code(response_body))
+                                finished = True
+                                yield {'usage': response_body.get('usage', {})}
+                            if kind in {'response.failed', 'response.incomplete', 'error'}:
+                                usage = response_body.get('usage')
+                                if isinstance(usage, dict) and usage:
+                                    yield {'usage': usage}
+                                raise ProviderError(_responses_incomplete_code(response_body))
+                        else:
+                            choices = data.get('choices', [])
+                            if not isinstance(choices, list):
+                                raise ProviderError('INVALID_PROVIDER_STREAM')
+                            for choice in choices:
+                                if not isinstance(choice, dict):
+                                    raise ProviderError('INVALID_PROVIDER_STREAM')
+                                delta = choice.get('delta', {}).get('content')
+                                if delta:
+                                    if not isinstance(delta, str):
+                                        raise ProviderError('INVALID_PROVIDER_STREAM')
+                                    yield {'text': delta}
+                                reason = choice.get('finish_reason')
+                                if reason is not None and reason != 'stop':
+                                    raise ProviderError('INCOMPLETE_PROVIDER_RESPONSE')
+                                if reason == 'stop':
+                                    finished = True
+                            if data.get('usage'):
+                                yield {'usage': data['usage']}
+                    if not finished:
+                        raise ProviderError('DISCONNECTED_PROVIDER_STREAM')
+        except ValueError:
+            raise ProviderError('INVALID_PROVIDER_STREAM') from None
+        except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError):
+            raise ProviderError('PROVIDER_TIMEOUT_OR_NETWORK') from None
+
+
+class DisabledProvider:
+    async def generate(self,*args,**kwargs):
+        raise ProviderError('MODEL_NOT_CONFIGURED')
+        yield
+    async def generate_exercise(self,*args,**kwargs):
+        raise ProviderError('MODEL_NOT_CONFIGURED')
+        yield
+    async def generate_explanation(self,*args,**kwargs):
+        raise ProviderError('MODEL_NOT_CONFIGURED')
+        yield
+    async def classify_course(self,*args,**kwargs):
+        raise ProviderError('MODEL_NOT_CONFIGURED')
+
+def _cite_sources(
+    answer: str, text: str, sources: "Sequence[Mapping[str, object]]", lane: str
+) -> str:
+    """Append the source markers a real model emits, so the citation path is reachable.
+
+    `generate_run` turns `[S1]` markers in the model's own output into citation cards
+    and then audits each card (module D: `audit_answer_citations`). The live DeepSeek
+    provider writes those markers, which is why the production path has an audit at
+    all — but the labelled `test` double did not, so **every** browser acceptance run
+    saw an empty `citations` array and the whole citation layer was unreachable in
+    local acceptance. That was a gap in the double, not in the product.
+
+    The sentence added here is deliberately shaped like a real answer: it names the
+    question it is answering and points at the material it used. Two properties make
+    it useful rather than decorative:
+
+    * one marker per offered source (bounded by `generate_run`'s own `max_cards`), so
+      a card exists for each source the learner was actually shown;
+    * the learner's own words are quoted verbatim, so the audit's layer-2 check
+      ("a figure the claim asserts that the cited source never states") can be driven
+      from a browser journey through the question alone.
+
+    The `problem` lane is left byte-identical on purpose: its output is parsed into
+    numbered steps by `answer_steps_parse`, and a trailing paragraph is not a step.
+    """
+    if lane == 'problem' or not sources:
+        return answer
+    markers = ' '.join(
+        f"[{source['id']}]" for source in sources[:6]
+        if isinstance(source, dict) and source.get('id')
+    )
+    if not markers:
+        return answer
+    # The quoted question keeps its words but loses its own sentence punctuation:
+    # `_claim_for_citation` splits the answer on `。！？!?;；` and keeps the piece
+    # that carries the marker, so a question mark inside the quote would cut the
+    # claim in half and the audit would judge a fragment nobody wrote.
+    asked = ' '.join(str(text or '').split())
+    for mark in '。！？!?;；':
+        asked = asked.replace(mark, ' ')
+    asked = ' '.join(asked.split())[:160]
+    if not asked:
+        return answer
+    return f"{answer}\n\n针对「{asked}」，课程材料中的相关依据见 {markers}。"
+
+
+class TestProvider:
+    """Deterministic, clearly-labelled generator for local and browser
+    acceptance tests. Selected only by `provider_mode='test'`, which the
+    settings validator forbids in production. It never writes learning state
+    and never pretends to be Qwen."""
+
+    async def generate(self, course, text, profile, sources, history, lane, bridge=None, *, attachments=None, spec_items=None, teaching_mode='normal', template_id='OTHER'):
+        if teaching_mode=='thinking':
+            yield {'kind':'status','status':'planning','label':'正在思考中'}
+            yield {'kind':'prompt','text':'本地测试教学 Prompt（非千问实测）：逐步讲解，保留英文术语，引用材料标记。'}
+        yield {'kind':'status','status':'generating','label':'正在输出中'}
+        if lane=='problem':
+            answer=('## Step 1 审题与条件整理\n先把题目条件整理成输入参数。\n\n'
+                    '## Step 2 计算核心点\n对每个点统计其 eps 邻域内的样本数，达到 MinPts 即为核心点。\n\n'
+                    '## Step 3 判断边界与噪声\n根据核心点的邻域关系判断其余样本。\n\n'
+                    '## Step 4 核对并作答\n复核条件后写出完整结论。')
+        elif bridge and bridge.get('step'):
+            answer=f"这是围绕原题第 {bridge['step']} 步的教学输出，携带桥接上下文。"
+        elif spec_items:
+            sentences=' '.join(
+                f"{item.get('objective','')}：{item.get('acceptance','')}"
+                for item in spec_items if item.get('requirement')=='REQUIRED')
+            answer=f"这是测试教学。{sentences}"
+        else:
+            answer='从定义出发：核心点是邻域内样本数不少于 MinPts 的点。'
+        answer=_cite_sources(answer,text,sources,lane)
+        yield {'kind':'delta','text':answer}
+        yield {'kind':'usage','stage':'answer','value':{'output_tokens':24}}
+
+    async def generate_exercise(self, course, node, profile, sources, *, target_label=''):
+        yield {'kind':'status','status':'generating','label':'正在出题中'}
+        target=(node or {}).get('title') or target_label or '当前知识点'
+        question=(f'【诊断题 · {target}】给定二维样本点集合，请解释 DBSCAN 中核心点、'
+                  '边界点与噪声点的判定条件，并指出 MinPts 对聚类结果的影响。'
+                  '（依据课程知识点自编，非官方原题）')
+        answer=[
+            {'title':'核心点判定','text':'邻域内样本数不少于 MinPts 的点为核心点。'},
+            {'title':'边界点与噪声点','text':'不是核心点但落在核心点邻域内的是边界点；其余为噪声点。'},
+            {'title':'MinPts 的影响','text':'MinPts 增大，聚类更保守，噪声点倾向增多。'},
+        ]
+        yield {'kind':'usage','stage':'exercise','value':{'output_tokens':36}}
+        yield {'kind':'complete','text':json.dumps({'question':question,'answer_steps':answer,'references':[]},ensure_ascii=False)}
+
+    async def generate_explanation(self, course, question_text, answer_context, step_text, profile, sources):
+        yield {'kind':'status','status':'generating','label':'正在生成详解'}
+        yield {'kind':'delta','text':f'这是针对该步骤的本地测试详解：{step_text[:80]}'}
+        yield {'kind':'usage','stage':'explanation','value':{'output_tokens':18}}
+
+    async def classify_course(self, bundle: dict) -> str:
+        """Deterministic test classification: data-science-flavoured courses
+        classify to 03; everything else stays OTHER. Never pretends to be the
+        live classifier."""
+        haystack = json.dumps(bundle, ensure_ascii=False).casefold()
+        if any(token in haystack for token in ('data science', 'cs3481', '统计', '数据分析')):
+            return json.dumps({
+                'template_id': '03', 'decision': 'classified',
+                'degree_level': 'graduate', 'confidence': 0.9, 'alternatives': [],
+                'reason': '课程内容以数据科学方法与统计推断为主（测试 Provider 确定性结果）',
+                'evidence_refs': [], 'materials_revision': bundle.get('materials_revision', ''),
+            }, ensure_ascii=False)
+        return json.dumps({
+            'template_id': 'OTHER', 'decision': 'other', 'degree_level': 'unknown',
+            'confidence': None, 'alternatives': [], 'reason': 'insufficient_evidence',
+            'evidence_refs': [], 'materials_revision': bundle.get('materials_revision', ''),
+        }, ensure_ascii=False)

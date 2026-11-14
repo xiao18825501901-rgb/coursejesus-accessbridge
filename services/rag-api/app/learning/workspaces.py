@@ -1,0 +1,317 @@
+import hashlib
+import sqlite3
+from pathlib import Path
+from typing import cast
+from uuid import uuid4
+
+from app.course_access import check_course_content_access
+from app.db import Database
+from app.errors import ApiError
+
+
+def accessible_course(database: Database, course_id: str, owner: str) -> sqlite3.Row:
+    # Content administration is not permission to read another user's private workspace.
+    with database.connect() as db:
+        row = db.execute(
+            "SELECT * FROM courses WHERE id=? AND (owner_user_id=? OR visibility='public')",
+            (course_id, owner),
+        ).fetchone()
+    if row is None:
+        raise ApiError(404, "COURSE_NOT_FOUND", "The course was not found.")
+    check_course_content_access(database,row,owner)
+    return cast(sqlite3.Row, row)
+
+
+def workspace_for(database: Database, workspace_id: str, owner: str) -> sqlite3.Row:
+    with database.connect() as db:
+        row = db.execute(
+            "SELECT * FROM learning_workspaces WHERE id=? AND owner_user_id=?",
+            (workspace_id, owner),
+        ).fetchone()
+    if row is None:
+        raise ApiError(404, "WORKSPACE_NOT_FOUND", "The workspace was not found.")
+    accessible_course(database, row["course_id"], owner)
+    return cast(sqlite3.Row, row)
+
+
+def join_course(database: Database, course_id: str, owner: str, limit: int) -> dict[str, object]:
+    accessible_course(database, course_id, owner)
+    with database.connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        return ensure_course_workspace(db, course_id, owner, limit)
+
+
+def ensure_course_workspace(
+    db: sqlite3.Connection, course_id: str, owner: str, limit: int,
+) -> dict[str, object]:
+    """Canonical workspace insert in the caller's authorized transaction.
+
+    Callers must authorize the course first, or have just created it for owner
+    in this same transaction. This keeps course admission and quota atomic.
+    """
+    row = db.execute(
+        "SELECT * FROM learning_workspaces WHERE course_id=? AND owner_user_id=?",
+        (course_id, owner),
+    ).fetchone()
+    if row is None:
+        # Owned courses have no course-count cap. Their file storage must not
+        # consume the separate enrollment allowance; byte and billing limits
+        # are still enforced by ingestion and the existing model ledger.
+        owned_course = db.execute(
+            "SELECT 1 FROM courses WHERE id=? AND owner_user_id=? AND course_type='user'",
+            (course_id, owner),
+        ).fetchone() is not None
+        if (
+            not owned_course
+            and db.execute(
+                "SELECT COUNT(*) FROM learning_workspaces w WHERE w.owner_user_id=? "
+                "AND NOT (w.id GLOB 'akm-workspace-*' "
+                "AND w.private_course_id GLOB 'akm-corpus-*') "
+                "AND NOT EXISTS (SELECT 1 FROM courses c WHERE c.id=w.course_id "
+                "AND c.owner_user_id=? AND c.course_type='user')",
+                (owner, owner),
+            ).fetchone()[0]
+            >= limit
+        ):
+            raise ApiError(429, "WORKSPACE_QUOTA", "Workspace quota reached.")
+        if db.execute(
+            "SELECT 1 FROM learning_workspaces WHERE private_course_id=?", (course_id,)
+        ).fetchone():
+            raise ApiError(422, "INVALID_COURSE", "Cannot enroll a private storage corpus.")
+        identifier, corpus = str(uuid4()), "ws-" + uuid4().hex
+        db.execute(
+            "INSERT INTO "
+            "courses(id,name,owner_user_id,course_type,visibility,publication_status)"
+            " VALUES(?,?,?,'user','private','private')",
+            (corpus, "My workspace files", owner),
+        )
+        db.execute(
+            "INSERT INTO learning_workspaces(id,owner_user_id,course_id,private_course_id)"
+            " VALUES(?,?,?,?)",
+            (identifier, owner, course_id, corpus),
+        )
+        row = db.execute(
+            "SELECT * FROM learning_workspaces WHERE id=?", (identifier,)
+        ).fetchone()
+    return dict(row)
+
+
+def document_for(database: Database, document_id: str, owner: str) -> sqlite3.Row:
+    with database.connect() as db:
+        row = db.execute("SELECT * FROM documents WHERE id=?", (document_id,)).fetchone()
+        workspace = db.execute(
+            "SELECT * FROM learning_workspaces WHERE private_course_id="
+            "(SELECT course_id FROM documents WHERE id=?)",
+            (document_id,),
+        ).fetchone()
+    if row is None:
+        raise ApiError(404, "DOCUMENT_NOT_FOUND", "The document was not found.")
+    try:
+        if workspace is not None:
+            workspace_for(database, workspace["id"], owner)
+        accessible_course(database, row["course_id"], owner)
+    except ApiError as error:
+        raise ApiError(404, "DOCUMENT_NOT_FOUND", "The document was not found.") from error
+    return cast(sqlite3.Row, row)
+
+
+def current_document_version(
+    database: Database, document_id: str, owner: str
+) -> sqlite3.Row:
+    document_for(database, document_id, owner)
+    with database.connect() as db:
+        row = db.execute(
+            "SELECT * FROM document_versions WHERE document_id=? "
+            "ORDER BY version DESC LIMIT 1",
+            (document_id,),
+        ).fetchone()
+    if row is None:
+        raise ApiError(
+            409,
+            "DOCUMENT_VERSION_UNAVAILABLE",
+            "The document source version is unavailable.",
+        )
+    try:
+        _authorize_document_version(database, row, owner)
+    except ApiError as error:
+        raise ApiError(404, "DOCUMENT_NOT_FOUND", "The document was not found.") from error
+    return cast(sqlite3.Row, row)
+
+
+def _authorize_document_version(
+    database: Database, version: sqlite3.Row, owner: str
+) -> None:
+    if version["source_scope"] == "OFFICIAL":
+        accessible_course(database, version["course_id"], owner)
+        return
+    if version["owner_user_id"] == owner:
+        return
+    if version["source_scope"] == "OWNER_COURSE":
+        try:
+            course = accessible_course(database, version["course_id"], owner)
+        except ApiError as error:
+            raise ApiError(
+                404,
+                "DOCUMENT_VERSION_NOT_FOUND",
+                "The source version was not found.",
+            ) from error
+        if course["visibility"] == "public" and course["publication_status"] == "published":
+            return
+    raise ApiError(404, "DOCUMENT_VERSION_NOT_FOUND", "The source version was not found.")
+
+
+def can_read_document_version(
+    database: Database, version: sqlite3.Row, owner: str
+) -> bool:
+    """True when ``owner`` may read this document version (the canonical ACL).
+
+    The same rule :func:`_authorize_document_version` enforces, exposed as a
+    predicate so a caller that must answer with a verdict instead of raising
+    (the citation evidence resolver) maps ``False`` to ``unauthorized`` rather
+    than importing or duplicating the ACL.
+    """
+    try:
+        _authorize_document_version(database, version, owner)
+    except ApiError:
+        return False
+    return True
+
+
+def document_version_for(
+    database: Database, version_id: str, owner: str
+) -> sqlite3.Row:
+    with database.connect() as db:
+        row = db.execute(
+            "SELECT * FROM document_versions WHERE id=?", (version_id,)
+        ).fetchone()
+    if row is None:
+        raise ApiError(404, "DOCUMENT_VERSION_NOT_FOUND", "The source version was not found.")
+    _authorize_document_version(database, row, owner)
+    return cast(sqlite3.Row, row)
+
+
+def artifact_for(database: Database, artifact_id: str, owner: str) -> sqlite3.Row:
+    with database.connect() as db:
+        row = db.execute(
+            "SELECT * FROM derived_artifacts WHERE id=?", (artifact_id,)
+        ).fetchone()
+    if row is None:
+        raise ApiError(404, "ARTIFACT_NOT_FOUND", "The derived artifact was not found.")
+    try:
+        document_version_for(database, row["document_version_id"], owner)
+    except ApiError as error:
+        raise ApiError(
+            404,
+            "ARTIFACT_NOT_FOUND",
+            "The derived artifact was not found.",
+        ) from error
+    return cast(sqlite3.Row, row)
+
+
+def stored_file_path(database: Database, stored_path: str) -> Path | None:
+    path = Path(stored_path)
+    roots = (database.upload_dir.resolve(), database.storage_cache_dir.resolve())
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return None
+    # No client paths and no symlinks escaping either trusted storage root.
+    try:
+        unsafe_link = path.is_symlink()
+    except OSError:
+        return None
+    if unsafe_link or not any(resolved.is_relative_to(root) for root in roots):
+        return None
+    try:
+        local_file = resolved.is_file()
+    except OSError:
+        local_file = False
+    if not local_file and database.storage_path_resolver is not None:
+        hydrated = database.storage_path_resolver(str(resolved))
+        resolved = Path(hydrated).resolve() if hydrated is not None else resolved
+    try:
+        usable = resolved.is_file() and not resolved.is_symlink()
+    except OSError:
+        usable = False
+    if not usable or not any(resolved.is_relative_to(root) for root in roots):
+        return None
+    return resolved
+
+
+def sized_file_path(
+    database: Database, stored_path: str | None, byte_size: int | None
+) -> Path | None:
+    if stored_path is None or byte_size is None:
+        return None
+    path = stored_file_path(database, stored_path)
+    return path if path is not None and path.stat().st_size == byte_size else None
+
+
+def stored_file_available(
+    database: Database, stored_path: str | None, byte_size: int | None
+) -> bool:
+    """Report a local or durable original without forcing a full cache restore."""
+
+    if stored_path is None or byte_size is None:
+        return False
+    try:
+        path = Path(stored_path).resolve()
+    except OSError:
+        return False
+    roots = (database.upload_dir.resolve(), database.storage_cache_dir.resolve())
+    if not any(path.is_relative_to(root) for root in roots):
+        return False
+    try:
+        if path.is_file() and not path.is_symlink():
+            return path.stat().st_size == byte_size
+    except OSError:
+        pass
+    probe = database.storage_object_probe
+    return bool(probe and probe(str(path), int(byte_size)))
+
+
+def _verified_path(
+    database: Database,
+    stored_path: str,
+    byte_size: int,
+    expected_sha256: str,
+) -> Path | None:
+    path = sized_file_path(database, stored_path, byte_size)
+    if path is None:
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return path if digest.hexdigest() == expected_sha256 else None
+
+
+def original_path(database: Database, document_version: sqlite3.Row) -> Path | None:
+    return _verified_path(
+        database,
+        document_version["stored_path"],
+        document_version["byte_size"],
+        document_version["sha256"],
+    )
+
+
+def artifact_path(database: Database, artifact: sqlite3.Row) -> Path | None:
+    if artifact["status"] != "READY" or not artifact["stored_path"]:
+        return None
+    return _verified_path(
+        database,
+        artifact["stored_path"],
+        artifact["byte_size"],
+        artifact["sha256"],
+    )
+
+
+def valid_preview_artifact(database: Database, version_id: str) -> sqlite3.Row | None:
+    with database.connect() as db:
+        rows = db.execute(
+            "SELECT * FROM derived_artifacts "
+            "WHERE document_version_id=? AND kind='PREVIEW_PDF' AND status='READY' "
+            "ORDER BY created_at DESC",
+            (version_id,),
+        ).fetchall()
+    return next((row for row in rows if artifact_path(database, row) is not None), None)

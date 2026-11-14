@@ -1,0 +1,416 @@
+import ipaddress
+from contextlib import suppress
+from pathlib import Path
+from typing import Literal
+from urllib.parse import urlsplit
+
+from pydantic import AliasChoices, Field, SecretStr, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    """Validated service configuration loaded from environment variables."""
+
+    model_config = SettingsConfigDict(
+        env_file=(".env", "../../.env"),
+        env_file_encoding="utf-8",
+        extra="ignore",
+        populate_by_name=True,
+    )
+
+    openai_api_key: SecretStr | None = None
+    openai_base_url: str | None = None
+    openai_chat_model: str = "gpt-5.6-luna"
+    openai_embedding_model: str = "text-embedding-3-small"
+    rag_chat_api_key: SecretStr | None = None
+    rag_chat_base_url: str | None = None
+    rag_chat_model: str = ""
+    # DeepSeek generation path for the grounded QA role (deepseek-flash).
+    # Explicit per role; the QA answerer never falls back to OpenAI or Qwen.
+    deepseek_chat_api_key: SecretStr | None = None
+    deepseek_chat_base_url: str = "https://api.deepseek.com"
+    deepseek_chat_model: str = "deepseek-flash"
+    rag_embedding_api_key: SecretStr | None = None
+    rag_embedding_base_url: str | None = None
+    rag_embedding_model: str = ""
+    rag_provider_mode: Literal["openai", "deterministic"] = "openai"
+    web_origin: str = "http://localhost:5173"
+    web_allowed_origins: str = ""
+    clerk_secret_key: SecretStr | None = None
+    clerk_jwt_key: SecretStr | None = None
+    admin_user_ids: str = ""
+    rag_qa_requests_per_minute: int = Field(default=10, ge=1, le=1_000)
+    app_env: Literal["development", "test", "production"] = "production"
+    auth_test_user_id: str | None = None
+    v3_enabled: bool = False
+    # Generation model.  deepseek-flash is the verified default; qwen3.8-max is
+    # retained ONLY as an explicitly configured historical path (reading old
+    # records / the legacy Model Studio canary) - a new request never defaults
+    # to it and there is no silent fallback between the two.
+    v3_model: Literal["deepseek-flash", "qwen3.8-max"] = "deepseek-flash"
+    v3_model_api_key: SecretStr | None = None
+    v3_model_base_url: str | None = None
+    # Historical direct adapters stay OFF unless their exact saved identity
+    # requires otherwise. New generic work uses the separately qualified route.
+    v3_qwen_protocol: Literal["responses", "chat_completions"] = "responses"
+    v3_qwen_native_reasoning: bool = False
+    v3_qwen_reasoning_effort: Literal["", "xhigh"] = ""
+    # Independent generic route: never overwrite the private-tree credential.
+    generic_llm_enabled: bool = False
+    assessment_point_policy_enabled: bool = False
+    cj_qwen_api_key: SecretStr | None = None
+    cj_qwen_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    cj_qwen_model: Literal["qwen3.8-max"] = "qwen3.8-max"
+    cj_qwen_capability_receipt_id: str = ""
+    cj_qwen_secret_generation_id: str = ""
+    cj_qwen_native_reasoning: bool = True
+    cj_qwen_reasoning_effort: Literal["xhigh"] = "xhigh"
+    v3_max_output_tokens: int = Field(default=4000, ge=500, le=8000)
+    v3_model_timeout_seconds: int = Field(default=180, ge=30, le=600)
+    v3_daily_operations: int = Field(default=30, ge=1, le=500)
+    v3_daily_model_calls_per_user: int = Field(default=60, ge=1, le=1_000)
+    v3_daily_model_calls_per_user_course: int = Field(default=60, ge=1, le=1_000)
+    v3_problem_image_max_bytes: int = Field(default=10 * 1024 * 1024, ge=1_024, le=20 * 1024 * 1024)
+    v3_preview_max_bytes: int = Field(default=2 * 1024 * 1024, ge=1_024, le=20 * 1024 * 1024)
+    v3_preview_max_text_chars: int = Field(default=100_000, ge=1_000, le=1_000_000)
+    v3_preview_max_csv_rows: int = Field(default=200, ge=1, le=5_000)
+    v3_preview_max_csv_columns: int = Field(default=50, ge=1, le=500)
+    v3_preview_max_cell_chars: int = Field(default=2_000, ge=10, le=20_000)
+    v3_preview_max_notebook_cells: int = Field(default=100, ge=1, le=1_000)
+    v3_preview_max_image_pixels: int = Field(default=40_000_000, ge=1, le=100_000_000)
+    v3_preview_max_image_dimension: int = Field(default=16_384, ge=1, le=100_000)
+    v3_office_max_archive_entries: int = Field(default=2_000, ge=1, le=20_000)
+    v3_office_max_uncompressed_bytes: int = Field(
+        default=50 * 1024 * 1024, ge=1_024, le=500 * 1024 * 1024
+    )
+    v3_office_max_compression_ratio: int = Field(default=100, ge=1, le=1_000)
+    # Automatic map generation is independently gated from ordinary teaching.
+    # Both switches must be explicit before a background worker can spend.
+    auto_knowledge_map_enabled: bool = False
+    auto_knowledge_map_allow_billable: bool = False
+    # Keep event-driven maps for new/changed material independent from the
+    # operator-controlled sweep of legacy inventory.  Production handoffs can
+    # pause the latter without disabling the former.
+    auto_knowledge_map_legacy_backfill_enabled: bool = True
+    auto_knowledge_map_poll_seconds: float = Field(default=5.0, ge=1.0, le=300.0)
+    auto_knowledge_map_reconcile_seconds: float = Field(default=300.0, ge=30.0, le=3600.0)
+    auto_knowledge_map_batch_wait_seconds: float = Field(default=90.0, ge=30.0, le=1800.0)
+
+    database_path: Path = Field(
+        default=Path("../../data/rag.sqlite3"),
+        validation_alias=AliasChoices("RAG_DATABASE_PATH", "DATABASE_PATH"),
+    )
+    upload_dir: Path = Field(
+        default=Path("../../data/uploads"),
+        validation_alias=AliasChoices("RAG_UPLOAD_DIR", "UPLOAD_DIR"),
+    )
+    storage_backend: Literal["local", "aliyun_oss"] = Field(
+        default="local", validation_alias=AliasChoices("STORAGE_BACKEND")
+    )
+    storage_cache_dir: Path = Field(
+        default=Path("../../data/storage-cache"),
+        validation_alias=AliasChoices("STORAGE_CACHE_DIR"),
+    )
+    storage_cache_max_bytes: int = Field(
+        default=10 * 1024**3, ge=0, le=100 * 1024**3
+    )
+    storage_reserve_min_bytes: int = Field(default=10 * 1024**3, ge=0)
+    storage_reserve_fraction: float = Field(default=0.20, ge=0.0, le=0.90)
+    oss_region: str = Field(default="", validation_alias=AliasChoices("OSS_REGION"))
+    oss_bucket: str = Field(default="", validation_alias=AliasChoices("OSS_BUCKET"))
+    oss_endpoint: str = Field(default="", validation_alias=AliasChoices("OSS_ENDPOINT"))
+    oss_public_endpoint: str = Field(
+        default="", validation_alias=AliasChoices("OSS_PUBLIC_ENDPOINT")
+    )
+    oss_object_prefix: str = Field(
+        default="coursejesus", validation_alias=AliasChoices("OSS_OBJECT_PREFIX")
+    )
+    # Ordinary uploads keep the ten-minute default. Reviewed large-import
+    # processes may explicitly request up to one hour so a PUT that starts
+    # before signature expiry can also reach the finalize gate in time.
+    oss_presign_ttl_seconds: int = Field(default=600, ge=60, le=3600)
+    chunk_size: int = Field(default=1_200, ge=200, le=12_000)
+    chunk_overlap: int = Field(default=200, ge=0, le=4_000)
+    top_k: int = Field(default=6, ge=1, le=30)
+    # Recall width per authorized scope before the single global fusion. The
+    # governing plan starts from "at most 40 candidates" as an untested default,
+    # so it is configurable rather than a magic number inside the adapter.
+    retrieval_candidates: int = Field(default=40, ge=1, le=200)
+    max_upload_bytes: int = Field(default=20 * 1024 * 1024, ge=1_024, le=500_000_000)
+    user_course_max_courses: int = Field(default=10, ge=1, le=1_000)
+    user_course_max_files: int = Field(default=50, ge=1, le=10_000)
+    user_course_max_total_upload_bytes: int = Field(
+        default=500 * 1024 * 1024,
+        ge=1_024,
+        le=100 * 1024 * 1024 * 1024,
+    )
+    max_context_chars: int = Field(default=18_000, ge=1_000, le=100_000)
+    ui_extension_enabled: bool = False
+    ui_task_agent_url: str = ""
+    ui_task_agent_timeout_seconds: float = Field(default=60.0, ge=1.0, le=300.0)
+    ui_web_dir: Path = Field(default=Path("../../apps/web/dist"))
+    # The visual engine remains off and local/mock by default. Selecting the
+    # real provider is explicit and requires both endpoint and protected token.
+    visual_engine_enabled: bool = False
+    visual_provider: Literal["mock", "aliyun_eas"] = "mock"
+    visual_auto_enabled: bool = False
+    visual_video_enabled: bool = False
+    visual_worker_poll_seconds: float = Field(default=1.0, ge=0.05, le=60.0)
+    visual_worker_lease_seconds: float = Field(default=30.0, ge=5.0, le=600.0)
+    visual_max_concurrent_jobs_per_user: int = Field(default=2, ge=1, le=20)
+    visual_max_concurrent_jobs_global: int = Field(default=4, ge=1, le=100)
+    visual_max_images_per_user_day: int = Field(default=20, ge=1, le=1_000)
+    visual_max_video_jobs_per_user_day: int = Field(default=2, ge=0, le=100)
+    visual_max_gpu_seconds_per_user_day: float = Field(default=0.0, ge=0.0, le=86_400.0)
+    visual_max_output_bytes: int = Field(default=10 * 1024 * 1024, ge=1_024, le=100 * 1024 * 1024)
+    visual_max_width: int = Field(default=2048, ge=256, le=8192)
+    visual_max_height: int = Field(default=2048, ge=256, le=8192)
+    visual_max_duration_seconds: float = Field(default=15.0, ge=0.5, le=120.0)
+    visual_max_retries: int = Field(default=1, ge=0, le=5)
+    visual_mock_complete_after_polls: int = Field(default=2, ge=1, le=20)
+    visual_eas_endpoint: str = Field(
+        default="", validation_alias=AliasChoices("COMFYUI_EAS_ENDPOINT")
+    )
+    visual_eas_token: SecretStr | None = Field(
+        default=None, validation_alias=AliasChoices("COMFYUI_EAS_TOKEN")
+    )
+    visual_provider_request_timeout_seconds: float = Field(default=420.0, ge=1.0, le=900.0)
+    visual_image_render_deadline_seconds: float = Field(default=900.0, ge=10.0, le=1800.0)
+    visual_renderer_poll_max_seconds: float = Field(default=15.0, ge=0.1, le=60.0)
+    # Canvas credentials are stored under an authenticated-encryption key that lives here and
+    # nowhere else: not in the database, not in the repository, not in a log. Without it the
+    # integration reports itself unconfigured instead of storing a token in the clear.
+    canvas_credential_key: SecretStr | None = Field(
+        default=None, validation_alias=AliasChoices("CANVAS_CREDENTIAL_KEY")
+    )
+    canvas_credential_dir: Path = Field(
+        default=Path("../../data/canvas-credentials"),
+        validation_alias=AliasChoices("CANVAS_CREDENTIAL_DIR"),
+    )
+    # Where the browser lands after the school's callback. It is configuration rather than a
+    # request parameter on purpose: the product decides the return target once, and no query
+    # string can steer a user elsewhere. The path before the fragment may contain a query
+    # (`?canvas=connected` is appended to it); the fragment is kept, because the UI is
+    # hash-routed.
+    canvas_return_path: str = Field(
+        default="/ui-extension/#/courses",
+        validation_alias=AliasChoices("CANVAS_RETURN_PATH"),
+    )
+    # The Local Canvas Bridge is the fallback for a school that has not issued a Developer Key: the
+    # user runs a bridge on their own machine and only metadata, file bytes and receipts ever reach
+    # this service. It is on by default because it grants nothing a user does not already have
+    # (their own private course, their own storage quota); an operator can turn it off, and the
+    # capability route then says so instead of the page offering something the deployment refuses.
+    canvas_local_bridge_enabled: bool = Field(
+        default=True, validation_alias=AliasChoices("CANVAS_LOCAL_BRIDGE_ENABLED")
+    )
+    # Per-definition Jev runtime modes, as `key=mode` pairs (`JEV_DEFINITION_MODES`).
+    #
+    # Without this the shipped service could only ever run the catalogue's default, which is
+    # `shadow` for every definition — so a definition could be measured but never promoted, and no
+    # deployment could demonstrate that a promotion changes behaviour. The setting makes promotion
+    # *possible*; it does not make it *allowed*, and both halves matter:
+    #
+    #   * the default is empty, so a deployment that does nothing behaves exactly as before (every
+    #     definition records its suggestion and none of them is used);
+    #   * it must stay empty until the quality gate in §14 of the task has passed for that
+    #     definition — the live comparison on the calibration split does not pass it today
+    #     (`JEV_CALIBRATION_AND_ABLATION_REPORT.md` §9), so promoting anything now would act on
+    #     numbers that do not support it;
+    #   * an unknown definition key or mode refuses at startup rather than being ignored, because a
+    #     silently dropped promotion looks exactly like a promotion that has no effect.
+    jev_definition_modes: str = Field(
+        default="", validation_alias=AliasChoices("JEV_DEFINITION_MODES")
+    )
+    # TypeSafe/Jev is retained only for historical receipt readability. New
+    # traffic is disabled unless the operator explicitly selects the private,
+    # pinned OpenJev service and supplies every coordinate below.
+    jev_provider: Literal["disabled", "openjev"] = Field(
+        default="disabled", validation_alias=AliasChoices("JEV_PROVIDER")
+    )
+    openjev_endpoint: str = Field(
+        default="", validation_alias=AliasChoices("OPENJEV_ENDPOINT")
+    )
+    openjev_bearer_token: SecretStr | None = Field(
+        default=None, validation_alias=AliasChoices("OPENJEV_BEARER_TOKEN")
+    )
+    openjev_model_revision: str = Field(
+        default="", validation_alias=AliasChoices("OPENJEV_MODEL_REVISION")
+    )
+    # ---- hybrid-strict-v1 strong-review chain -------------------------------
+    #
+    # The Question Engine's original four quality requirements are unchanged.
+    # What changes is *which reviewed method* may satisfy them: alongside the
+    # historical local/TypeSafe receipt chain, a deployment may configure two
+    # independently requested DeepSeek reviewer roles plus a scoped
+    # qualification.  Off by default, and the default is the point: with
+    # ``HYBRID_QUALITY_ENABLED`` unset the pipeline is byte-identical to before,
+    # hard gates still fail closed, and no extra paid call is ever made.
+    #
+    # Enabling this is explicitly a billable decision: the two reviewer calls per
+    # candidate are real provider requests and are counted as such.  A missing or
+    # out-of-scope qualification refuses publication rather than passing it.
+    hybrid_quality_enabled: bool = Field(
+        default=False, validation_alias=AliasChoices("HYBRID_QUALITY_ENABLED")
+    )
+    hybrid_review_max_output_tokens: int = Field(
+        default=4000, ge=500, le=8000
+    )
+    # The task-level transient credential: a personal access token pasted for one import task,
+    # held in the service process, destroyed before indexing starts.
+    #
+    # OFF by default, and the default is the point. This path exists because the owner's own
+    # testing must not be blocked by the school's Developer Key, not because the product has
+    # permission to accept students' tokens — no institution has been asked, and the public
+    # multi-user OAuth path (`CANVAS_OAUTH_LIVE = WAITING_INSTITUTION`) stays the only route
+    # offered to everyone else. A deployment turns this on for listed accounts only.
+    canvas_task_credential_enabled: bool = Field(
+        default=False, validation_alias=AliasChoices("CANVAS_TASK_CREDENTIAL_ENABLED")
+    )
+    # Who may use it. Empty means the existing administrators, so enabling the path does not
+    # silently mean "every account": a deployment that lists nobody gets the admins.
+    canvas_task_credential_users: str = Field(
+        default="", validation_alias=AliasChoices("CANVAS_TASK_CREDENTIAL_USERS")
+    )
+
+    @model_validator(mode="after")
+    def validate_chunk_window(self) -> "Settings":
+        if self.chunk_overlap >= self.chunk_size:
+            raise ValueError("chunk_overlap must be smaller than chunk_size")
+        if self.storage_backend == "aliyun_oss" and not (
+            self.oss_region and self.oss_bucket and self.oss_endpoint
+        ):
+            raise ValueError(
+                "OSS_REGION, OSS_BUCKET and OSS_ENDPOINT are required for aliyun_oss storage"
+            )
+        if self.storage_backend == "aliyun_oss" and not self.v3_enabled:
+            raise ValueError("aliyun_oss storage requires the V3 storage metadata schema")
+        if self.visual_engine_enabled and not self.v3_enabled:
+            raise ValueError("visual engine requires the V3 schema")
+        if self.visual_engine_enabled and self.visual_provider == "aliyun_eas":
+            if not self.visual_eas_endpoint.strip() or not self.visual_eas_token:
+                raise ValueError(
+                    "COMFYUI_EAS_ENDPOINT and COMFYUI_EAS_TOKEN are required for aliyun_eas"
+                )
+            endpoint = urlsplit(self.visual_eas_endpoint)
+            hostname = (endpoint.hostname or "").lower()
+            official_http_gateway = (
+                endpoint.scheme == "http"
+                and hostname.endswith(".pai-eas.aliyuncs.com")
+                and hostname.count(".") >= 5
+            )
+            if (
+                endpoint.scheme not in {"http", "https"}
+                or not hostname
+                or (endpoint.scheme == "http" and not official_http_gateway)
+                or endpoint.username is not None
+                or endpoint.password is not None
+                or endpoint.port is not None
+                or endpoint.path not in {"", "/"}
+                or endpoint.query
+                or endpoint.fragment
+            ):
+                raise ValueError(
+                    "COMFYUI_EAS_ENDPOINT must be an HTTPS origin or an exact official "
+                    "PAI-EAS shared-gateway HTTP origin"
+                )
+        if self.jev_provider == "openjev":
+            missing: list[str] = []
+            if not self.openjev_endpoint.strip():
+                missing.append("OPENJEV_ENDPOINT")
+            if not self.openjev_bearer_token:
+                missing.append("OPENJEV_BEARER_TOKEN")
+            if not self.openjev_model_revision.strip():
+                missing.append("OPENJEV_MODEL_REVISION")
+            if missing:
+                raise ValueError(
+                    "OpenJev configuration is incomplete: " + ", ".join(missing)
+                )
+        self.rag_chat_api_key = self.rag_chat_api_key or self.openai_api_key
+        self.rag_chat_base_url = self.rag_chat_base_url or self.openai_base_url
+        self.rag_chat_model = self.rag_chat_model or self.openai_chat_model
+        self.rag_embedding_api_key = self.rag_embedding_api_key or self.openai_api_key
+        self.rag_embedding_base_url = self.rag_embedding_base_url or self.openai_base_url
+        self.rag_embedding_model = self.rag_embedding_model or self.openai_embedding_model
+        self.web_origin = self.web_origin.strip()
+        for origin in self.web_allowed_origin_tuple:
+            self._validate_browser_origin(origin)
+        return self
+
+    def _validate_browser_origin(self, origin: str) -> None:
+        parsed = urlsplit(origin)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(f"Browser origin must be an exact HTTP(S) origin: {origin!r}")
+        hostname = parsed.hostname or ""
+        is_loopback = hostname == "localhost" or hostname.endswith(".localhost")
+        if not is_loopback:
+            with suppress(ValueError):
+                is_loopback = ipaddress.ip_address(hostname).is_loopback
+        if self.app_env == "production" and parsed.scheme != "https" and not is_loopback:
+            raise ValueError("Production browser origins must use HTTPS.")
+
+    @property
+    def web_allowed_origin_tuple(self) -> tuple[str, ...]:
+        origins: list[str] = []
+        for item in self.web_allowed_origins.split(","):
+            origin = item.strip()
+            if origin and origin not in origins:
+                origins.append(origin)
+        if self.web_origin not in origins:
+            origins.append(self.web_origin)
+        return tuple(origins)
+
+    @property
+    def admin_user_id_set(self) -> frozenset[str]:
+        return frozenset(item.strip() for item in self.admin_user_ids.split(",") if item.strip())
+
+    @property
+    def jev_definition_mode_map(self) -> dict[str, str]:
+        """The per-definition modes to hand `JevGateway`, validated against the catalogue.
+
+        Refuses rather than ignores: an unknown definition key is a typo that would silently leave
+        the definition in `shadow`, and an unknown mode is a misspelling of `on` — both look like
+        "the
+        promotion had no effect" once the deployment is running, which is the hardest kind of
+        mistake to notice from the outside.
+        """
+        raw = (self.jev_definition_modes or "").strip()
+        if not raw:
+            return {}
+        from app.jev.catalog import load_catalog  # local: config import stays cheap
+        from app.jev.gateway import MODES
+
+        known = set(load_catalog().definitions)
+        modes: dict[str, str] = {}
+        for pair in raw.split(","):
+            item = pair.strip()
+            if not item:
+                continue
+            key, separator, mode = item.partition("=")
+            key, mode = key.strip(), mode.strip().lower()
+            if not separator or not key or not mode:
+                raise ValueError(f"JEV_DEFINITION_MODES entries must be key=mode, got {item!r}")
+            if key not in known:
+                raise ValueError(f"JEV_DEFINITION_MODES names an unknown definition: {key!r}")
+            if mode not in MODES:
+                raise ValueError(
+                    f"JEV_DEFINITION_MODES mode {mode!r} for {key!r} is not one of {sorted(MODES)}"
+                )
+            modes[key] = mode
+        return modes
+
+    @property
+    def canvas_task_credential_user_set(self) -> frozenset[str]:
+        """Accounts allowed to paste a task credential. Falls back to the administrators."""
+        listed = frozenset(
+            item.strip() for item in self.canvas_task_credential_users.split(",") if item.strip()
+        )
+        return listed or self.admin_user_id_set

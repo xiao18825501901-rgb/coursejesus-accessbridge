@@ -1,0 +1,3332 @@
+import hashlib
+import json
+import logging
+import sqlite3
+from collections.abc import Callable
+from typing import Any, Final, Literal, TypeVar, cast
+from uuid import uuid4
+
+from pydantic import BaseModel
+
+from app.cm_update.templates import explanation_prompt
+from app.config import Settings
+from app.db import Database
+from app.errors import ApiError
+from app.jev import callsites
+from app.jev.service import SemanticDecisionService
+from app.learning.assessment_point_configuration import AssessmentPointPolicyService
+from app.learning.assessments import AssessmentService
+from app.learning.compiler import (
+    TEMPLATE_VERSION,
+    assessment_template,
+    compile_unit,
+    problem_template,
+    template,
+    validate_plan,
+    validate_unit,
+)
+from app.learning.course_policy import course_policy
+from app.learning.knowledge import KnowledgeService
+from app.learning.learning_loop import LearningLoopService
+from app.learning.model_operation_authority import preparation_model_claim
+from app.learning.models import (
+    AssessmentAbandonInput,
+    AssessmentAnswer,
+    AssessmentAssistInput,
+    AssessmentDraftInput,
+    AssessmentExplanationInput,
+    AssessmentExplanationOutput,
+    AssessmentGradeProposal,
+    AssessmentPreparationStartInput,
+    AssessmentReferenceSolutionOutput,
+    AssessmentStartInput,
+    AssessmentSubmitInput,
+    BridgeInput,
+    GradePolicyDraftInput,
+    NodeDraft,
+    OperationInput,
+    PersonalPlanInput,
+    PreferenceInput,
+    ProblemSolutionOutput,
+    ReturnInput,
+    SolveInput,
+    TeachingItem,
+    TeachingPlan,
+    TeachingSpecDraft,
+    TeachingUnitOutput,
+    TeachInput,
+)
+from app.learning.plans import TeachingPlanRepository
+from app.learning.problems import ProblemIndexScope, ProblemRepository
+from app.learning.provider import LearningProvider, ProviderCallFailure, ProviderImage
+from app.learning.question_runtime import (
+    QuestionEngineRuntime,
+    QuestionEngineRuntimeError,
+)
+from app.learning.workspaces import document_version_for, original_path, workspace_for
+from app.rag.retrieval import HybridRetriever
+from app.repositories.chunks import RetrievalAccess
+
+LOGGER = logging.getLogger(__name__)
+
+# How many times a blocked configured preparation may be resumed automatically.
+# Retrying is what the mechanism needs -- one attempt advances about one slot --
+# but it must be bounded, or a preparation that can never succeed (a node whose
+# objective cannot form a blueprint, say) would be retried forever at real cost.
+#
+# History, because the same mistake is easy to repeat.  Raised to 16 on the claim that
+# the dominant failure had been repaired; for the preparations actually stuck that claim
+# was false, and forty-eight attempts were spent in four seconds against a failure that
+# could not vary.  Reverted.  The cause turned out to be str(None) fabricating an
+# operation id, which is now fixed, so the bound is raised again -- and this time the
+# justification is the one that was missing before: the failure can vary, so further
+# attempts can succeed.  Before raising this again, check that the failure being
+# repaired is the one the stuck rows are hitting.
+MAX_AUTO_PREPARATION_ATTEMPTS: Final = 24
+
+
+def encode(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def identifier() -> str:
+    return uuid4().hex
+
+
+Output = TypeVar("Output", bound=BaseModel)
+
+
+class LearningOrchestrator:
+    def __init__(
+        self,
+        database: Database,
+        settings: Settings,
+        retriever: HybridRetriever,
+        jev: SemanticDecisionService | None = None,
+        hybrid_reviewer: Any | None = None,
+        assessment_point_policy: AssessmentPointPolicyService | None = None,
+        generic_provider: LearningProvider | None = None,
+    ) -> None:
+        self.db = database
+        self.settings = settings
+        self.retriever = retriever
+        # Map50 is the sole DeepSeek exception. Interactive teaching, solving,
+        # Question Engine and assessment roles use the independently qualified
+        # generic provider when enabled; retaining both objects makes rollback a
+        # configuration change rather than a credential rewrite.
+        self.tree_provider = LearningProvider(settings)
+        self._generic_provider_supplied = generic_provider is not None
+        self.provider = generic_provider or self.tree_provider
+        # Non-authoritative semantic-decision layer; None (default) disables Jev
+        # entirely so the deterministic path is byte-identical to before.
+        self.jev = jev
+        # ``hybrid-strict-v1`` strong-review chain; None (default) leaves the
+        # Question Engine byte-identical to the local-review-only behaviour.
+        self.hybrid_reviewer = hybrid_reviewer
+        self.knowledge = KnowledgeService(database, jev)
+        self.plans = TeachingPlanRepository(database)
+        self.problems = ProblemRepository(database)
+        self.assessments = AssessmentService(
+            database,
+            jev,
+            point_policy=assessment_point_policy,
+        )
+        self.learning_loop = LearningLoopService(
+            database,
+            internal_user_ids=settings.admin_user_id_set,
+            test_environment=settings.app_env == "test",
+        )
+        self.question_engine = QuestionEngineRuntime(
+            database=database,
+            provider=self.provider,
+            semantic_decisions=jev,
+            metered_generate=self.generate,
+            learning_loop=self.learning_loop,
+            hybrid_reviewer=hybrid_reviewer,
+            point_store=self.assessments.point_store,
+            source_bound_student_entry=settings.assessment_point_policy_enabled,
+        )
+        if self.assessments.point_store is not None:
+            self.assessments.point_ready_verifier = self.question_engine.point_ready_for
+
+    def provider_for(
+        self, quota_scope: Literal["INTERACTIVE", "BACKGROUND_AUTO_MAP"]
+    ) -> LearningProvider:
+        if quota_scope == "BACKGROUND_AUTO_MAP" and getattr(
+            self, "_generic_provider_supplied", True
+        ):
+            return self.tree_provider
+        return self.provider
+
+    def problem_index(
+        self,
+        workspace_id: str,
+        owner: str,
+        *,
+        scope: ProblemIndexScope,
+        query: str | None,
+        document_version_id: str | None,
+        filename: str | None,
+        question_number: str | None,
+        question_part: str | None,
+        locator_type: str | None,
+        locator_value: str | None,
+        limit: int,
+    ) -> dict[str, Any]:
+        return self.problems.list_index(
+            workspace_id,
+            owner,
+            scope=scope,
+            query=query,
+            document_version_id=document_version_id,
+            filename=filename,
+            question_number=question_number,
+            question_part=question_part,
+            locator_type=locator_type,
+            locator_value=locator_value,
+            limit=limit,
+        )
+
+    def node(self, workspace: sqlite3.Row, node_id: str) -> dict[str, Any]:
+        with self.db.connect() as db:
+            row = db.execute(
+                "SELECT * FROM knowledge_nodes WHERE id=? AND course_id=? "
+                "AND ((owner_user_id=? AND status='PRIVATE') OR status='PUBLISHED' OR "
+                "(owner_user_id IS NULL AND status='CANDIDATE' AND EXISTS("
+                "SELECT 1 FROM auto_course_tree_activations AS activation "
+                "JOIN knowledge_tree_memberships AS membership "
+                "ON membership.tree_version_id=activation.tree_version_id "
+                "WHERE activation.course_id=knowledge_nodes.course_id "
+                "AND activation.status='ACTIVE' AND membership.node_id=knowledge_nodes.id)))",
+                (node_id, workspace["course_id"], workspace["owner_user_id"]),
+            ).fetchone()
+            spec = (
+                db.execute(
+                    "SELECT teaching_specs.* FROM teaching_specs "
+                    "JOIN teaching_spec_metadata AS metadata "
+                    "ON metadata.node_id=teaching_specs.node_id "
+                    "AND metadata.version=teaching_specs.version "
+                    "WHERE teaching_specs.node_id=? "
+                    "AND (metadata.status IN ('PRIVATE_ACTIVE','PUBLISHED') OR "
+                    "(metadata.status='DRAFT' AND EXISTS("
+                    "SELECT 1 FROM auto_course_tree_activations AS activation "
+                    "JOIN knowledge_tree_memberships AS membership "
+                    "ON membership.tree_version_id=activation.tree_version_id "
+                    "WHERE activation.course_id=? AND activation.status='ACTIVE' "
+                    "AND membership.node_id=teaching_specs.node_id "
+                    "AND membership.teaching_spec_version=teaching_specs.version))) "
+                    "ORDER BY teaching_specs.version DESC LIMIT 1",
+                    (node_id, workspace["course_id"]),
+                ).fetchone()
+                if row is not None and row["kind"] == "ATOMIC"
+                else None
+            )
+        if row is None:
+            raise ApiError(404, "NODE_NOT_FOUND", "The knowledge node was not found.")
+        if row["kind"] == "ATOMIC" and spec is None:
+            raise ApiError(
+                409,
+                "SPEC_NOT_AVAILABLE",
+                "The atomic knowledge node has no active Teaching Spec.",
+            )
+        return {
+            "id": row["id"],
+            "course_id": row["course_id"],
+            "title": row["title"],
+            "description": row["description"],
+            "major": row["major"],
+            "kind": row["kind"],
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "spec_version": spec["version"] if spec is not None else None,
+            "spec_hash": spec["content_hash"] if spec is not None else None,
+            "items": json.loads(spec["content_json"]) if spec is not None else [],
+        }
+
+    def create_node(self, workspace_id: str, owner: str, draft: NodeDraft) -> dict[str, Any]:
+        workspace = workspace_for(self.db, workspace_id, owner)
+        evidence_ids = {e for item in draft.items for e in item.evidence_ids}
+        self.check_evidence(workspace, evidence_ids)
+        node_id = identifier()
+        content = encode([item.model_dump() for item in draft.items])
+        with self.db.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if (
+                db.execute(
+                    "SELECT COUNT(*) FROM knowledge_nodes WHERE course_id=? AND owner_user_id=?",
+                    (workspace["course_id"], owner),
+                ).fetchone()[0]
+                >= 200
+            ):
+                raise ApiError(429, "NODE_QUOTA", "Private node quota reached.")
+            db.execute(
+                "INSERT INTO "
+                "knowledge_nodes(id,course_id,owner_user_id,title,description,major,kind,status)"
+                " VALUES(?,?,?,?,?,?,?,'PRIVATE')",
+                (
+                    node_id,
+                    workspace["course_id"],
+                    owner,
+                    draft.title,
+                    draft.description,
+                    draft.major,
+                    draft.kind,
+                ),
+            )
+            if draft.kind == "ATOMIC":
+                db.execute(
+                    "INSERT INTO teaching_specs VALUES(?,1,?,?)",
+                    (node_id, content, hashlib.sha256(content.encode()).hexdigest()),
+                )
+            db.execute(
+                "UPDATE learning_workspaces SET revision=revision+1 WHERE id=?", (workspace_id,)
+            )
+        return self.node(workspace, node_id)
+
+    def knowledge_state(self, workspace_id: str, owner: str) -> dict[str, Any]:
+        return self.knowledge.snapshot(workspace_id, owner)
+
+    def start_assessment(
+        self,
+        workspace_id: str,
+        owner: str,
+        request: AssessmentStartInput,
+    ) -> dict[str, Any]:
+        workspace = workspace_for(self.db, workspace_id, owner)
+        configuration_id: str | None = None
+        needs_config_preparation = False
+        with self.db.connect() as db:
+            node = self.assessments._atomic_node(db, workspace, request.node_id)
+            if request.slots or request.configuration_id:
+                configuration, _ = self.assessments.freeze_configuration(
+                    db,
+                    workspace,
+                    node,
+                    request.slots,
+                    requested_id=request.configuration_id,
+                    intent_id=request.client_intent_id,
+                    content_language=request.content_language,
+                )
+                configuration_id = str(configuration["id"])
+                try:
+                    self.assessments.select_configuration(
+                        db, workspace, node, configuration_id
+                    )
+                except ApiError as error:
+                    if error.code not in {
+                        "ASSESSMENT_CONFIGURATION_POOL_INSUFFICIENT",
+                        "ASSESSMENT_CONFIGURATION_POOL_INCOMPLETE",
+                    }:
+                        raise
+                    needs_config_preparation = True
+            if configuration_id is not None and not needs_config_preparation:
+                families = {
+                    str(row["family_id"])
+                    for row in self.assessments.select_configuration(
+                        db, workspace, node, configuration_id
+                    )[0]
+                }
+            else:
+                families = self.assessments.distinct_families(db, workspace, node)
+        if needs_config_preparation and configuration_id is not None:
+            return self.prepare_configured_pool(
+                workspace_id,
+                owner,
+                request,
+                configuration_id=configuration_id,
+            )
+        # A selected configuration has already proved that every frozen slot
+        # has one compatible READY question. The legacy unconfigured path still
+        # requires five distinct families; dynamic K configurations may safely
+        # contain fewer than five slots.
+        if configuration_id is None and len(families) < 5:
+            return self.prepare_pool(workspace_id, owner, request)
+
+        def save(
+            db: sqlite3.Connection,
+            workspace: sqlite3.Row,
+            _: Any,
+        ) -> dict[str, Any]:
+            result = self.assessments.start(
+                db, workspace, request.node_id, configuration_id=configuration_id
+            )
+            self.cursor(
+                db,
+                workspace_id,
+                node_id=request.node_id,
+                assessment_session_id=result["id"],
+                pane="ASSESSMENT",
+            )
+            return result
+
+        return self.operate(
+            workspace_id,
+            owner,
+            request,
+            "assessment.start",
+            lambda workspace: None,
+            save,
+            resource_identity={"node_id": request.node_id, "configuration_id": configuration_id},
+        )
+
+    def assessment_setup(
+        self,
+        workspace_id: str,
+        owner: str,
+        node_id: str,
+        *,
+        content_language: str | None = None,
+    ) -> dict[str, Any]:
+        workspace = workspace_for(self.db, workspace_id, owner)
+        with self.db.connect() as db:
+            setup = self.assessments.setup(
+                db, workspace, node_id, content_language=content_language
+            )
+            active = db.execute(
+                "SELECT prep.* FROM assessment_configuration_preparations AS prep "
+                "JOIN assessment_configurations AS config ON config.id=prep.configuration_id "
+                "WHERE prep.workspace_id=? AND config.node_id=? "
+                "AND prep.status IN ('PREPARING','READY','BLOCKED') "
+                "ORDER BY prep.updated_at DESC,prep.id DESC LIMIT 1",
+                (workspace_id, node_id),
+            ).fetchone()
+            setup["active_preparation"] = (
+                self._configured_preparation_view(db, active) if active is not None else None
+            )
+            return setup
+
+    def prepare_configured_pool(
+        self,
+        workspace_id: str,
+        owner: str,
+        request: AssessmentStartInput,
+        *,
+        configuration_id: str,
+    ) -> dict[str, Any]:
+        """Queue only missing slots for one immutable configuration.
+
+        Freezing a configuration stays synchronous.  Provider work is claimed by
+        the durable worker, so closing the page cannot strand an HTTP request or
+        cause a second click to author the same five questions again.
+        """
+
+        workspace = workspace_for(self.db, workspace_id, owner)
+        with self.db.connect() as db:
+            self.assessments._atomic_node(db, workspace, request.node_id)
+            slots = self.assessments.configuration_slots(db, configuration_id)
+            row = db.execute(
+                "SELECT * FROM assessment_configuration_preparations WHERE configuration_id=?",
+                (configuration_id,),
+            ).fetchone()
+            if row is not None:
+                self._reconcile_configured_slot_progress(
+                    db,
+                    preparation_id=str(row["id"]),
+                    configuration_id=configuration_id,
+                )
+                complete = self._configured_prepared_count(db, configuration_id) == len(slots)
+                if complete and str(row["status"]) != "READY":
+                    self._recover_completed_configuration(db, row, len(slots))
+                    row = db.execute(
+                        "SELECT * FROM assessment_configuration_preparations WHERE id=?",
+                        (row["id"],),
+                    ).fetchone()
+                if str(row["status"]) in {"PREPARING", "READY"}:
+                    return self._configured_preparation_view(db, row)
+
+        preparation_id = "assessment-config-prep-" + configuration_id[-32:]
+
+        def save(
+            db: sqlite3.Connection,
+            current_workspace: sqlite3.Row,
+            _: Any,
+        ) -> dict[str, Any]:
+            existing = db.execute(
+                "SELECT * FROM assessment_configuration_preparations WHERE configuration_id=?",
+                (configuration_id,),
+            ).fetchone()
+            if existing is not None and existing["operation_id"]:
+                unsafe = db.execute(
+                    "SELECT status FROM learning_model_call_reservations "
+                    "WHERE workspace_id=? AND operation_id=? "
+                    "AND status IN ('RESERVED','UNKNOWN') LIMIT 1",
+                    (workspace_id, existing["operation_id"]),
+                ).fetchone()
+                if unsafe is not None:
+                    db.execute(
+                        "UPDATE assessment_configuration_preparations SET status='BLOCKED',"
+                        "error_code='MODEL_REQUEST_UNCERTAIN',"
+                        "error_message='上一次模型请求状态未知；为避免重复计费，系统不会自动重发。',"
+                        "diagnostic_id=COALESCE(diagnostic_id,?),"
+                        "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?",
+                        ("assessment-diagnostic-" + uuid4().hex, existing["id"]),
+                    )
+                    blocked = db.execute(
+                        "SELECT * FROM assessment_configuration_preparations WHERE id=?",
+                        (existing["id"],),
+                    ).fetchone()
+                    return self._configured_preparation_view(db, blocked)
+
+            if existing is None:
+                attempt = 1
+                model_operation_id = f"assessment-prep-{configuration_id[-20:]}-{attempt}"
+            else:
+                # `attempt` is the bounded automatic retry counter.  A person
+                # explicitly continuing a settled BLOCKED preparation starts a
+                # fresh bounded window; carrying the exhausted counter forward
+                # would queue work that the worker can never claim.  Keep a new
+                # operation identity so completed reservations from the previous
+                # window remain immutable and cannot be resent accidentally.
+                attempt = 0
+                resume_epoch = hashlib.sha256(request.operation_id.encode()).hexdigest()[:12]
+                model_operation_id = (
+                    f"assessment-prep-{configuration_id[-20:]}-resume-{resume_epoch}"
+                )
+            # Model-reservation triggers require a known operation.  The HTTP
+            # operation only queues work and completes immediately; this stable
+            # background identity owns every later reservation without keeping
+            # the workspace's one-interactive-operation lock occupied.
+            operation_hash = hashlib.sha256(
+                encode(
+                    {
+                        "kind": "assessment.configured_preparation.worker",
+                        "configuration_id": configuration_id,
+                        "operation_id": model_operation_id,
+                        "attempt": attempt,
+                    }
+                ).encode()
+            ).hexdigest()
+            db.execute(
+                "INSERT OR IGNORE INTO learning_operations("
+                "workspace_id,id,request_hash,kind,status,result_json) "
+                "VALUES(?,?,?,'assessment.configured_preparation.worker','COMPLETED','{}')",
+                (workspace_id, model_operation_id, operation_hash),
+            )
+            if existing is None:
+                db.execute(
+                    "INSERT INTO assessment_configuration_preparations("
+                    "id,configuration_id,workspace_id,status,operation_id,attempt,total_slots,"
+                    "prepared_slots,current_stage) VALUES(?,?,?,'PREPARING',?,?,?,0,'QUEUED')",
+                    (
+                        preparation_id,
+                        configuration_id,
+                        current_workspace["id"],
+                        model_operation_id,
+                        attempt,
+                        len(slots),
+                    ),
+                )
+            else:
+                db.execute(
+                    "UPDATE assessment_configuration_preparations SET status='PREPARING',"
+                    "operation_id=?,attempt=?,total_slots=?,prepared_slots=?,current_ordinal=NULL,"
+                    "current_stage='QUEUED',diagnostic_id=NULL,error_code=NULL,error_message=NULL,"
+                    "cancel_requested=0,lease_owner=NULL,lease_expires_at=NULL,completed_at=NULL,"
+                    "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?",
+                    (
+                        model_operation_id,
+                        attempt,
+                        len(slots),
+                        self._configured_prepared_count(db, configuration_id),
+                        existing["id"],
+                    ),
+                )
+            current_preparation_id = preparation_id if existing is None else str(existing["id"])
+            self._reconcile_configured_slot_progress(
+                db,
+                preparation_id=current_preparation_id,
+                configuration_id=configuration_id,
+            )
+            queued = db.execute(
+                "SELECT * FROM assessment_configuration_preparations WHERE configuration_id=?",
+                (configuration_id,),
+            ).fetchone()
+            return self._configured_preparation_view(db, queued)
+
+        return self.operate(
+            workspace_id,
+            owner,
+            request,
+            "assessment.prepare_configured_pool",
+            lambda current_workspace: None,
+            save,
+            resource_identity={"node_id": request.node_id, "configuration_id": configuration_id},
+        )
+
+    @staticmethod
+    def _configured_prepared_count(db: sqlite3.Connection, configuration_id: str) -> int:
+        return int(
+            db.execute(
+                "SELECT COUNT(*) FROM assessment_configuration_questions WHERE configuration_id=?",
+                (configuration_id,),
+            ).fetchone()[0]
+        )
+
+    @staticmethod
+    def _reconcile_configured_slot_progress(
+        db: sqlite3.Connection,
+        *,
+        preparation_id: str,
+        configuration_id: str,
+    ) -> None:
+        """Project frozen slots and authoritative bindings into progress rows.
+
+        Progress is a read model only. It can become READY solely when the
+        immutable configuration already contains the matching question binding.
+        """
+
+        db.execute(
+            "INSERT OR IGNORE INTO assessment_configuration_slot_preparations("
+            "preparation_id,configuration_id,slot_id,ordinal,status,current_stage) "
+            "SELECT ?,slot.configuration_id,slot.slot_id,slot.ordinal,"
+            "CASE WHEN bound.slot_id IS NULL THEN 'PENDING' ELSE 'READY' END,"
+            "CASE WHEN bound.slot_id IS NULL THEN 'QUEUED' ELSE 'READY_REUSED' END "
+            "FROM assessment_configuration_slots AS slot "
+            "LEFT JOIN assessment_configuration_questions AS bound "
+            "ON bound.configuration_id=slot.configuration_id AND bound.slot_id=slot.slot_id "
+            "WHERE slot.configuration_id=?",
+            (preparation_id, configuration_id),
+        )
+        db.execute(
+            "UPDATE assessment_configuration_slot_preparations SET status='READY',"
+            "current_stage='READY_REUSED',error_code=NULL,error_message=NULL,diagnostic_id=NULL,"
+            "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+            "WHERE preparation_id=? AND EXISTS ("
+            "SELECT 1 FROM assessment_configuration_questions AS bound "
+            "WHERE bound.configuration_id="
+            "assessment_configuration_slot_preparations.configuration_id "
+            "AND bound.slot_id=assessment_configuration_slot_preparations.slot_id)",
+            (preparation_id,),
+        )
+
+    def _configured_preparation_view(
+        self, db: sqlite3.Connection, row: sqlite3.Row
+    ) -> dict[str, Any]:
+        configuration_id = str(row["configuration_id"])
+        configuration = db.execute(
+            "SELECT config.policy_version,config.language,"
+            "json_extract(plan.plan_json,'$.intent_id') AS client_intent_id "
+            "FROM assessment_configurations AS config "
+            "LEFT JOIN assessment_point_configuration_plans AS plan "
+            "ON plan.configuration_id=config.id WHERE config.id=?",
+            (configuration_id,),
+        ).fetchone()
+        prepared = self._configured_prepared_count(db, configuration_id)
+        total = int(row["total_slots"] or 0) or int(
+            db.execute(
+                "SELECT COUNT(*) FROM assessment_configuration_slots WHERE configuration_id=?",
+                (configuration_id,),
+            ).fetchone()[0]
+        )
+        selections = [
+            {
+                "slot_id": str(slot["slot_id"]),
+                "question_type": str(slot["question_type"]),
+                "task_form": str(slot["task_form"]),
+            }
+            for slot in db.execute(
+                "SELECT slot_id,question_type,task_form FROM assessment_configuration_slots "
+                "WHERE configuration_id=? ORDER BY ordinal",
+                (configuration_id,),
+            ).fetchall()
+        ]
+        slot_progress = [
+            {
+                "slot_id": str(item["slot_id"]),
+                "ordinal": int(item["ordinal"]),
+                "status": str(item["status"]),
+                "current_stage": item["current_stage"],
+                "error_code": item["error_code"],
+                "error_message": item["error_message"],
+                "diagnostic_id": item["diagnostic_id"],
+                "updated_at": item["updated_at"],
+            }
+            for item in db.execute(
+                "SELECT slot_id,ordinal,status,current_stage,error_code,error_message,"
+                "diagnostic_id,updated_at FROM assessment_configuration_slot_preparations "
+                "WHERE preparation_id=? ORDER BY ordinal",
+                (str(row["id"]),),
+            ).fetchall()
+        ]
+        return {
+            "status": str(row["status"]),
+            "preparation_job_id": str(row["id"]),
+            "configuration_id": configuration_id,
+            "policy_version": configuration["policy_version"] if configuration else None,
+            "content_language": configuration["language"] if configuration else None,
+            "client_intent_id": configuration["client_intent_id"] if configuration else None,
+            "question_count": total,
+            "slots": selections,
+            "slot_progress": slot_progress,
+            "prepared_questions": prepared,
+            "eligible_families": prepared,
+            "current_ordinal": row["current_ordinal"],
+            "current_stage": row["current_stage"],
+            "diagnostic_id": row["diagnostic_id"],
+            "error_code": row["error_code"],
+            "error_message": row["error_message"],
+            "can_start_from_ready_pool": str(row["status"]) == "READY" and prepared == total,
+            "updated_at": row["updated_at"],
+        }
+
+    def _recover_completed_configuration(
+        self, db: sqlite3.Connection, row: sqlite3.Row, prepared: int
+    ) -> None:
+        db.execute(
+            "INSERT OR IGNORE INTO assessment_configuration_recovery_receipts("
+            "id,preparation_id,configuration_id,prior_status,reason,prepared_slots) "
+            "VALUES(?,?,?,?, 'COMPATIBLE_POOL_COMPLETE', ?)",
+            (
+                "assessment-recovery-" + uuid4().hex,
+                row["id"],
+                row["configuration_id"],
+                row["status"],
+                prepared,
+            ),
+        )
+        db.execute(
+            "UPDATE assessment_configuration_preparations SET status='READY',prepared_slots=?,"
+            "current_stage='READY',error_code=NULL,error_message=NULL,diagnostic_id=NULL,"
+            "lease_owner=NULL,lease_expires_at=NULL,"
+            "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),"
+            "completed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?",
+            (prepared, row["id"]),
+        )
+
+    def configured_preparation_status(
+        self, workspace_id: str, owner: str, configuration_id: str
+    ) -> dict[str, Any]:
+        workspace_for(self.db, workspace_id, owner)
+        with self.db.connect() as db:
+            row = db.execute(
+                "SELECT * FROM assessment_configuration_preparations "
+                "WHERE configuration_id=? AND workspace_id=?",
+                (configuration_id, workspace_id),
+            ).fetchone()
+            if row is None:
+                raise ApiError(404, "ASSESSMENT_PREPARATION_NOT_FOUND", "测评准备任务不存在。")
+            self._reconcile_configured_slot_progress(
+                db,
+                preparation_id=str(row["id"]),
+                configuration_id=configuration_id,
+            )
+            total = int(row["total_slots"] or 0)
+            prepared = self._configured_prepared_count(db, configuration_id)
+            if total and prepared == total and str(row["status"]) != "READY":
+                self._recover_completed_configuration(db, row, prepared)
+                row = db.execute(
+                    "SELECT * FROM assessment_configuration_preparations WHERE id=?",
+                    (row["id"],),
+                ).fetchone()
+            return self._configured_preparation_view(db, row)
+
+    def run_configured_preparation_once(self, worker_id: str) -> dict[str, Any] | None:
+        """Claim and advance one durable configured-assessment preparation."""
+
+        with self.db.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            # A preparation blocked on a *settled* request is resumed here.  The
+            # unknown-request block is deliberately excluded: it exists so the
+            # system never resends a call whose fate is unknown, and resuming it
+            # could pay twice.  A QUESTION_NOT_READY block carries no such
+            # uncertainty -- its reservations are all COMPLETED and the item simply
+            # did not reach the bar -- so retrying authors a new item for the
+            # remaining slot rather than resending an old one.  Without this a
+            # blocked preparation is never picked up again, and finishing a
+            # configuration needs a person to resume it once per slot.
+            row = db.execute(
+                "SELECT * FROM assessment_configuration_preparations "
+                "WHERE status IN ('PREPARING','BLOCKED') AND cancel_requested=0 "
+                "AND COALESCE(error_code,'') <> 'MODEL_REQUEST_UNCERTAIN' "
+                "AND attempt < ? "
+                "AND (lease_expires_at IS NULL "
+                "OR lease_expires_at<strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
+                "ORDER BY created_at,id LIMIT 1",
+                (MAX_AUTO_PREPARATION_ATTEMPTS,),
+            ).fetchone()
+            if row is None:
+                return None
+            if row["operation_id"]:
+                uncertain = db.execute(
+                    "SELECT 1 FROM learning_model_call_reservations WHERE workspace_id=? "
+                    "AND operation_id=? AND status IN ('RESERVED','UNKNOWN') LIMIT 1",
+                    (row["workspace_id"], row["operation_id"]),
+                ).fetchone()
+                if uncertain is not None:
+                    diagnostic = "assessment-diagnostic-" + uuid4().hex
+                    db.execute(
+                        "UPDATE assessment_configuration_preparations SET status='BLOCKED',"
+                        "error_code='MODEL_REQUEST_UNCERTAIN',"
+                        "error_message='模型请求状态未知；为避免重复计费，系统不会自动重发。',"
+                        "diagnostic_id=?,current_stage='BLOCKED',updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                        "WHERE id=?",
+                        (diagnostic, row["id"]),
+                    )
+                    return {"id": str(row["id"]), "status": "BLOCKED"}
+            claimed = db.execute(
+                "UPDATE assessment_configuration_preparations SET lease_owner=?,"
+                "lease_expires_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','+30 minutes'),"
+                "status='PREPARING',attempt=attempt+1,"
+                "current_stage='CLAIMED',updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                "WHERE id=? AND status IN ('PREPARING','BLOCKED') AND cancel_requested=0 "
+                "AND (lease_expires_at IS NULL OR lease_expires_at<strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                (worker_id, row["id"]),
+            )
+            if claimed.rowcount != 1:
+                return None
+            row = db.execute(
+                "SELECT prep.*,config.node_id,workspace.owner_user_id,workspace.course_id,"
+                "workspace.private_course_id FROM assessment_configuration_preparations AS prep "
+                "JOIN assessment_configurations AS config ON config.id=prep.configuration_id "
+                "JOIN learning_workspaces AS workspace ON workspace.id=prep.workspace_id "
+                "WHERE prep.id=?",
+                (row["id"],),
+            ).fetchone()
+            self._reconcile_configured_slot_progress(
+                db,
+                preparation_id=str(row["id"]),
+                configuration_id=str(row["configuration_id"]),
+            )
+            slots = self.assessments.configuration_slots(db, str(row["configuration_id"]))
+            # A resumed preparation authors only what is missing.  Offering a slot that
+            # is already legitimately bound makes the engine author a *second* question
+            # for it, and the binding check then refuses the whole attempt as
+            # ASSESSMENT_SLOT_CONFLICT -- which is how three campus configurations
+            # stalled at 2/5 and 3/5 with a perfectly good question already saved for
+            # the slot they were re-authoring.  The existing binding is authoritative:
+            # it is reconciled by being reused, never by being authored again.  When
+            # nothing is missing the list is empty, the engine does no work, and the
+            # preparation completes on what is already there.
+            bound = {
+                str(binding["slot_id"])
+                for binding in db.execute(
+                    "SELECT slot_id FROM assessment_configuration_questions "
+                    "WHERE configuration_id=?",
+                    (str(row["configuration_id"]),),
+                )
+            }
+            slots = [slot for slot in slots if slot.slot_key not in bound]
+
+        def cancelled() -> bool:
+            with self.db.connect() as check:
+                state = check.execute(
+                    "SELECT status,cancel_requested,lease_owner FROM assessment_configuration_preparations "
+                    "WHERE id=?",
+                    (row["id"],),
+                ).fetchone()
+            return (
+                state is None
+                or str(state["status"]) != "PREPARING"
+                or int(state["cancel_requested"]) == 1
+                or str(state["lease_owner"]) != worker_id
+            )
+
+        def progress(update: dict[str, Any]) -> None:
+            with self.db.connect() as db:
+                stage = str(update["stage"])
+                db.execute(
+                    "UPDATE assessment_configuration_preparations SET prepared_slots=?,"
+                    "current_ordinal=?,current_stage=?,"
+                    "lease_expires_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','+30 minutes'),"
+                    "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                    "WHERE id=? AND lease_owner=? AND status='PREPARING'",
+                    (
+                        int(update["prepared_slots"]),
+                        int(update["ordinal"]),
+                        stage,
+                        row["id"],
+                        worker_id,
+                    ),
+                )
+                if stage == "SLOT_READY":
+                    db.execute(
+                        "UPDATE assessment_configuration_slot_preparations SET "
+                        "status='READY',current_stage='READY',error_code=NULL,"
+                        "error_message=NULL,diagnostic_id=NULL,"
+                        "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                        "WHERE preparation_id=? AND ordinal=? AND EXISTS ("
+                        "SELECT 1 FROM assessment_configuration_questions AS bound "
+                        "WHERE bound.configuration_id="
+                        "assessment_configuration_slot_preparations.configuration_id "
+                        "AND bound.slot_id=assessment_configuration_slot_preparations.slot_id)",
+                        (row["id"], int(update["ordinal"])),
+                    )
+                else:
+                    db.execute(
+                        "UPDATE assessment_configuration_slot_preparations SET "
+                        "status='PREPARING',current_stage=?,"
+                        "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                        "WHERE preparation_id=? AND ordinal=? AND status!='READY'",
+                        (stage, row["id"], int(update["ordinal"])),
+                    )
+
+        # A preparation written before this worker existed carries no operation, and
+        # str(None) is not a missing value -- it is the four-character string "None",
+        # which names no row.  The reservation the first provider call makes then fails
+        # its foreign key and the attempt dies before it starts, which is how six campus
+        # preparations spent every attempt they were given without ever reaching a
+        # model: instantly, silently, and unaffected by any number of retries.  The
+        # operation is resolved to a real identifier and registered here, so a stale row
+        # is repaired by the code that reads it rather than by rewriting the table.
+        operation_id = str(row["operation_id"] or "") or (
+            "assessment-prep-" + str(row["configuration_id"])[-32:]
+        )
+        with self.db.connect() as db:
+            db.execute(
+                "INSERT OR IGNORE INTO learning_operations("
+                "workspace_id,id,request_hash,kind,status) VALUES(?,?,?,?,?)",
+                (
+                    str(row["workspace_id"]),
+                    operation_id,
+                    "",
+                    "assessment.configured_preparation.worker",
+                    "RUNNING",
+                ),
+            )
+
+        error: QuestionEngineRuntimeError | None = None
+        try:
+            with preparation_model_claim(str(row["id"]), worker_id):
+                self.question_engine.generate_assessment_set(
+                    owner_user_id=str(row["owner_user_id"]),
+                    workspace_id=str(row["workspace_id"]),
+                    course_id=str(row["course_id"]),
+                    private_course_id=str(row["private_course_id"]),
+                    node_id=str(row["node_id"]),
+                    preparation_key=str(row["configuration_id"]),
+                    slots=tuple(slots),
+                    operation_id=operation_id,
+                    should_cancel=cancelled,
+                    progress=progress,
+                )
+        except QuestionEngineRuntimeError as caught:
+            error = caught
+        except Exception as caught:  # noqa: BLE001 - attributed, never swallowed
+            # A bare code here discards the cause, and an unattributable worker
+            # failure is not diagnosable: three consecutive attempts were lost to
+            # this path in one rehearsal and nothing recorded said why.  The
+            # exception's own class and a bounded message now travel with the
+            # error, and the traceback goes to the log.
+            LOGGER.exception("assessment preparation worker failed")
+            error = QuestionEngineRuntimeError(
+                "ASSESSMENT_WORKER_FAILED",
+                "The durable assessment worker failed before the configuration was "
+                f"complete: {type(caught).__name__}: {str(caught)[:300]}",
+            )
+
+        with self.db.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = db.execute(
+                "SELECT * FROM assessment_configuration_preparations WHERE id=?",
+                (row["id"],),
+            ).fetchone()
+            self._reconcile_configured_slot_progress(
+                db,
+                preparation_id=str(row["id"]),
+                configuration_id=str(row["configuration_id"]),
+            )
+            prepared = self._configured_prepared_count(db, str(row["configuration_id"]))
+            if current is None:
+                return None
+            if int(current["cancel_requested"]):
+                db.execute(
+                    "UPDATE assessment_configuration_preparations SET status='CANCELLED',"
+                    "current_stage='CANCELLED',prepared_slots=?,lease_owner=NULL,lease_expires_at=NULL,"
+                    "completed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),"
+                    "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?",
+                    (prepared, row["id"]),
+                )
+                return {"id": str(row["id"]), "status": "CANCELLED"}
+            # Completion is measured against the configuration's full slot count, not
+            # the length of the work list this attempt was given.  Those differ on a
+            # resume: a preparation with two slots already bound is offered only the
+            # three missing ones, so after filling them prepared is 5 while len(slots)
+            # is 3, the equality below never held, and the preparation sat BLOCKED with
+            # every slot bound and no way to finish.
+            total_slots = int(current["total_slots"] or 0) or len(slots)
+            if prepared >= total_slots:
+                if error is not None:
+                    self._recover_completed_configuration(db, current, prepared)
+                else:
+                    db.execute(
+                        "UPDATE assessment_configuration_preparations SET status='READY',"
+                        "prepared_slots=?,current_stage='READY',error_code=NULL,error_message=NULL,"
+                        "diagnostic_id=NULL,lease_owner=NULL,lease_expires_at=NULL,"
+                        "completed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),"
+                        "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?",
+                        (prepared, row["id"]),
+                    )
+                return {"id": str(row["id"]), "status": "READY", "prepared": prepared}
+
+            diagnostic = "assessment-diagnostic-" + uuid4().hex
+            code = error.code if error is not None else "ASSESSMENT_PREPARATION_INCOMPLETE"
+            messages = {
+                "NO_TEACHING_SPEC": "该知识点还没有可用教学规格。",
+                "NO_REQUIRED_ITEM": "该知识点没有可用于组卷的必学目标。",
+                "SOURCE_NOT_FOUND": "课程资料版本与教学目标的来源绑定不完整。",
+                "MODEL_REQUEST_UNCERTAIN": "模型请求状态未知；为避免重复计费，系统不会自动重发。",
+                "ASSESSMENT_PREPARATION_CANCELLED": "测评准备已取消，已完成题目仍然保留。",
+            }
+            message = messages.get(
+                code,
+                f"测评准备在第 {prepared + 1} 题受阻；已保留 {prepared}/{len(slots)} 题。",
+            )
+            db.execute(
+                "UPDATE assessment_configuration_preparations SET status='BLOCKED',"
+                "prepared_slots=?,current_stage='BLOCKED',diagnostic_id=?,error_code=?,"
+                "error_message=?,lease_owner=NULL,lease_expires_at=NULL,"
+                "completed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),"
+                "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?",
+                (prepared, diagnostic, code, message, row["id"]),
+            )
+            return {
+                "id": str(row["id"]),
+                "status": "BLOCKED",
+                "prepared": prepared,
+                "error_code": code,
+                "diagnostic_id": diagnostic,
+            }
+
+    def prepare_pool(
+        self,
+        workspace_id: str,
+        owner: str,
+        request: AssessmentStartInput,
+    ) -> dict[str, Any]:
+        """Traceable, idempotent, cancellable, resumable pool preparation.
+
+        Never seeds or relabels: candidates are generated by the configured
+        provider, validated, and stored in the EXISTING question pool with either
+        DETERMINISTIC (VALIDATED channel) or AI_REVIEWED (diagnostic channel)
+        verification. A missing budget/provider becomes an explicit BLOCKED job,
+        never a fake question.
+        """
+        workspace = workspace_for(self.db, workspace_id, owner)
+        with self.db.connect() as db:
+            node = self.assessments._atomic_node(db, workspace, request.node_id)
+            existing = self.assessments.preparation_job(
+                db, workspace, request.node_id, int(node["spec_version"])
+            )
+            if existing is not None and existing["status"] == "READY":
+                return self._preparation_view(workspace, request.node_id, existing)
+            if existing is not None and existing["status"] == "PREPARING":
+                # An in-flight preparation for this owner/node/spec is returned
+                # as-is (idempotent); it never spawns a second paid question set.
+                return self._preparation_view(workspace, request.node_id, existing)
+            job = self.assessments.ensure_preparation_job(db, workspace, node)
+            self.assessments.mark_preparation_job(db, job["id"], "PREPARING")
+
+        def prepare(workspace: sqlite3.Row) -> tuple[str, str | None, list[dict[str, Any]]]:
+            with self.db.connect() as db:
+                self.assessments.mark_preparation_job(db, job["id"], "PREPARING")
+
+            def cancelled() -> bool:
+                with self.db.connect() as db:
+                    row = db.execute(
+                        "SELECT status FROM assessment_preparation_jobs WHERE id=?",
+                        (job["id"],),
+                    ).fetchone()
+                return row is None or str(row["status"]) == "CANCELLED"
+
+            try:
+                questions = self.question_engine.generate_assessment_set(
+                    owner_user_id=str(workspace["owner_user_id"]),
+                    workspace_id=str(workspace["id"]),
+                    course_id=str(workspace["course_id"]),
+                    private_course_id=str(workspace["private_course_id"]),
+                    node_id=str(node["id"]),
+                    preparation_key=str(job["id"]),
+                    operation_id=request.operation_id,
+                    should_cancel=cancelled,
+                )
+            except QuestionEngineRuntimeError as error:
+                return ("BLOCKED", error.code, [])
+            return ("OK", None, questions)
+
+        def save(
+            db: sqlite3.Connection,
+            workspace: sqlite3.Row,
+            prepared: tuple[str, str | None, list[dict[str, Any]]],
+        ) -> dict[str, Any]:
+            status, code, questions = prepared
+            can_start_from_ready_pool = False
+            if status == "BLOCKED":
+                # A bounded provider failure can happen after its final useful
+                # revision has already committed.  Re-run the exact pool
+                # compatibility selector before projecting BLOCKED: five current,
+                # distinct, rubric-backed READY families are enough to proceed,
+                # even though the provider's final call failed.  The error stays
+                # in the response for audit; it is not relabelled as success.
+                try:
+                    self.assessments.select(db, workspace, node)
+                except ApiError:
+                    pass
+                else:
+                    can_start_from_ready_pool = True
+                # Preserve the provider failure and its charge evidence.  The
+                # browser may immediately issue a fresh, model-free start when
+                # the exact selector above proves the existing READY pool works;
+                # the failed preparation itself is never rewritten as READY.
+                self.assessments.mark_preparation_job(
+                    db,
+                    job["id"],
+                    "BLOCKED",
+                    error_code=code,
+                    error_message=(
+                        "Question Engine preparation stopped after a provider failure; "
+                        + (
+                            "the compatible READY pool can start an assessment without another model call."
+                            if can_start_from_ready_pool
+                            else "completed slots remain reusable but the compatible pool is still incomplete."
+                        )
+                    ),
+                )
+            else:
+                eligible = self.assessments.distinct_families(db, workspace, node)
+                generated_families = {str(item["family_id"]) for item in questions}
+                if len(questions) != 5 or not generated_families.issubset(eligible):
+                    self.assessments.mark_preparation_job(
+                        db,
+                        job["id"],
+                        "BLOCKED",
+                        channel="AI_REVIEWED",
+                        error_code="ASSESSMENT_POOL_NOT_READY",
+                        error_message=(
+                            "Five current Question Engine revisions were not available to freeze."
+                        ),
+                    )
+                else:
+                    self.assessments.mark_preparation_job(
+                        db, job["id"], "READY", channel="AI_REVIEWED"
+                    )
+            row = db.execute(
+                "SELECT * FROM assessment_preparation_jobs WHERE id=?", (job["id"],)
+            ).fetchone()
+            return {
+                "status": row["status"],
+                "preparation_job_id": row["id"],
+                "node_id": request.node_id,
+                "channel": row["channel"],
+                "eligible_families": len(
+                    self.assessments.distinct_families(db, workspace, node)
+                ),
+                "error_code": row["error_code"],
+                "error_message": row["error_message"],
+                "can_start_from_ready_pool": can_start_from_ready_pool,
+            }
+
+        try:
+            return self.operate(
+                workspace_id,
+                owner,
+                request,
+                "assessment.prepare_pool",
+                prepare,
+                save,
+                resource_identity={"node_id": request.node_id},
+            )
+        except ApiError as error:
+            if error.code not in {"MODEL_OUTPUT_REJECTED", "OPERATION_UNKNOWN"}:
+                raise
+            with self.db.connect() as db:
+                self.assessments.mark_preparation_job(
+                    db,
+                    job["id"],
+                    "BLOCKED",
+                    error_code=error.code,
+                    error_message="Pool preparation failed; no question was created.",
+                )
+                blocked = db.execute(
+                    "SELECT * FROM assessment_preparation_jobs WHERE id=?", (job["id"],)
+                ).fetchone()
+            view = self._preparation_view(workspace, request.node_id, blocked)
+            view["status"] = "BLOCKED"
+            view["error_code"] = error.code
+            return view
+
+    def _preparation_view(
+        self,
+        workspace: sqlite3.Row,
+        node_id: str,
+        job: sqlite3.Row | None,
+    ) -> dict[str, Any]:
+        with self.db.connect() as db:
+            node = self.assessments._atomic_node(db, workspace, node_id)
+            families = self.assessments.distinct_families(db, workspace, node)
+        status = str(job["status"]) if job is not None else "PREPARING"
+        return {
+            "status": status,
+            "preparation_job_id": job["id"] if job is not None else None,
+            "node_id": node_id,
+            "channel": job["channel"] if job is not None else "VALIDATED",
+            "eligible_families": len(families),
+            "error_code": job["error_code"] if job is not None else None,
+            "error_message": job["error_message"] if job is not None else None,
+        }
+
+    def cancel_pool_preparation(
+        self,
+        workspace_id: str,
+        owner: str,
+        request: OperationInput,
+        job_id: str,
+    ) -> dict[str, Any]:
+        def save(
+            db: sqlite3.Connection,
+            workspace: sqlite3.Row,
+            _: Any,
+        ) -> dict[str, Any]:
+            configured = db.execute(
+                "SELECT * FROM assessment_configuration_preparations "
+                "WHERE id=? AND workspace_id=?",
+                (job_id, workspace["id"]),
+            ).fetchone()
+            if configured is not None:
+                db.execute(
+                    "UPDATE assessment_configuration_preparations SET cancel_requested=1,"
+                    "status=CASE WHEN lease_owner IS NULL THEN 'CANCELLED' ELSE status END,"
+                    "current_stage=CASE WHEN lease_owner IS NULL THEN 'CANCELLED' ELSE current_stage END,"
+                    "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),"
+                    "completed_at=CASE WHEN lease_owner IS NULL THEN "
+                    "strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE completed_at END WHERE id=?",
+                    (job_id,),
+                )
+                updated = db.execute(
+                    "SELECT * FROM assessment_configuration_preparations WHERE id=?",
+                    (job_id,),
+                ).fetchone()
+                return self._configured_preparation_view(db, updated)
+            return self.assessments.cancel_preparation_job(db, workspace, job_id)
+
+        return self.operate(
+            workspace_id,
+            owner,
+            request,
+            "assessment.prepare_pool.cancel",
+            lambda workspace: None,
+            save,
+            resource_identity={"preparation_job_id": job_id},
+        )
+
+    def resume_pool_preparation(
+        self,
+        workspace_id: str,
+        owner: str,
+        request: AssessmentPreparationStartInput,
+    ) -> dict[str, Any]:
+        return self.prepare_pool(
+            workspace_id,
+            owner,
+            AssessmentStartInput(
+                operation_id=request.operation_id,
+                revision=request.revision,
+                node_id=request.node_id,
+            ),
+        )
+
+    def assessment(
+        self,
+        workspace_id: str,
+        owner: str,
+        session_id: str,
+    ) -> dict[str, Any]:
+        return self.assessments.view(workspace_id, owner, session_id)
+
+    def submit_assessment(
+        self,
+        workspace_id: str,
+        owner: str,
+        session_id: str,
+        request: AssessmentSubmitInput,
+    ) -> dict[str, Any]:
+        def prepare(workspace: sqlite3.Row) -> tuple[str, list[AssessmentAnswer], Any, dict[str, Any]]:
+            if request.answers:
+                answers = request.answers
+            else:
+                with self.db.connect() as db:
+                    answers = self.assessments.map_unified_answers(
+                        db,
+                        session_id,
+                        request.unified_answer,
+                        list(request.confirm_unanswered),
+                    )
+                if request.attachments:
+                    answers = self._transcribe_answers(
+                        workspace, request.operation_id, session_id, answers, request.attachments
+                    )
+            prepared = self.assessments.prepare_submission(workspace, session_id, answers)
+            reference_solutions = self._ensure_reference_solutions(
+                workspace, request.operation_id, prepared
+            )
+            grader_context = self.assessments.grader_context(prepared)
+            if grader_context is None:
+                return ("READY", answers, None, reference_solutions)
+            try:
+                instructions, template_version = assessment_template()
+                proposal, _run = self.generate(
+                    workspace_id,
+                    request.operation_id,
+                    AssessmentGradeProposal,
+                    instructions=instructions,
+                    context=grader_context,
+                    role="grader",
+                    template_version=template_version,
+                    schema_version="v3.2",
+                )
+            except (ApiError, ValueError):
+                return ("GRADER_FAILED", answers, None, reference_solutions)
+            return ("READY", answers, proposal, reference_solutions)
+
+        def save(
+            db: sqlite3.Connection,
+            workspace: sqlite3.Row,
+            prepared_data: tuple[str, list[AssessmentAnswer], Any, dict[str, Any]],
+        ) -> dict[str, Any]:
+            status, answers, proposal, reference_solutions = prepared_data
+            self.assessments.store_reference_solutions(db, reference_solutions)
+            if status == "GRADER_FAILED":
+                result = self.assessments.save_submission_review_needed(
+                    db, workspace, session_id, answers
+                )
+            else:
+                result = self.assessments.save_submission(
+                    db,
+                    workspace,
+                    session_id,
+                    answers,
+                    proposal,
+                )
+            self.cursor(
+                db,
+                workspace_id,
+                node_id=result["node_id"],
+                assessment_session_id=session_id,
+                pane="ASSESSMENT",
+            )
+            return result
+
+        return self.operate(
+            workspace_id,
+            owner,
+            request,
+            "assessment.submit",
+            prepare,
+            save,
+            resource_identity={"assessment_session_id": session_id},
+        )
+
+    def _ensure_reference_solutions(
+        self,
+        workspace: sqlite3.Row,
+        operation_id: str,
+        prepared: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Compile (and return for storage) a frozen reference solution per
+        blueprint item BEFORE the student answers are graded. The reference solver
+        receives only the question, rubric and authorized sources — never the
+        student answer — and a stored solution is never recomputed."""
+        solutions: dict[str, Any] = {}
+        for question in prepared["questions"]:
+            question_revision_id = str(question["question_revision_id"])
+            with self.db.connect() as db:
+                if self.assessments.has_reference_solution(db, question_revision_id):
+                    continue
+            if self.assessments._is_deterministic(question):
+                solutions[question_revision_id] = (
+                    self.assessments.synthesize_deterministic_reference(question)
+                )
+                continue
+            try:
+                instructions, template_version = problem_template()
+                solution, _run = self.generate(
+                    workspace["id"],
+                    operation_id,
+                    AssessmentReferenceSolutionOutput,
+                    instructions=instructions,
+                    context={
+                        "question": question["prompt_text"],
+                        "question_type": question["question_type"],
+                        "answer": question["answer_key"],
+                        "rubric": [
+                            {
+                                "criterion_id": criterion["criterion_id"],
+                                "dimension": criterion["dimension"],
+                                "max_fraction": criterion["max_fraction"],
+                                "description": criterion["description"],
+                            }
+                            for criterion in question["rubric"]
+                        ],
+                    },
+                    role="reference",
+                    template_version=template_version,
+                    schema_version="v3.2",
+                )
+            except Exception:
+                # A reference-solution failure must not block grading: grading uses
+                # the frozen answer key, and the step-by-step display is best-effort.
+                continue
+            solutions[question_revision_id] = solution
+        return solutions
+
+    def _transcribe_answers(
+        self,
+        workspace: sqlite3.Row,
+        operation_id: str,
+        session_id: str,
+        answers: list[AssessmentAnswer],
+        attachments: list[Any],
+    ) -> list[AssessmentAnswer]:
+        """Image transcription through the configured provider. NOT_RUN without
+        live vision credentials: a missing provider raises for confirmation rather
+        than guessing an answer mapping."""
+        if not attachments:
+            return answers
+        raise ApiError(
+            422,
+            "ASSESSMENT_TRANSCRIPTION_REQUIRED",
+            "Image transcription needs the configured vision provider; provide text "
+            "markers or confirm the mapping instead.",
+        )
+
+    def assist_assessment(
+        self,
+        workspace_id: str,
+        owner: str,
+        session_id: str,
+        request: AssessmentAssistInput,
+    ) -> dict[str, Any]:
+        def save(
+            db: sqlite3.Connection,
+            workspace: sqlite3.Row,
+            _: Any,
+        ) -> dict[str, Any]:
+            return self.assessments.assist(
+                db,
+                workspace,
+                session_id,
+                request.blueprint_item_id,
+                request.action,
+            )
+
+        return self.operate(
+            workspace_id,
+            owner,
+            request,
+            "assessment.assist",
+            lambda workspace: None,
+            save,
+            resource_identity={"assessment_session_id": session_id},
+        )
+
+    def abandon_assessment(
+        self,
+        workspace_id: str,
+        owner: str,
+        session_id: str,
+        request: AssessmentAbandonInput,
+    ) -> dict[str, Any]:
+        def save(
+            db: sqlite3.Connection,
+            workspace: sqlite3.Row,
+            _: Any,
+        ) -> dict[str, Any]:
+            return self.assessments.abandon(db, workspace, session_id)
+
+        return self.operate(
+            workspace_id,
+            owner,
+            request,
+            "assessment.abandon",
+            lambda workspace: None,
+            save,
+            resource_identity={"assessment_session_id": session_id},
+        )
+
+    def save_assessment_draft(
+        self,
+        workspace_id: str,
+        owner: str,
+        session_id: str,
+        request: AssessmentDraftInput,
+    ) -> dict[str, Any]:
+        def save(
+            db: sqlite3.Connection,
+            workspace: sqlite3.Row,
+            _: Any,
+        ) -> dict[str, Any]:
+            return self.assessments.save_draft(
+                db,
+                workspace,
+                session_id,
+                request.unified_answer,
+                [attachment.model_dump() for attachment in request.attachments],
+            )
+
+        return self.operate(
+            workspace_id,
+            owner,
+            request,
+            "assessment.draft.save",
+            lambda workspace: None,
+            save,
+            resource_identity={"assessment_session_id": session_id},
+        )
+
+    def load_assessment_draft(
+        self,
+        workspace_id: str,
+        owner: str,
+        session_id: str,
+    ) -> dict[str, Any]:
+        workspace = workspace_for(self.db, workspace_id, owner)
+        with self.db.connect() as db:
+            session = db.execute(
+                "SELECT 1 FROM assessment_sessions WHERE id=? AND workspace_id=? AND owner_user_id=?",
+                (session_id, workspace_id, owner),
+            ).fetchone()
+            if session is None:
+                raise ApiError(404, "ASSESSMENT_NOT_FOUND", "The Assessment was not found.")
+            draft = self.assessments.load_draft(db, workspace, session_id)
+        return {"session_id": session_id, "draft": draft}
+
+    def explain_assessment_step(
+        self,
+        workspace_id: str,
+        owner: str,
+        session_id: str,
+        request: AssessmentExplanationInput,
+    ) -> dict[str, Any]:
+        def prepare(workspace: sqlite3.Row) -> dict[str, Any]:
+            with self.db.connect() as db:
+                context = self.assessments.explanation_context(
+                    db, workspace, session_id, request.blueprint_item_id, request.step_id
+                )
+            if context["content"] is not None:
+                return context
+            with self.db.connect() as db:
+                item = db.execute(
+                    "SELECT question_revision_id FROM assessment_blueprint_items WHERE id=?",
+                    (request.blueprint_item_id,),
+                ).fetchone()
+                question_row = db.execute(
+                    "SELECT prompt_text FROM assessment_question_revisions WHERE id=?",
+                    (item["question_revision_id"],),
+                ).fetchone()
+                reference = self.assessments.reference_solution(db, str(item["question_revision_id"]))
+                steps = json.loads(reference["steps_json"])
+                step = next(
+                    s for s in steps if str(s.get("step_id")) == request.step_id
+                )
+            instructions = explanation_prompt()
+            output, _run = self.generate(
+                workspace_id,
+                request.operation_id,
+                AssessmentExplanationOutput,
+                instructions=instructions,
+                context={
+                    "question": question_row["prompt_text"],
+                    "step": step,
+                    "solution_revision": reference["solution_revision"],
+                },
+                role="explanation",
+                template_version="explanation-v1",
+                schema_version="v1",
+            )
+            with self.db.connect() as db:
+                self.assessments.store_explanation_content(db, context["id"], output.text)
+            context["content"] = {"text": output.text}
+            return context
+
+        def save(
+            db: sqlite3.Connection,
+            workspace: sqlite3.Row,
+            context: dict[str, Any],
+        ) -> dict[str, Any]:
+            return context
+
+        return self.operate(
+            workspace_id,
+            owner,
+            request,
+            "assessment.explain",
+            prepare,
+            save,
+            resource_identity={
+                "assessment_session_id": session_id,
+                "blueprint_item_id": request.blueprint_item_id,
+                "step_id": request.step_id,
+            },
+        )
+
+    def create_grade_policy(
+        self,
+        owner: str,
+        request: GradePolicyDraftInput,
+    ) -> dict[str, Any]:
+        return self.assessments.create_grade_policy(owner, request)
+
+    def publish_grade_policy(self, owner: str, policy_id: str) -> dict[str, Any]:
+        return self.assessments.publish_grade_policy(owner, policy_id)
+
+    def personal_plan(
+        self, workspace_id: str, owner: str, request: PersonalPlanInput
+    ) -> dict[str, Any]:
+        def save(
+            db: sqlite3.Connection, workspace: sqlite3.Row, _: Any
+        ) -> dict[str, Any]:
+            return self.knowledge.create_personal_plan(db, workspace, request)
+
+        return self.operate(
+            workspace_id,
+            owner,
+            request,
+            "personal.plan",
+            lambda workspace: None,
+            save,
+        )
+
+    def create_spec(
+        self,
+        workspace_id: str,
+        owner: str,
+        node_id: str,
+        request: TeachingSpecDraft,
+    ) -> dict[str, Any]:
+        content = encode([item.model_dump() for item in request.items])
+        content_hash = hashlib.sha256(content.encode()).hexdigest()
+
+        def prepare(workspace: sqlite3.Row) -> None:
+            with self.db.connect() as db:
+                node = db.execute(
+                    "SELECT kind FROM knowledge_nodes WHERE id=? AND course_id=? "
+                    "AND owner_user_id=? AND status='PRIVATE'",
+                    (node_id, workspace["course_id"], owner),
+                ).fetchone()
+            if node is None:
+                raise ApiError(404, "NODE_NOT_FOUND", "The knowledge node was not found.")
+            if node["kind"] != "ATOMIC":
+                raise ApiError(
+                    422,
+                    "ATOMIC_REQUIRED",
+                    "Only atomic knowledge nodes have a Teaching Spec.",
+                )
+            self.check_evidence(
+                workspace,
+                {evidence_id for item in request.items for evidence_id in item.evidence_ids},
+            )
+
+        def save(
+            db: sqlite3.Connection, workspace: sqlite3.Row, _: Any
+        ) -> dict[str, Any]:
+            node = db.execute(
+                "SELECT kind FROM knowledge_nodes WHERE id=? AND course_id=? "
+                "AND owner_user_id=? AND status='PRIVATE'",
+                (node_id, workspace["course_id"], owner),
+            ).fetchone()
+            if node is None:
+                raise ApiError(404, "NODE_NOT_FOUND", "The knowledge node was not found.")
+            self.check_evidence(
+                workspace,
+                {evidence_id for item in request.items for evidence_id in item.evidence_ids},
+            )
+            latest = db.execute(
+                "SELECT version,content_hash FROM teaching_specs WHERE node_id=? "
+                "ORDER BY version DESC LIMIT 1",
+                (node_id,),
+            ).fetchone()
+            if latest is not None and latest["content_hash"] == content_hash:
+                raise ApiError(
+                    409,
+                    "SPEC_UNCHANGED",
+                    "Create a new Teaching Spec only when its scope changes.",
+                )
+            version = int(latest["version"] if latest is not None else 0) + 1
+            db.execute(
+                "INSERT INTO teaching_specs(node_id,version,content_json,content_hash) "
+                "VALUES(?,?,?,?)",
+                (node_id, version, content, content_hash),
+            )
+            db.execute(
+                "UPDATE teaching_spec_metadata SET change_reason=? "
+                "WHERE node_id=? AND version=?",
+                (request.change_reason, node_id, version),
+            )
+            return {
+                "node_id": node_id,
+                "version": version,
+                "content_hash": content_hash,
+                "items": [item.model_dump() for item in request.items],
+                "learning_progress": "NOT_STARTED",
+                "assessment_status": "NOT_ASSESSED",
+                "evidence_ids": sorted(
+                    {
+                        evidence_id
+                        for item in request.items
+                        for evidence_id in item.evidence_ids
+                    }
+                ),
+            }
+
+        return self.operate(
+            workspace_id,
+            owner,
+            request,
+            "teaching.spec",
+            prepare,
+            save,
+            resource_identity={"node_id": node_id},
+        )
+
+    def evidence_version(self, workspace: sqlite3.Row, evidence_id: str) -> sqlite3.Row:
+        with self.db.connect() as db:
+            row = db.execute(
+                "SELECT document_versions.* FROM chunk_source_versions "
+                "JOIN document_versions ON document_versions.id="
+                "chunk_source_versions.document_version_id "
+                "WHERE chunk_source_versions.chunk_id=?",
+                (evidence_id,),
+            ).fetchone()
+        if row is None:
+            raise ApiError(410, "SOURCE_UNAVAILABLE", "A source is no longer available.")
+        is_course_source = (
+            row["course_id"] == workspace["course_id"]
+            and row["source_scope"] in {"OFFICIAL", "OWNER_COURSE"}
+        )
+        is_private_source = (
+            row["course_id"] == workspace["private_course_id"]
+            and row["source_scope"] == "WORKSPACE_PRIVATE"
+        )
+        if not (is_course_source or is_private_source):
+            raise ApiError(410, "SOURCE_UNAVAILABLE", "A source is no longer available.")
+        try:
+            return document_version_for(self.db, row["id"], workspace["owner_user_id"])
+        except ApiError as error:
+            raise ApiError(
+                410, "SOURCE_UNAVAILABLE", "A source is no longer available."
+            ) from error
+
+    def check_evidence(self, workspace: sqlite3.Row, evidence_ids: set[str]) -> None:
+        for evidence_id in evidence_ids:
+            self.evidence_version(workspace, evidence_id)
+
+    def evidence(
+        self, workspace: sqlite3.Row, query: str, scope: str = "union"
+    ) -> list[dict[str, Any]]:
+        courses = [workspace["course_id"], workspace["private_course_id"]]
+        if scope != "union":
+            courses = [courses[0 if scope == "official" else 1]]
+        result: list[dict[str, Any]] = []
+        for course in courses:
+            source_scope: Literal["official", "mine"] = (
+                "mine" if course == workspace["private_course_id"] else "official"
+            )
+            access = RetrievalAccess(
+                owner_user_id=workspace["owner_user_id"], scope=source_scope
+            )
+            for hit in self.retriever.retrieve(
+                course_id=course,
+                query=query,
+                top_k=3,
+                access=access,
+            ):
+                version = self.evidence_version(workspace, hit.chunk_id)
+                result.append(
+                    {
+                        "id": hit.chunk_id,
+                        "document_id": hit.document_id,
+                        "document_version_id": version["id"],
+                        "document_version": version["sha256"],
+                        "locator_type": hit.locator_type,
+                        "locator_value": hit.locator_value,
+                        "content": hit.content[:2500],
+                        "scope": source_scope,
+                        "source_scope": version["source_scope"],
+                    }
+                )
+        return result
+
+    def operate(
+        self,
+        workspace_id: str,
+        owner: str,
+        request: OperationInput,
+        kind: str,
+        prepare: Callable[[sqlite3.Row], Any],
+        save: Callable[[sqlite3.Connection, sqlite3.Row, Any], dict[str, Any]],
+        *,
+        resource_identity: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        workspace = workspace_for(self.db, workspace_id, owner)
+        request_hash = hashlib.sha256(
+            encode(
+                {
+                    "kind": kind,
+                    "resource_identity": resource_identity or {},
+                    **request.model_dump(exclude={"revision"}),
+                }
+            ).encode()
+        ).hexdigest()
+        reserved_revision = request.revision + 1
+        with self.db.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            previous = db.execute(
+                "SELECT * FROM learning_operations WHERE workspace_id=? AND id=?",
+                (workspace_id, request.operation_id),
+            ).fetchone()
+            if previous:
+                if previous["request_hash"] != request_hash:
+                    raise ApiError(
+                        409,
+                        "OPERATION_REUSED",
+                        "Operation ID already belongs to a different request.",
+                    )
+                if previous["status"] == "COMPLETED":
+                    result = json.loads(previous["result_json"])
+                    self.check_evidence(workspace, set(result.get("evidence_ids", [])))
+                    return dict(result)
+                raise ApiError(
+                    409,
+                    "OPERATION_" + previous["status"],
+                    "Do not regenerate automatically. Check this operation's saved status.",
+                )
+            if db.execute(
+                "SELECT 1 FROM learning_operations WHERE workspace_id=? AND status='RUNNING'",
+                (workspace_id,),
+            ).fetchone():
+                raise ApiError(409, "WORKSPACE_BUSY", "Another bounded operation is running.")
+            if (
+                db.execute(
+                    "SELECT COUNT(*) FROM learning_operations o JOIN learning_workspaces w ON "
+                    "w.id=o.workspace_id "
+                    "WHERE w.owner_user_id=? AND o.created_at>=date('now')",
+                    (owner,),
+                ).fetchone()[0]
+                >= self.settings.v3_daily_operations
+            ):
+                raise ApiError(
+                    429, "DAILY_QUOTA", "The daily learning-operation quota has been reached."
+                )
+            if (
+                db.execute(
+                    "UPDATE learning_workspaces SET revision=revision+1 WHERE id=? AND revision=?",
+                    (workspace_id, request.revision),
+                ).rowcount
+                != 1
+            ):
+                raise ApiError(
+                    409, "REVISION_CONFLICT", "Refresh shared state before another action."
+                )
+            db.execute(
+                "INSERT INTO learning_operations(workspace_id,id,request_hash,kind,status) "
+                "VALUES(?,?,?,?,'RUNNING')",
+                (workspace_id, request.operation_id, request_hash, kind),
+            )
+            self.event(
+                db, workspace_id, request.operation_id, "operation.started", {"workflow": kind}
+            )
+        # Network and expensive work never hold a SQLite write transaction.
+        try:
+            prepared = prepare(workspace)
+            workspace = workspace_for(
+                self.db, workspace_id, owner
+            )  # permissions may change during generation
+            with self.db.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                current = db.execute(
+                    "SELECT revision FROM learning_workspaces WHERE id=?",
+                    (workspace_id,),
+                ).fetchone()
+                if current is None or current["revision"] != reserved_revision:
+                    raise ApiError(
+                        409,
+                        "REVISION_CONFLICT",
+                        "The workspace changed while this operation was running; "
+                        "the stale result was not saved.",
+                    )
+                result = save(db, workspace, prepared)
+                result["revision"] = db.execute(
+                    "SELECT revision FROM learning_workspaces WHERE id=?", (workspace_id,)
+                ).fetchone()[0]
+                result["operation_id"] = request.operation_id
+                db.execute(
+                    "UPDATE learning_operations SET status='COMPLETED',result_json=? WHERE "
+                    "workspace_id=? AND id=?",
+                    (encode(result), workspace_id, request.operation_id),
+                )
+                self.event(
+                    db,
+                    workspace_id,
+                    request.operation_id,
+                    kind + ".completed",
+                    {"id": result.get("id"), "revision": result["revision"]},
+                )
+                return dict(result)
+        except Exception as error:
+            status = "FAILED" if isinstance(error, (ApiError, ValueError)) else "UNKNOWN"
+            with self.db.connect() as db:
+                db.execute(
+                    "UPDATE learning_operations SET status=? WHERE workspace_id=? AND id=?",
+                    (status, workspace_id, request.operation_id),
+                )
+                self.event(
+                    db, workspace_id, request.operation_id, "operation.failed", {"status": status}
+                )
+            if isinstance(error, ApiError):
+                raise
+            raise ApiError(
+                502,
+                "MODEL_OUTPUT_REJECTED" if status == "FAILED" else "OPERATION_UNKNOWN",
+                "No learning completion was saved; this request will not be retried automatically.",
+            ) from error
+
+    @staticmethod
+    def event(
+        db: sqlite3.Connection, workspace: str, operation: str, kind: str, payload: Any
+    ) -> None:
+        db.execute(
+            "INSERT INTO learning_events(workspace_id,operation_id,kind,payload_json) "
+            "VALUES(?,?,?,?)",
+            (workspace, operation, kind, encode(payload)),
+        )
+
+    @staticmethod
+    def cursor(db: sqlite3.Connection, workspace_id: str, **values: Any) -> None:
+        previous = json.loads(
+            db.execute(
+                "SELECT cursor_json FROM learning_workspaces WHERE id=?", (workspace_id,)
+            ).fetchone()[0]
+        )
+        db.execute(
+            "UPDATE learning_workspaces SET cursor_json=? WHERE id=?",
+            (encode({**previous, **values}), workspace_id),
+        )
+
+    def reserve_model_call(
+        self,
+        workspace_id: str,
+        operation: str,
+        role: str,
+        max_output_tokens: int | None = None,
+        quota_scope: Literal["INTERACTIVE", "BACKGROUND_AUTO_MAP"] = "INTERACTIVE",
+    ) -> str:
+        reservation_id = identifier()
+        reserved_output_tokens = (
+            self.settings.v3_max_output_tokens
+            if max_output_tokens is None
+            else max_output_tokens
+        )
+        if not 500 <= reserved_output_tokens <= 8_000:
+            raise ApiError(
+                422,
+                "MODEL_OUTPUT_LIMIT_INVALID",
+                "The model output-token limit must be between 500 and 8000.",
+            )
+        with self.db.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            workspace = db.execute(
+                "SELECT owner_user_id,course_id FROM learning_workspaces WHERE id=?",
+                (workspace_id,),
+            ).fetchone()
+            if workspace is None:
+                raise ApiError(404, "WORKSPACE_NOT_FOUND", "The workspace was not found.")
+            if quota_scope == "INTERACTIVE":
+                user_calls = db.execute(
+                    "SELECT COUNT(*) FROM learning_model_call_reservations "
+                    "WHERE owner_user_id=? AND created_at>=date('now') "
+                    "AND status!='BLOCKED' AND quota_scope='INTERACTIVE'",
+                    (workspace["owner_user_id"],),
+                ).fetchone()[0]
+                course_calls = db.execute(
+                    "SELECT COUNT(*) FROM learning_model_call_reservations "
+                    "WHERE owner_user_id=? AND course_id=? AND created_at>=date('now') "
+                    "AND status!='BLOCKED' AND quota_scope='INTERACTIVE'",
+                    (workspace["owner_user_id"], workspace["course_id"]),
+                ).fetchone()[0]
+                if (
+                    user_calls >= self.settings.v3_daily_model_calls_per_user
+                    or course_calls >= self.settings.v3_daily_model_calls_per_user_course
+                ):
+                    raise ApiError(
+                        429,
+                        "DAILY_MODEL_CALL_QUOTA",
+                        "The daily model-call budget has been reached; no provider call was made.",
+                    )
+            db.execute(
+                "INSERT INTO learning_model_call_reservations("
+                "id,workspace_id,operation_id,owner_user_id,course_id,role,"
+                "reserved_output_tokens,status,quota_scope) "
+                "VALUES(?,?,?,?,?,?,?,'RESERVED',?)",
+                (
+                    reservation_id,
+                    workspace_id,
+                    operation,
+                    workspace["owner_user_id"],
+                    workspace["course_id"],
+                    role,
+                    reserved_output_tokens,
+                    quota_scope,
+                ),
+            )
+        return reservation_id
+
+    def record_run(
+        self,
+        workspace_id: str,
+        operation: str,
+        run: dict[str, Any],
+        reservation_id: str,
+    ) -> None:
+        with self.db.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "INSERT INTO learning_model_run_evidence("
+                "id,workspace_id,operation_id,role,model_id,provider_label,protocol,"
+                "region_label,template_version,schema_version,input_hash,started_at,"
+                "finished_at,latency_ms,input_tokens,output_tokens,status,error_class,"
+                "provider_response_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    identifier(),
+                    workspace_id,
+                    operation,
+                    run["role"],
+                    run["model"],
+                    run.get("provider", "UNRECORDED"),
+                    run["protocol"],
+                    run.get("region", "UNKNOWN"),
+                    run.get("template_version", TEMPLATE_VERSION),
+                    run.get("schema_version", "UNRECORDED"),
+                    run.get("input_hash"),
+                    run.get("started_at", "1970-01-01T00:00:00Z"),
+                    run.get("finished_at", "1970-01-01T00:00:00Z"),
+                    run.get("latency_ms", 0),
+                    run.get("input_tokens", 0),
+                    run.get("output_tokens", 0),
+                    run.get("status", "UNKNOWN"),
+                    run.get("error_class"),
+                    run.get("provider_response_id"),
+                ),
+            )
+            if (
+                db.execute(
+                    "UPDATE learning_model_call_reservations SET status=?,input_tokens=?,"
+                    "output_tokens=?,finished_at=? WHERE id=? AND workspace_id=? "
+                    "AND operation_id=? AND status='RESERVED'",
+                    (
+                        run.get("status", "UNKNOWN"),
+                        run.get("input_tokens", 0),
+                        run.get("output_tokens", 0),
+                        run.get("finished_at", "1970-01-01T00:00:00Z"),
+                        reservation_id,
+                        workspace_id,
+                        operation,
+                    ),
+                ).rowcount
+                != 1
+            ):
+                raise ApiError(
+                    409,
+                    "MODEL_CALL_RESERVATION_CONFLICT",
+                    "The model-call reservation could not be finalized safely.",
+                )
+
+    def generate(
+        self,
+        workspace_id: str,
+        operation: str,
+        schema: type[Output],
+        *,
+        instructions: str,
+        context: dict[str, Any],
+        role: str,
+        template_version: str,
+        schema_version: str,
+        images: list[ProviderImage] | None = None,
+        max_output_tokens: int | None = None,
+        quota_scope: Literal["INTERACTIVE", "BACKGROUND_AUTO_MAP"] = "INTERACTIVE",
+        transport_event_sink: Callable[[dict[str, Any]], None] | None = None,
+    ) -> tuple[Output, dict[str, Any]]:
+        reservation_id = self.reserve_model_call(
+            workspace_id, operation, role, max_output_tokens, quota_scope
+        )
+        try:
+            output, run = self.provider_for(quota_scope).generate(
+                schema,
+                instructions=instructions,
+                context=context,
+                role=role,
+                template_version=template_version,
+                schema_version=schema_version,
+                images=images,
+                max_output_tokens=max_output_tokens,
+                transport_event_sink=transport_event_sink,
+            )
+        except ProviderCallFailure as error:
+            self.record_run(workspace_id, operation, error.run, reservation_id)
+            raise error.cause from error
+        self.record_run(workspace_id, operation, run, reservation_id)
+        return output, run
+
+    @staticmethod
+    def _hash(value: Any) -> str:
+        return hashlib.sha256(encode(value).encode()).hexdigest()
+
+    def preference_version(
+        self, workspace_id: str, preference: str, language: str
+    ) -> dict[str, Any]:
+        payload = {"preference": preference.strip(), "language": language}
+        return self.plans.preference_version(workspace_id, self._hash(payload), payload)
+
+    def cached_plan(
+        self,
+        *,
+        workspace_id: str,
+        node_id: str,
+        journey_id: str,
+        identity: dict[str, Any],
+        cache_key: str,
+        explicit_replan: bool,
+    ) -> sqlite3.Row | None:
+        return self.plans.cached_plan(
+            workspace_id=workspace_id,
+            node_id=node_id,
+            journey_id=journey_id,
+            identity=identity,
+            cache_key=cache_key,
+            explicit_replan=explicit_replan,
+        )
+
+    def invalidate_plan(self, plan_id: str, reason: str) -> None:
+        self.plans.invalidate(plan_id, reason)
+
+    def save_plan(
+        self,
+        *,
+        workspace: sqlite3.Row,
+        journey: sqlite3.Row,
+        request: TeachInput,
+        plan: TeachingPlan,
+        run: dict[str, Any],
+        preference: dict[str, Any],
+        identity: dict[str, Any],
+        cache_key: str,
+        input_hash: str,
+    ) -> sqlite3.Row:
+        return self.plans.save(
+            workspace=workspace,
+            journey=journey,
+            request_revision=request.revision,
+            operation_id=request.operation_id,
+            plan=plan,
+            run=run,
+            preference=preference,
+            identity=identity,
+            cache_key=cache_key,
+            input_hash=input_hash,
+            template_version=TEMPLATE_VERSION,
+            model_id=self.provider.cache_model,
+            protocol=self.provider.cache_protocol,
+        )
+
+    def resolve_plan(
+        self,
+        *,
+        workspace: sqlite3.Row,
+        journey: sqlite3.Row,
+        node: dict[str, Any],
+        request: TeachInput,
+        items: list[TeachingItem],
+        eligible: list[TeachingItem],
+        evidence: list[dict[str, Any]],
+        bridge: sqlite3.Row | None,
+        planner_context: dict[str, Any],
+    ) -> tuple[sqlite3.Row, TeachingPlan, bool]:
+        preference = self.preference_version(
+            workspace["id"], request.preference, request.language
+        )
+        source_version_ids = sorted(
+            {
+                f"{item['document_version_id']}:{item['document_version']}"
+                for item in evidence
+            }
+        )
+        identity = {
+            "owner_user_id": workspace["owner_user_id"],
+            "workspace_id": workspace["id"],
+            "course_id": workspace["course_id"],
+            "node_id": node["id"],
+            "spec_version": journey["spec_version"],
+            "spec_hash": node["spec_hash"],
+            "preference_version": preference["version"],
+            "preference_hash": preference["preference_hash"],
+            "template_version": TEMPLATE_VERSION,
+            "schema_version": "v3.2",
+            "model_id": self.provider.cache_model,
+            "protocol": self.provider.cache_protocol,
+            "course_policy_version": planner_context["course_policy"]["version"],
+            "source_version_ids": source_version_ids,
+            "bridge_id": bridge["id"] if bridge is not None else None,
+            "bridge_revision": bridge["revision"] if bridge is not None else None,
+            "performance_trigger_ids": sorted(
+                trigger["id"]
+                for trigger in planner_context["performance_replan_triggers"]
+            ),
+        }
+        cache_key = self._hash(identity)
+        input_hash = self._hash(
+            {
+                "identity": identity,
+                "eligible": [item.model_dump() for item in eligible],
+            }
+        )
+        expected_case = "CASE_B" if request.preference.strip() else "CASE_A"
+        cached = self.cached_plan(
+            workspace_id=workspace["id"],
+            node_id=node["id"],
+            journey_id=journey["id"],
+            identity=identity,
+            cache_key=cache_key,
+            explicit_replan=request.replan,
+        )
+        if cached is not None:
+            try:
+                plan = TeachingPlan.model_validate_json(cached["plan_json"])
+                item_by_id = {item.item_id: item for item in items}
+                planned_item_ids = {
+                    item_id for unit in plan.units for item_id in unit.target_item_ids
+                }
+                if not planned_item_ids <= item_by_id.keys():
+                    raise ValueError("Cached plan references a retired Teaching Item")
+                validate_plan(
+                    plan,
+                    node_id=node["id"],
+                    spec_version=journey["spec_version"],
+                    eligible=[item_by_id[item_id] for item_id in planned_item_ids],
+                    evidence_ids=[item["id"] for item in evidence],
+                    bridge_id=request.bridge_id,
+                    expected_case=expected_case,
+                )
+                delivered = self.plans.delivered_unit_keys(cached["id"])
+                pending_items = {
+                    item_id
+                    for unit in plan.units
+                    if unit.unit_key not in delivered
+                    for item_id in unit.target_item_ids
+                }
+                if pending_items != {item.item_id for item in eligible}:
+                    raise ValueError("Cached plan does not match remaining REQUIRED scope")
+                return cached, plan, True
+            except ValueError:
+                self.invalidate_plan(cached["id"], "CACHE_REVALIDATION_FAILED")
+        plan, run = self.generate(
+            workspace["id"],
+            request.operation_id,
+            TeachingPlan,
+            instructions=template("planner"),
+            context=planner_context,
+            role="planner",
+            template_version=TEMPLATE_VERSION,
+            schema_version="v3.2",
+        )
+        validate_plan(
+            plan,
+            node_id=node["id"],
+            spec_version=journey["spec_version"],
+            eligible=eligible,
+            evidence_ids=[item["id"] for item in evidence],
+            bridge_id=request.bridge_id,
+            expected_case=expected_case,
+        )
+        stored = self.save_plan(
+            workspace=workspace,
+            journey=journey,
+            request=request,
+            plan=plan,
+            run=run,
+            preference=preference,
+            identity=identity,
+            cache_key=cache_key,
+            input_hash=input_hash,
+        )
+        return stored, plan, False
+
+    def solve(self, workspace_id: str, owner: str, request: SolveInput) -> dict[str, Any]:
+        def prepare(workspace: sqlite3.Row) -> Any:
+            nodes = [self.node(workspace, n) for n in request.node_ids]
+            if any(n["kind"] != "ATOMIC" for n in nodes):
+                raise ApiError(
+                    422, "ATOMIC_REQUIRED", "Solution steps must reference atomic knowledge."
+                )
+            image_inputs: list[ProviderImage] = []
+            indexed_entry: dict[str, Any] | None = None
+            image_source: dict[str, Any] | None = None
+            if request.problem_index_entry_id is not None:
+                indexed_entry = self.problems.index_entry(
+                    workspace_id, owner, request.problem_index_entry_id
+                )
+                question = cast(str, indexed_entry["question_text"])
+                input_kind = "INDEXED"
+                retrieval_query = question
+            elif request.image_document_version_id is not None:
+                image, image_source = self.problems.image_input(
+                    workspace_id,
+                    owner,
+                    request.image_document_version_id,
+                    max_bytes=self.settings.v3_problem_image_max_bytes,
+                )
+                image_inputs.append(image)
+                question = request.question or "Transcribe and solve the supplied image question."
+                input_kind = "IMAGE"
+                retrieval_query = request.transcription_hint or request.question or "image question"
+            else:
+                question = cast(str, request.question)
+                input_kind = "TEXT"
+                retrieval_query = question
+            evidence = self.evidence(workspace, retrieval_query, request.scope)
+            if indexed_entry is not None and not any(
+                item["id"] == indexed_entry["chunk_id"] for item in evidence
+            ):
+                source_scope = indexed_entry["source_scope"]
+                evidence.insert(
+                    0,
+                    {
+                        "id": indexed_entry["chunk_id"],
+                        "document_id": indexed_entry["document_id"],
+                        "document_version_id": indexed_entry["document_version_id"],
+                        "document_version": indexed_entry["document_sha256"],
+                        "locator_type": indexed_entry["locator_type"],
+                        "locator_value": indexed_entry["locator_value"],
+                        "content": indexed_entry["question_text"],
+                        "scope": "mine"
+                        if source_scope == "WORKSPACE_PRIVATE"
+                        else "official",
+                        "source_scope": source_scope,
+                    },
+                )
+            instructions, template_version = problem_template()
+            output, _run = self.generate(
+                workspace_id,
+                request.operation_id,
+                ProblemSolutionOutput,
+                instructions=instructions,
+                context={
+                    "input_kind": input_kind,
+                    "question": question,
+                    "transcription_hint": request.transcription_hint,
+                    "indexed_source": indexed_entry,
+                    "image_source": image_source,
+                    "nodes": nodes,
+                    "evidence": evidence,
+                },
+                role="problem",
+                template_version=template_version,
+                schema_version="ProblemSolutionOutput:v2",
+                images=image_inputs,
+            )
+            if input_kind == "IMAGE" and output.question_transcription is None:
+                raise ValueError("Image output must preserve a question transcription")
+            allowed = {e["id"] for e in evidence}
+            by_node = {node["id"]: node for node in nodes}
+            for step in output.steps:
+                for link in step.knowledge_links:
+                    if link.resolution_status == "UNRESOLVED":
+                        continue
+                    node = by_node.get(cast(str, link.node_id))
+                    if node is None or link.spec_version != node["spec_version"]:
+                        raise ValueError("Unknown node or Teaching Spec in solution")
+                    allowed_items = {item["item_id"] for item in node["items"]}
+                    if link.item_id not in allowed_items:
+                        raise ValueError("Unknown Teaching Item in solution")
+            if any(not set(s.source_refs) <= allowed for s in output.steps):
+                raise ValueError("Unknown source in solution")
+            return output, evidence, {
+                "input_kind": input_kind,
+                "question": question,
+                "indexed_entry": indexed_entry,
+                "image_source": image_source,
+            }
+
+        def save(db: sqlite3.Connection, workspace: sqlite3.Row, prepared: Any) -> dict[str, Any]:
+            output, evidence, problem_input = prepared
+            self.check_evidence(workspace, {e["id"] for e in evidence})
+            for node_id in request.node_ids:
+                self.node(workspace, node_id)
+            problem_id, solution_id, attempt_id = identifier(), identifier(), identifier()
+            problem_revision_id, solution_revision_id = identifier(), identifier()
+            evidence_ids = [e["id"] for e in evidence]
+            input_kind = problem_input["input_kind"]
+            indexed_entry = problem_input["indexed_entry"]
+            image_source = problem_input["image_source"]
+            question = (
+                cast(str, output.question_transcription)
+                if input_kind == "IMAGE"
+                else cast(str, problem_input["question"])
+            )
+            db.execute(
+                "INSERT INTO "
+                "learning_problems(id,workspace_id,question,conditions_json,"
+                "source_refs_json,attempt_id) VALUES(?,?,?,?,?,?)",
+                (
+                    problem_id,
+                    workspace_id,
+                    question,
+                    encode(output.conditions),
+                    encode(evidence_ids),
+                    attempt_id,
+                ),
+            )
+            problem_identity = {
+                "input_kind": input_kind,
+                "question": question,
+                "question_transcription": output.question_transcription,
+                "visual_uncertainties": output.visual_uncertainties,
+                "problem_index_entry_id": (
+                    indexed_entry["id"] if indexed_entry is not None else None
+                ),
+                "input_document_version_id": (
+                    indexed_entry["document_version_id"]
+                    if indexed_entry is not None
+                    else image_source["document_version_id"]
+                    if image_source is not None
+                    else None
+                ),
+                "conditions": output.conditions,
+                "evidence_ids": evidence_ids,
+            }
+            db.execute(
+                "INSERT INTO problem_revisions("
+                "id,problem_id,workspace_id,revision,input_kind,question_text,"
+                "question_transcription,transcription_status,visual_uncertainties_json,"
+                "problem_index_entry_id,input_document_version_id,input_source_sha256,"
+                "source_locator_json,content_hash,validation_status) "
+                "VALUES(?,?,?,1,?,?,?,?,?,?,?,?,?,?,'VALIDATED')",
+                (
+                    problem_revision_id,
+                    problem_id,
+                    workspace_id,
+                    input_kind,
+                    question,
+                    output.question_transcription,
+                    (
+                        "UNCERTAIN"
+                        if input_kind == "IMAGE" and output.visual_uncertainties
+                        else "MODEL_PROPOSED"
+                        if input_kind == "IMAGE"
+                        else "NOT_APPLICABLE"
+                    ),
+                    encode(output.visual_uncertainties),
+                    indexed_entry["id"] if indexed_entry is not None else None,
+                    (
+                        indexed_entry["document_version_id"]
+                        if indexed_entry is not None
+                        else image_source["document_version_id"]
+                        if image_source is not None
+                        else None
+                    ),
+                    (
+                        indexed_entry["document_sha256"]
+                        if indexed_entry is not None
+                        else image_source["document_sha256"]
+                        if image_source is not None
+                        else None
+                    ),
+                    encode(
+                        {
+                            "question_number": indexed_entry["question_number"],
+                            "question_part": indexed_entry["question_part"],
+                            "locator_type": indexed_entry["locator_type"],
+                            "locator_value": indexed_entry["locator_value"],
+                        }
+                        if indexed_entry is not None
+                        else {}
+                    ),
+                    self._hash(problem_identity),
+                ),
+            )
+            db.execute(
+                "INSERT INTO problem_attempts("
+                "id,workspace_id,problem_revision_id,assistance) "
+                "VALUES(?,?,?,'ANSWER_EXPOSED')",
+                (attempt_id, workspace_id, problem_revision_id),
+            )
+            steps: list[dict[str, Any]] = []
+            for index, step_output in enumerate(output.steps):
+                links = [
+                    {**link.model_dump(), "id": identifier()}
+                    for link in step_output.knowledge_links
+                ]
+                steps.append(
+                    {
+                        **step_output.model_dump(exclude={"knowledge_links"}),
+                        "id": identifier(),
+                        "ordinal": index + 1,
+                        "knowledge_links": links,
+                    }
+                )
+            result = {
+                **output.model_dump(),
+                "id": solution_id,
+                "problem_id": problem_id,
+                "problem_version": 1,
+                "problem_revision": 1,
+                "problem_revision_id": problem_revision_id,
+                "solution_version": 1,
+                "solution_revision": 1,
+                "solution_revision_id": solution_revision_id,
+                "attempt_id": attempt_id,
+                "question": question,
+                "input_kind": input_kind,
+                "problem_index_entry_id": (
+                    indexed_entry["id"] if indexed_entry is not None else None
+                ),
+                "input_document_version_id": (
+                    indexed_entry["document_version_id"]
+                    if indexed_entry is not None
+                    else image_source["document_version_id"]
+                    if image_source is not None
+                    else None
+                ),
+                "steps": steps,
+                "assistance": "ANSWER_EXPOSED",
+                "evidence_ids": evidence_ids,
+                "sources": [{k: v for k, v in e.items() if k != "content"} for e in evidence],
+            }
+            db.execute(
+                "INSERT INTO learning_solutions VALUES(?,?,1,?)",
+                (solution_id, problem_id, encode(result)),
+            )
+            db.execute(
+                "INSERT INTO solution_revisions("
+                "id,workspace_id,solution_id,problem_revision_id,attempt_id,revision,"
+                "answer_origin,verification,content_hash,validation_status) "
+                "VALUES(?,?,?,?,?,1,?,?,?,'VALIDATED')",
+                (
+                    solution_revision_id,
+                    workspace_id,
+                    solution_id,
+                    problem_revision_id,
+                    attempt_id,
+                    output.answer_origin,
+                    output.verification,
+                    self._hash(output.model_dump()),
+                ),
+            )
+            for step in steps:
+                db.execute(
+                    "INSERT INTO learning_steps VALUES(?,?,?,?)",
+                    (step["id"], solution_id, step["ordinal"], encode(step)),
+                )
+                for link_ordinal, link in enumerate(step["knowledge_links"], start=1):
+                    db.execute(
+                        "INSERT INTO step_knowledge_links("
+                        "id,workspace_id,solution_revision_id,step_id,ordinal,"
+                        "resolution_status,node_id,spec_version,item_id,question_text,"
+                        "reason,unresolved_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            link["id"],
+                            workspace_id,
+                            solution_revision_id,
+                            step["id"],
+                            link_ordinal,
+                            link["resolution_status"],
+                            link["node_id"],
+                            link["spec_version"],
+                            link["item_id"],
+                            link["question_text"],
+                            link["reason"],
+                            link["unresolved_reason"],
+                        ),
+                    )
+            self.cursor(
+                db,
+                workspace_id,
+                problem_id=problem_id,
+                solution_id=solution_id,
+                step_id=steps[0]["id"],
+                pane="PROBLEM",
+            )
+            return dict(result)
+
+        return self.operate(workspace_id, owner, request, "solution", prepare, save)
+
+    @staticmethod
+    def journey(db: sqlite3.Connection, workspace_id: str, node: dict[str, Any]) -> sqlite3.Row:
+        if node["kind"] != "ATOMIC" or node["spec_version"] is None:
+            raise ApiError(
+                422,
+                "ATOMIC_REQUIRED",
+                "A learning journey requires an atomic node with an active Teaching Spec.",
+            )
+        row = db.execute(
+            "SELECT * FROM learning_journeys WHERE workspace_id=? AND node_id=? "
+            "AND spec_version=?",
+            (workspace_id, node["id"], node["spec_version"]),
+        ).fetchone()
+        if row is None:
+            journey_id = identifier()
+            db.execute(
+                "INSERT INTO learning_journeys(id,workspace_id,node_id,spec_version) "
+                "VALUES(?,?,?,?)",
+                (journey_id, workspace_id, node["id"], node["spec_version"]),
+            )
+            row = db.execute("SELECT * FROM learning_journeys WHERE id=?", (journey_id,)).fetchone()
+        return cast(sqlite3.Row, row)
+
+    def bridge(self, workspace_id: str, owner: str, request: BridgeInput) -> dict[str, Any]:
+        def save(db: sqlite3.Connection, workspace: sqlite3.Row, _: Any) -> dict[str, Any]:
+            row = db.execute(
+                "SELECT p.*,s.id AS solution_id,s.version AS solution_version,st.content_json "
+                "AS step_json "
+                "FROM learning_steps st JOIN learning_solutions s ON s.id=st.solution_id JOIN "
+                "learning_problems p ON p.id=s.problem_id "
+                "WHERE st.id=? AND p.workspace_id=?",
+                (request.step_id, workspace_id),
+            ).fetchone()
+            if row is None:
+                raise ApiError(404, "STEP_NOT_FOUND", "The step was not found.")
+            step = json.loads(row["step_json"])
+            link = db.execute(
+                "SELECT link.*,revision.problem_revision_id,revision.attempt_id,"
+                "revision.id AS saved_solution_revision_id "
+                "FROM step_knowledge_links AS link "
+                "JOIN solution_revisions AS revision "
+                "ON revision.id=link.solution_revision_id "
+                "WHERE link.workspace_id=? AND link.step_id=? AND "
+                + ("link.id=?" if request.knowledge_link_id else "link.node_id=?"),
+                (
+                    workspace_id,
+                    request.step_id,
+                    request.knowledge_link_id or request.node_id,
+                ),
+            ).fetchone()
+            if link is None or (
+                request.node_id is not None and link["node_id"] != request.node_id
+            ):
+                raise ApiError(
+                    422,
+                    "STEP_LINK_MISMATCH",
+                    "This step does not contain the selected knowledge question.",
+                )
+            if link["resolution_status"] == "UNRESOLVED":
+                raise ApiError(
+                    422,
+                    "KNOWLEDGE_LINK_UNRESOLVED",
+                    "This knowledge question is awaiting an authorized atomic-node binding.",
+                )
+            node_id = cast(str, link["node_id"])
+            node = self.node(workspace, node_id)
+            self.check_evidence(workspace, set(json.loads(row["source_refs_json"])))
+            previous = db.execute(
+                "SELECT snapshot_json FROM learning_bridges WHERE workspace_id=? AND step_id=? "
+                "AND node_id=?",
+                (workspace_id, request.step_id, node_id),
+            ).fetchone()
+            if previous:
+                result = json.loads(previous[0])
+            else:
+                journey = self.journey(db, workspace_id, node)
+                result = {
+                    "id": identifier(),
+                    "source_problem_id": row["id"],
+                    "problem_version": row["version"],
+                    "source_attempt_id": row["attempt_id"],
+                    "solution_id": row["solution_id"],
+                    "solution_version": row["solution_version"],
+                    "problem_revision_id": link["problem_revision_id"],
+                    "solution_revision_id": link["saved_solution_revision_id"],
+                    "step_id": request.step_id,
+                    "knowledge_link_id": link["id"],
+                    "node_id": node_id,
+                    "spec_version": link["spec_version"],
+                    "item_id": link["item_id"],
+                    "learning_session_id": journey["id"],
+                    "target_learning_session": journey["id"],
+                    "reason_for_learning": link["reason"],
+                    "selected_question": link["question_text"],
+                    "problem_snapshot": {
+                        "question": row["question"],
+                        "conditions": json.loads(row["conditions_json"]),
+                        "step": step,
+                    },
+                    "return_anchor": "step-" + request.step_id,
+                    "return_problem_id": row["id"],
+                    "return_step_id": request.step_id,
+                    "evidence_ids": json.loads(row["source_refs_json"]),
+                }
+                db.execute(
+                    "INSERT INTO "
+                    "learning_bridges(id,workspace_id,step_id,node_id,journey_id,"
+                    "snapshot_json,status) VALUES(?,?,?,?,?,?,'OPEN')",
+                    (
+                        result["id"],
+                        workspace_id,
+                        request.step_id,
+                        node_id,
+                        journey["id"],
+                        encode(result),
+                    ),
+                )
+                validation = (
+                    "VALIDATED"
+                    if link["resolution_status"] == "VALIDATED"
+                    else "LEGACY_PRESERVED"
+                )
+                db.execute(
+                    "INSERT INTO learning_bridge_contexts("
+                    "bridge_id,workspace_id,owner_user_id,course_id,problem_revision_id,"
+                    "attempt_id,solution_revision_id,source_step_id,knowledge_link_id,"
+                    "knowledge_node_ids_json,node_id,spec_version,item_id,reason_for_learning,"
+                    "selected_question,target_learning_session,return_problem_id,return_step_id,"
+                    "return_anchor,idempotency_key,validation_status) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        result["id"],
+                        workspace_id,
+                        owner,
+                        workspace["course_id"],
+                        link["problem_revision_id"],
+                        link["attempt_id"],
+                        link["saved_solution_revision_id"],
+                        request.step_id,
+                        link["id"],
+                        encode([node_id]),
+                        node_id,
+                        link["spec_version"],
+                        link["item_id"],
+                        link["reason"],
+                        link["question_text"],
+                        journey["id"],
+                        row["id"],
+                        request.step_id,
+                        result["return_anchor"],
+                        self._hash({"workspace_id": workspace_id, "link_id": link["id"]}),
+                        validation,
+                    ),
+                )
+            self.cursor(
+                db,
+                workspace_id,
+                bridge_id=result["id"],
+                journey_id=result["learning_session_id"],
+                node_id=node_id,
+                pane="TEACHING",
+            )
+            return dict(result)
+
+        return self.operate(workspace_id, owner, request, "bridge", lambda w: None, save)
+
+    def teach(self, workspace_id: str, owner: str, request: TeachInput) -> dict[str, Any]:
+        def prepare(workspace: sqlite3.Row) -> Any:
+            node = self.node(workspace, request.node_id)
+            if node["kind"] != "ATOMIC":
+                raise ApiError(
+                    422,
+                    "ATOMIC_REQUIRED",
+                    "Teach atomic descendants instead of a composite node.",
+                )
+            with self.db.connect() as db:
+                journey = self.journey(db, workspace_id, node)
+                spec = db.execute(
+                    "SELECT content_json FROM teaching_specs WHERE node_id=? AND version=?",
+                    (node["id"], journey["spec_version"]),
+                ).fetchone()
+                covered = {
+                    r[0]
+                    for r in db.execute(
+                        "SELECT DISTINCT item_id FROM teaching_delivery_evidence "
+                        "WHERE journey_id=? AND validation_status IN "
+                        "('VALIDATED','LEGACY_PRESERVED','REVIEWED')",
+                        (journey["id"],),
+                    )
+                }
+                bridge = (
+                    db.execute(
+                        "SELECT * FROM learning_bridges WHERE id=? AND workspace_id=? AND "
+                        "node_id=?",
+                        (request.bridge_id, workspace_id, request.node_id),
+                    ).fetchone()
+                    if request.bridge_id
+                    else None
+                )
+                replan_triggers = self.assessments.pending_replan(
+                    db,
+                    workspace,
+                    node["id"],
+                )
+            if request.bridge_id and (
+                bridge is None or bridge["status"] in ("CANCELLED", "SOURCE_UNAVAILABLE")
+            ):
+                raise ApiError(404, "BRIDGE_NOT_FOUND", "The active bridge was not found.")
+            items = [TeachingItem.model_validate(i) for i in json.loads(spec[0])]
+            uncovered_required = [
+                i for i in items if i.item_id not in covered and i.requirement == "REQUIRED"
+            ]
+            replan_item_ids = {
+                item_id
+                for trigger in replan_triggers
+                for item_id in trigger["item_ids"]
+            }
+            known_item_ids = {item.item_id for item in items}
+            eligible_item_ids = {
+                item.item_id for item in uncovered_required
+            } | (replan_item_ids & known_item_ids)
+            eligible = [item for item in items if item.item_id in eligible_item_ids]
+            if not eligible:
+                if replan_triggers:
+                    raise ApiError(
+                        409,
+                        "REPLAN_SPEC_CHANGED",
+                        "Pending performance evidence targets a retired Teaching Spec item.",
+                    )
+                raise ApiError(
+                    409, "SCOPE_COMPLETE", "All REQUIRED teaching content has been saved."
+                )
+            evidence = self.evidence(workspace, node["title"])
+            bridge_data = json.loads(bridge["snapshot_json"]) if bridge else None
+            if bridge_data:
+                self.check_evidence(workspace, set(bridge_data["evidence_ids"]))
+            # Non-authoritative Jev decisions layered on the deterministic plan
+            # (shadow by default). The chosen pedagogy method is written into the
+            # teaching context the plan->work step consumes; a remediation run may
+            # record a legal prerequisite to review. Neither ever removes REQUIRED
+            # template content, creates a node, or changes the user's choices.
+            jev_scope = (
+                self.jev.scope(
+                    owner_user_id=str(workspace["owner_user_id"]),
+                    authorization_scope="pedagogy",
+                    course_id=str(workspace["course_id"]),
+                    workspace_id=str(workspace["id"]),
+                    node_id=node["id"],
+                    spec_version=journey["spec_version"],
+                )
+                if self.jev is not None
+                else None
+            )
+            jev_pedagogy_method = callsites.select_pedagogy_method(
+                self.jev,
+                learner_request=str(node["title"]),
+                known_prior_evidence=sorted(covered),
+                topic=str(node["title"]),
+                template_profile={"major": node["major"], "spec_version": journey["spec_version"]},
+                current_step="remediation" if replan_triggers else "planning",
+                scope=jev_scope,
+            )
+            jev_prerequisite_review: str | None = None
+            if self.jev is not None and replan_triggers:
+                with self.db.connect() as db:
+                    jev_prerequisite_review = self.knowledge.select_repair_prerequisite(
+                        db, workspace, node["id"], "remediation"
+                    )
+            context = {
+                "node_id": node["id"],
+                "knowledge_node": node,
+                "teaching_spec_version": journey["spec_version"],
+                "spec_version": journey["spec_version"],
+                "required_items": [
+                    item.model_dump() for item in items if item.requirement == "REQUIRED"
+                ],
+                "recommended_items": [
+                    item.model_dump() for item in items if item.requirement == "RECOMMENDED"
+                ],
+                "optional_items": [
+                    item.model_dump() for item in items if item.requirement == "OPTIONAL"
+                ],
+                "eligible": [i.model_dump() for i in eligible],
+                "covered_item_ids": sorted(covered),
+                "performance_replan_triggers": replan_triggers,
+                "planning_scope": (
+                    "REMEDIATION_AND_REQUIRED"
+                    if replan_triggers
+                    else "UNCOVERED_REQUIRED"
+                ),
+                "preference": request.preference,
+                "language": request.language,
+                "major_policy": node["major"],
+                "course_policy": course_policy(workspace["course_id"]).model_dump(),
+                "learning_cursor": json.loads(workspace["cursor_json"]),
+                "evidence": evidence,
+                "bridge_id": request.bridge_id,
+                "bridge": bridge_data,
+                "output_budget": self.settings.v3_max_output_tokens,
+                "jev_pedagogy_method": jev_pedagogy_method,
+                "jev_prerequisite_review": jev_prerequisite_review,
+            }
+            plan_row, plan, plan_reused = self.resolve_plan(
+                workspace=workspace,
+                journey=journey,
+                node=node,
+                request=request,
+                items=items,
+                eligible=eligible,
+                evidence=evidence,
+                bridge=bridge,
+                planner_context=context,
+            )
+            delivered = self.plans.delivered_unit_keys(plan_row["id"])
+            unit_plan = next(
+                (unit for unit in plan.units if unit.unit_key not in delivered), None
+            )
+            if unit_plan is None:
+                raise ApiError(409, "SCOPE_COMPLETE", "The saved teaching plan is complete.")
+            if unit_plan.stop_condition == "MISSING_EVIDENCE":
+                raise ApiError(
+                    409,
+                    "MISSING_EVIDENCE",
+                    "The saved plan identifies missing evidence; no teaching completion "
+                    "was generated.",
+                )
+            selected_evidence_ids = set(unit_plan.selected_evidence_ids)
+            selected_evidence = [
+                item for item in evidence if item["id"] in selected_evidence_ids
+            ]
+            unit_context = {**context, "evidence": selected_evidence}
+            instructions, compiled = compile_unit(
+                major=node["major"],
+                plan=plan,
+                unit_plan=unit_plan,
+                items=[i for i in items if i.item_id in unit_plan.target_item_ids],
+                context=unit_context,
+            )
+            anchor = bridge_data["return_anchor"] if bridge_data else None
+            unit, _run = self.generate(
+                workspace_id,
+                request.operation_id,
+                TeachingUnitOutput,
+                instructions=instructions,
+                context={
+                    "compiled": json.loads(compiled),
+                    "plan": plan.model_dump(),
+                    "plan_unit": unit_plan.model_dump(),
+                    "return_anchor": anchor,
+                },
+                role="teacher",
+                template_version=TEMPLATE_VERSION,
+                schema_version="v3.2",
+            )
+            validate_unit(
+                unit,
+                plan=plan,
+                unit_plan=unit_plan,
+                node_ids={node["id"]},
+                return_anchor=anchor,
+            )
+            return (
+                journey["id"],
+                node,
+                items,
+                plan_row,
+                plan,
+                unit_plan,
+                unit,
+                selected_evidence,
+                plan_reused,
+                replan_triggers,
+            )
+
+        def save(db: sqlite3.Connection, workspace: sqlite3.Row, data: Any) -> dict[str, Any]:
+            (
+                journey_id,
+                node,
+                items,
+                plan_row,
+                plan,
+                unit_plan,
+                unit,
+                evidence,
+                plan_reused,
+                replan_triggers,
+            ) = data
+            self.node(workspace, node["id"])
+            self.check_evidence(workspace, {e["id"] for e in evidence})
+            current_plan = db.execute(
+                "SELECT status,journey_id FROM teaching_plan_versions WHERE id=?",
+                (plan_row["id"],),
+            ).fetchone()
+            if (
+                current_plan is None
+                or current_plan["status"] != "ACTIVE"
+                or current_plan["journey_id"] != journey_id
+                or db.execute(
+                    "SELECT 1 FROM teaching_unit_plan_links WHERE plan_version_id=? "
+                    "AND plan_unit_key=?",
+                    (plan_row["id"], unit_plan.unit_key),
+                ).fetchone()
+            ):
+                raise ApiError(
+                    409,
+                    "PLAN_CONFLICT",
+                    "The teaching plan changed before this unit could be saved.",
+                )
+            unit_id = identifier()
+            policy = course_policy(workspace["course_id"])
+            saved_unit = {
+                **unit.model_dump(),
+                "display": {"question_prefix": policy.question_prefix},
+                "plan_version": plan_row["version"],
+                "plan_unit_key": unit_plan.unit_key,
+                "plan_reused": plan_reused,
+                "remediation_trigger_ids": [
+                    trigger["id"]
+                    for trigger in replan_triggers
+                    if set(trigger["item_ids"]) & set(unit_plan.target_item_ids)
+                ],
+            }
+            db.execute(
+                "INSERT INTO "
+                "teaching_units(id,journey_id,operation_id,workflow,content_json,"
+                "plan_json,provenance_json) VALUES(?,?,?,'TEACHING',?,?,?)",
+                (
+                    unit_id,
+                    journey_id,
+                    request.operation_id,
+                    encode(saved_unit),
+                    encode(plan.model_dump()),
+                    encode(
+                        {
+                            "prompt_version": TEMPLATE_VERSION,
+                            "schema_version": plan.schema_version,
+                            "spec_hash": node["spec_hash"],
+                            "model": self.provider.cache_model,
+                            "evidence_ids": [e["id"] for e in evidence],
+                            "preference_version": plan_row["preference_version"],
+                            "preference_hash": plan_row["preference_hash"],
+                            "language": request.language,
+                            "plan_version_id": plan_row["id"],
+                            "plan_unit_key": unit_plan.unit_key,
+                            "course_policy_version": policy.version,
+                        }
+                    ),
+                ),
+            )
+            db.execute(
+                "INSERT INTO teaching_unit_plan_links("
+                "teaching_unit_id,plan_version_id,plan_unit_key) VALUES(?,?,?)",
+                (unit_id, plan_row["id"], unit_plan.unit_key),
+            )
+            sections = {section.section_id: section for section in unit.sections}
+            for proposal in unit.coverage_proposals:
+                for section_id in proposal.section_ids:
+                    section_hash = self._hash(sections[section_id].model_dump())
+                    db.execute(
+                        "INSERT INTO teaching_delivery_evidence("
+                        "id,journey_id,node_id,spec_version,item_id,teaching_unit_id,"
+                        "section_id,plan_version_id,plan_unit_key,content_hash,"
+                        "validation_status,validation_reason) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,'VALIDATED',"
+                        "'SERVER_SCHEMA_SCOPE_AND_PERSISTENCE_V1')",
+                        (
+                            identifier(),
+                            journey_id,
+                            node["id"],
+                            plan.spec_version,
+                            proposal.item_id,
+                            unit_id,
+                            section_id,
+                            plan_row["id"],
+                            unit_plan.unit_key,
+                            section_hash,
+                        ),
+                    )
+                db.execute(
+                    "INSERT OR IGNORE INTO "
+                    "learning_coverage(journey_id,item_id,unit_id,section_ids_json) "
+                    "VALUES(?,?,?,?)",
+                    (journey_id, proposal.item_id, unit_id, encode(proposal.section_ids)),
+                )
+            covered = {
+                r[0]
+                for r in db.execute(
+                    "SELECT DISTINCT item_id FROM teaching_delivery_evidence "
+                    "WHERE journey_id=? AND validation_status IN "
+                    "('VALIDATED','LEGACY_PRESERVED','REVIEWED')",
+                    (journey_id,),
+                )
+            }
+            required = {i.item_id for i in items if i.requirement == "REQUIRED"}
+            progress = "LEARNED" if required <= covered else "LEARNING"
+            db.execute("UPDATE learning_journeys SET status=? WHERE id=?", (progress, journey_id))
+            for trigger in replan_triggers:
+                if set(trigger["item_ids"]) & set(unit_plan.target_item_ids):
+                    db.execute(
+                        "INSERT OR IGNORE INTO teaching_unit_remediations("
+                        "trigger_id,teaching_unit_id) VALUES(?,?)",
+                        (trigger["id"], unit_id),
+                    )
+            self.plans.complete_if_delivered(db, plan_row["id"])
+            completed_plan = db.execute(
+                "SELECT status FROM teaching_plan_versions WHERE id=?",
+                (plan_row["id"],),
+            ).fetchone()
+            if completed_plan is not None and completed_plan["status"] == "COMPLETED":
+                for trigger in replan_triggers:
+                    remediated_items = {
+                        str(row[0])
+                        for row in db.execute(
+                            "SELECT DISTINCT target.value "
+                            "FROM teaching_unit_remediations AS remediation "
+                            "JOIN teaching_unit_plan_links AS link "
+                            "ON link.teaching_unit_id=remediation.teaching_unit_id "
+                            "JOIN teaching_plan_units AS plan_unit "
+                            "ON plan_unit.plan_version_id=link.plan_version_id "
+                            "AND plan_unit.unit_key=link.plan_unit_key,"
+                            "json_each(plan_unit.target_item_ids_json) AS target "
+                            "WHERE remediation.trigger_id=?",
+                            (trigger["id"],),
+                        )
+                    }
+                    if set(trigger["item_ids"]) <= remediated_items:
+                        db.execute(
+                            "UPDATE learning_replan_triggers SET status='APPLIED',"
+                            "applied_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                            "WHERE id=? AND status='PENDING'",
+                            (trigger["id"],),
+                        )
+            if request.bridge_id:
+                db.execute(
+                    "UPDATE learning_bridges SET status=? WHERE id=? AND "
+                    "workspace_id=?",
+                    (
+                        "READY_TO_RETURN" if progress == "LEARNED" else "LEARNING",
+                        request.bridge_id,
+                        workspace_id,
+                    ),
+                )
+            self.cursor(
+                db,
+                workspace_id,
+                node_id=node["id"],
+                journey_id=journey_id,
+                unit_id=unit_id,
+                pane="TEACHING",
+            )
+            self.event(
+                db,
+                workspace_id,
+                request.operation_id,
+                "coverage.updated",
+                {"node_id": node["id"], "progress": progress},
+            )
+            assessment_state = self.knowledge._atomic_assessment(
+                db,
+                workspace_id,
+                node["id"],
+            )
+            return {
+                **saved_unit,
+                "id": unit_id,
+                "journey_id": journey_id,
+                "progress": progress,
+                "assessment": assessment_state,
+                "grade": assessment_state.get("grade_label")
+                or assessment_state["status"],
+                "evidence_ids": [e["id"] for e in evidence],
+                "plan_version_id": plan_row["id"],
+                "plan_version": plan_row["version"],
+                "plan_unit_key": unit_plan.unit_key,
+                "plan_reused": plan_reused,
+            }
+
+        return self.operate(workspace_id, owner, request, "unit", prepare, save)
+
+    def return_bridge(
+        self, workspace_id: str, owner: str, bridge_id: str, request: ReturnInput
+    ) -> dict[str, Any]:
+        def save(db: sqlite3.Connection, workspace: sqlite3.Row, _: Any) -> dict[str, Any]:
+            row = db.execute(
+                "SELECT * FROM learning_bridges WHERE id=? AND workspace_id=?",
+                (bridge_id, workspace_id),
+            ).fetchone()
+            if row is None:
+                raise ApiError(404, "BRIDGE_NOT_FOUND", "The bridge was not found.")
+            result = json.loads(row["snapshot_json"])
+            self.check_evidence(workspace, set(result["evidence_ids"]))
+            db.execute(
+                "UPDATE learning_bridges SET status=?,revision=revision+1 WHERE id=?",
+                (request.status, bridge_id),
+            )
+            self.cursor(
+                db,
+                workspace_id,
+                problem_id=result["source_problem_id"],
+                solution_id=result["solution_id"],
+                step_id=result["step_id"],
+                pane="PROBLEM",
+            )
+            return {**result, "status": request.status}
+
+        return self.operate(
+            workspace_id,
+            owner,
+            request,
+            "bridge.return",
+            lambda w: None,
+            save,
+            resource_identity={"bridge_id": bridge_id},
+        )
+
+    def preferences(
+        self, workspace_id: str, owner: str, request: PreferenceInput
+    ) -> dict[str, Any]:
+        def save(db: sqlite3.Connection, workspace: sqlite3.Row, _: Any) -> dict[str, Any]:
+            db.execute(
+                "UPDATE learning_workspaces SET mode=?,layout_json=? WHERE id=?",
+                (request.mode, encode(request.layout.model_dump()), workspace_id),
+            )
+            return {"mode": request.mode, "layout": request.layout.model_dump()}
+
+        return self.operate(workspace_id, owner, request, "preference", lambda w: None, save)
+
+    def state(self, workspace_id: str, owner: str) -> dict[str, Any]:
+        workspace = workspace_for(self.db, workspace_id, owner)
+        knowledge = self.knowledge.snapshot(workspace_id, owner)
+        nodes = [
+            {
+                "id": node["id"],
+                "title": node["title"],
+                "description": node["description"],
+                "major": node["major"],
+                "kind": node["kind"],
+                "status": node["status"],
+                "source": node["source"],
+                "progress": node["state"]["learning"]["status"],
+                "learning": node["state"]["learning"],
+                "assessment": node["state"]["assessment"],
+            }
+            for node in knowledge["registry"]
+        ]
+        with self.db.connect() as db:
+            solution_rows = db.execute(
+                "SELECT s.id,s.content_json FROM learning_solutions s "
+                "JOIN learning_problems p ON p.id=s.problem_id WHERE p.workspace_id=? "
+                "ORDER BY s.rowid DESC LIMIT 25",
+                (workspace_id,),
+            ).fetchall()
+            revision_by_solution = {
+                row["solution_id"]: row
+                for row in db.execute(
+                    "SELECT revision.solution_id,revision.id AS solution_revision_id,"
+                    "revision.revision AS solution_revision,problem_revision.* "
+                    "FROM solution_revisions AS revision "
+                    "JOIN problem_revisions AS problem_revision "
+                    "ON problem_revision.id=revision.problem_revision_id "
+                    "WHERE revision.workspace_id=? ORDER BY revision.revision",
+                    (workspace_id,),
+                )
+            }
+            links_by_step: dict[str, list[dict[str, Any]]] = {}
+            for row in db.execute(
+                "SELECT link.* FROM step_knowledge_links AS link "
+                "JOIN learning_steps AS step ON step.id=link.step_id "
+                "JOIN learning_solutions AS solution ON solution.id=step.solution_id "
+                "JOIN learning_problems AS problem ON problem.id=solution.problem_id "
+                "WHERE problem.workspace_id=? ORDER BY link.step_id,link.ordinal",
+                (workspace_id,),
+            ):
+                links_by_step.setdefault(row["step_id"], []).append(
+                    {
+                        "id": row["id"],
+                        "resolution_status": row["resolution_status"],
+                        "node_id": row["node_id"],
+                        "spec_version": row["spec_version"],
+                        "item_id": row["item_id"],
+                        "question_text": row["question_text"],
+                        "reason": row["reason"],
+                        "unresolved_reason": row["unresolved_reason"],
+                    }
+                )
+            solutions = []
+            for solution_row in solution_rows:
+                solution = json.loads(solution_row["content_json"])
+                for step in solution.get("steps", []):
+                    step.setdefault("formulae", [])
+                    step.setdefault("units", [])
+                    step.setdefault("check", None)
+                    step.setdefault("source_refs", [])
+                    if step.get("id") in links_by_step:
+                        step["knowledge_links"] = links_by_step[step["id"]]
+                revision = revision_by_solution.get(solution_row["id"])
+                if revision is not None:
+                    solution.update(
+                        problem_revision=int(revision["revision"]),
+                        problem_revision_id=revision["id"],
+                        solution_revision=int(revision["solution_revision"]),
+                        solution_revision_id=revision["solution_revision_id"],
+                        input_kind=revision["input_kind"],
+                        problem_index_entry_id=revision["problem_index_entry_id"],
+                        input_document_version_id=revision["input_document_version_id"],
+                    )
+                    solution.setdefault(
+                        "question_transcription", revision["question_transcription"]
+                    )
+                    solution.setdefault(
+                        "visual_uncertainties",
+                        json.loads(revision["visual_uncertainties_json"]),
+                    )
+                solution.setdefault("conditions", [])
+                solution.setdefault("common_mistakes", [])
+                solution.setdefault("question_transcription", None)
+                solution.setdefault("visual_uncertainties", [])
+                solution.setdefault("verification", "NOT_INDEPENDENTLY_VERIFIED")
+                solution.setdefault("sources", [])
+                solutions.append(solution)
+            bridges = [
+                {**json.loads(r["snapshot_json"]), "status": r["status"]}
+                for r in db.execute(
+                    "SELECT * FROM learning_bridges WHERE workspace_id=? ORDER BY rowid DESC "
+                    "LIMIT 50",
+                    (workspace_id,),
+                )
+            ]
+            units = [
+                {
+                    **json.loads(r["content_json"]),
+                    "id": r["id"],
+                    "journey_id": r["journey_id"],
+                    "evidence_ids": json.loads(r["provenance_json"])["evidence_ids"],
+                }
+                for r in db.execute(
+                    "SELECT u.* FROM teaching_units u JOIN learning_journeys j ON "
+                    "j.id=u.journey_id "
+                    "WHERE j.workspace_id=? ORDER BY u.rowid DESC LIMIT 25",
+                    (workspace_id,),
+                )
+            ]
+            operations = [
+                dict(r)
+                for r in db.execute(
+                    "SELECT id,kind,status FROM learning_operations WHERE workspace_id=? ORDER "
+                    "BY rowid DESC LIMIT 25",
+                    (workspace_id,),
+                )
+            ]
+
+        def safe(artifact: dict[str, Any]) -> dict[str, Any]:
+            try:
+                self.check_evidence(workspace, set(artifact.get("evidence_ids", [])))
+                if artifact.get("input_kind") == "IMAGE":
+                    version_id = artifact.get("input_document_version_id")
+                    if not isinstance(version_id, str):
+                        raise ApiError(
+                            410, "SOURCE_UNAVAILABLE", "The image source is unavailable."
+                        )
+                    version = document_version_for(self.db, version_id, owner)
+                    if original_path(self.db, version) is None:
+                        raise ApiError(
+                            410, "SOURCE_UNAVAILABLE", "The image source is unavailable."
+                        )
+                return artifact
+            except ApiError:
+                return {"id": artifact["id"], "status": "SOURCE_UNAVAILABLE"}
+
+        return {
+            "id": workspace_id,
+            "course_id": workspace["course_id"],
+            "revision": workspace["revision"],
+            "mode": workspace["mode"],
+            "layout": json.loads(workspace["layout_json"]),
+            "cursor": json.loads(workspace["cursor_json"]),
+            "nodes": nodes,
+            "solutions": [safe(s) for s in solutions],
+            "bridges": [safe(b) for b in bridges],
+            "units": [safe(u) for u in units],
+            "operations": operations,
+        }

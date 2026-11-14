@@ -1,0 +1,803 @@
+from typing import Annotated, Any, Literal
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
+
+Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=6000)]
+Identifier = Annotated[str, StringConstraints(pattern=r"^[a-zA-Z0-9_-]{1,100}$")]
+Major = Literal["CS", "SMART_MANUFACTURING", "MATERIALS", "ENERGY", "OTHER"]
+
+
+class Contract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class TeachingItem(Contract):
+    item_id: Identifier
+    requirement: Literal["REQUIRED", "RECOMMENDED", "OPTIONAL"]
+    objective: Text
+    acceptance: Text
+    evidence_ids: list[Identifier] = Field(max_length=20)
+
+
+class NodeDraft(Contract):
+    title: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=150)]
+    description: Text
+    major: Major
+    kind: Literal["ATOMIC", "COMPOSITE"] = "ATOMIC"
+    items: list[TeachingItem] = Field(max_length=30)
+
+    @model_validator(mode="after")
+    def unique_scope(self) -> "NodeDraft":
+        ids = [i.item_id for i in self.items]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Teaching item IDs must be unique")
+        if self.kind == "ATOMIC" and (
+            not self.items or not any(i.requirement == "REQUIRED" for i in self.items)
+        ):
+            raise ValueError("An ATOMIC node requires at least one REQUIRED teaching item")
+        if self.kind == "COMPOSITE" and self.items:
+            raise ValueError(
+                "A COMPOSITE node aggregates descendants and cannot own teaching items"
+            )
+        return self
+
+
+class CheckQuestion(Contract):
+    check_id: Identifier
+    kind: Literal["DEFINITION", "DISTINCTION", "ENGLISH", "APPLICATION", "SYNTHESIS"]
+    prompt: Text
+
+
+class TeachingPlanUnit(Contract):
+    unit_key: Identifier
+    target_item_ids: list[Identifier] = Field(min_length=1, max_length=3)
+    unit_goal: Text
+    teaching_sequence: list[Text] = Field(min_length=1, max_length=8)
+    adaptation: str = Field(max_length=2000)
+    selected_evidence_ids: list[Identifier] = Field(max_length=20)
+    suggested_exercise_blueprint: str = Field(max_length=2000)
+    check_questions: list[CheckQuestion] = Field(min_length=3, max_length=5)
+    instruction_draft: str = Field(max_length=3000)
+    stop_condition: Literal["UNIT_COMPLETE", "MISSING_EVIDENCE"]
+
+    @model_validator(mode="after")
+    def unique_unit_scope(self) -> "TeachingPlanUnit":
+        if len(self.target_item_ids) != len(set(self.target_item_ids)):
+            raise ValueError("Teaching plan unit item IDs must be unique")
+        check_ids = [question.check_id for question in self.check_questions]
+        if len(check_ids) != len(set(check_ids)):
+            raise ValueError("Teaching plan check IDs must be unique within a unit")
+        return self
+
+
+class TeachingPlan(Contract):
+    schema_version: Literal["v3.2"]
+    case_type: Literal["CASE_A", "CASE_B"]
+    node_id: Identifier
+    spec_version: int = Field(ge=1)
+    preference_interpretation: str = Field(max_length=2000)
+    units: list[TeachingPlanUnit] = Field(min_length=1, max_length=12)
+    problem_bridge_id: Identifier | None
+    uncertainties: list[Text] = Field(max_length=10)
+
+    @model_validator(mode="after")
+    def unique_plan_scope(self) -> "TeachingPlan":
+        unit_keys = [unit.unit_key for unit in self.units]
+        item_ids = [item_id for unit in self.units for item_id in unit.target_item_ids]
+        if len(unit_keys) != len(set(unit_keys)):
+            raise ValueError("Teaching plan unit keys must be unique")
+        if len(item_ids) != len(set(item_ids)):
+            raise ValueError("A Teaching Item may be scheduled only once per plan")
+        return self
+
+
+class Section(Contract):
+    section_id: Identifier
+    title: Text
+    content: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=40, max_length=12000)
+    ]
+
+
+class CoverageProposal(Contract):
+    item_id: Identifier
+    section_ids: list[Identifier] = Field(min_length=1, max_length=8)
+
+
+class KnowledgeLink(Contract):
+    node_id: Identifier
+    question_text: Text
+    reason: Text
+
+
+class StepKnowledgeLink(Contract):
+    resolution_status: Literal["VALIDATED", "UNRESOLVED"]
+    node_id: Identifier | None = None
+    spec_version: int | None = Field(default=None, ge=1)
+    item_id: Identifier | None = None
+    question_text: Text
+    reason: Text
+    unresolved_reason: Text | None = None
+
+    @model_validator(mode="after")
+    def complete_or_explicitly_unresolved(self) -> "StepKnowledgeLink":
+        identity = (self.node_id, self.spec_version, self.item_id)
+        if self.resolution_status == "VALIDATED":
+            if any(value is None for value in identity) or self.unresolved_reason is not None:
+                raise ValueError("A validated StepKnowledgeLink needs an exact Spec item")
+        elif any(value is not None for value in identity) or self.unresolved_reason is None:
+            raise ValueError("An unresolved StepKnowledgeLink cannot invent a node binding")
+        return self
+
+
+class TeachingUnitOutput(Contract):
+    plan_unit_key: Identifier
+    completion_status: Literal["COMPLETED", "INCOMPLETE"]
+    sections: list[Section] = Field(min_length=1, max_length=8)
+    terms: list[Text] = Field(max_length=20)
+    formulas_examples: list[Text] = Field(max_length=10)
+    source_refs: list[Identifier] = Field(max_length=20)
+    coverage_proposals: list[CoverageProposal] = Field(max_length=3)
+    comprehension_checks: list[CheckQuestion] = Field(min_length=3, max_length=5)
+    knowledge_questions: list[KnowledgeLink] = Field(max_length=10)
+    return_anchor: str | None = Field(max_length=200)
+    next_actions: list[Literal["CONTINUE", "EXAMPLE", "RETURN", "ASSESS", "PAUSE"]] = Field(
+        max_length=5
+    )
+    uncertainties: list[Text] = Field(max_length=10)
+
+
+class SolutionStep(Contract):
+    operation: Text
+    result: Text
+    explanation: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=20, max_length=6000)
+    ]
+    formulae: list[Text] = Field(default_factory=list, max_length=10)
+    units: list[Text] = Field(default_factory=list, max_length=10)
+    check: Text | None = None
+    knowledge_links: list[StepKnowledgeLink] = Field(min_length=1, max_length=5)
+    source_refs: list[Identifier] = Field(max_length=10)
+
+    @model_validator(mode="after")
+    def unique_validated_nodes(self) -> "SolutionStep":
+        node_ids = [
+            link.node_id for link in self.knowledge_links if link.resolution_status == "VALIDATED"
+        ]
+        if len(node_ids) != len(set(node_ids)):
+            raise ValueError("A solution step may ask only one question per bound node")
+        return self
+
+
+class ProblemSolutionOutput(Contract):
+    # Only an independently checked derivation/pairing may upgrade this in the backend.
+    answer_origin: Literal["MODEL_PROPOSED"]
+    exam_answer: Text
+    conditions: list[Text] = Field(max_length=20)
+    steps: list[SolutionStep] = Field(min_length=1, max_length=12)
+    assumptions: list[Text] = Field(max_length=10)
+    common_mistakes: list[Text] = Field(default_factory=list, max_length=10)
+    question_transcription: Text | None = None
+    visual_uncertainties: list[Text] = Field(default_factory=list, max_length=20)
+    verification: Literal["NOT_INDEPENDENTLY_VERIFIED"]
+
+
+class OperationInput(Contract):
+    operation_id: Identifier
+    revision: int = Field(ge=0)
+
+
+class SolveInput(OperationInput):
+    question: Text | None = None
+    node_ids: list[Identifier] = Field(min_length=1, max_length=10)
+    scope: Literal["official", "mine", "union"] = "union"
+    problem_index_entry_id: Identifier | None = None
+    image_document_version_id: Identifier | None = None
+    transcription_hint: Text | None = None
+
+    @model_validator(mode="after")
+    def one_problem_source(self) -> "SolveInput":
+        if self.problem_index_entry_id and self.image_document_version_id:
+            raise ValueError("Choose either an indexed question or one image")
+        if self.problem_index_entry_id and self.question is not None:
+            raise ValueError("An indexed question must use its saved version text")
+        if not (self.question or self.problem_index_entry_id or self.image_document_version_id):
+            raise ValueError("Provide question text, an indexed question, or an image")
+        if self.transcription_hint is not None and self.image_document_version_id is None:
+            raise ValueError("A transcription hint belongs to an image question")
+        return self
+
+
+class BridgeInput(OperationInput):
+    step_id: Identifier
+    knowledge_link_id: Identifier | None = None
+    node_id: Identifier | None = None
+
+    @model_validator(mode="after")
+    def link_or_legacy_node(self) -> "BridgeInput":
+        if self.knowledge_link_id is None and self.node_id is None:
+            raise ValueError("Select a saved StepKnowledgeLink")
+        return self
+
+
+class TeachInput(OperationInput):
+    node_id: Identifier
+    bridge_id: Identifier | None = None
+    preference: str = Field(default="", max_length=2000)
+    language: Literal["zh-CN", "en", "bilingual"] = "zh-CN"
+    replan: bool = False
+
+
+class Layout(Contract):
+    orientation: Literal["columns", "rows"] = "columns"
+    swapped: bool = False
+    ratio: int = Field(default=50, ge=30, le=70)
+
+
+class PreferenceInput(OperationInput):
+    mode: Literal["AUTO", "TEACHING", "PROBLEM"]
+    layout: Layout
+
+
+class ReturnInput(OperationInput):
+    status: Literal["COMPLETED", "CANCELLED"] = "COMPLETED"
+
+
+class TreeMembershipInput(Contract):
+    node_id: Identifier
+    parent_node_id: Identifier | None = None
+    ordinal: int = Field(ge=0, le=10_000)
+    spec_version: int | None = Field(default=None, ge=1)
+
+
+class PrerequisiteInput(Contract):
+    node_id: Identifier
+    prerequisite_node_id: Identifier
+
+
+class PersonalPlanInput(OperationInput):
+    title: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
+    change_reason: Text
+    memberships: list[TreeMembershipInput] = Field(min_length=1, max_length=500)
+    prerequisites: list[PrerequisiteInput] = Field(default_factory=list, max_length=1_000)
+
+    @model_validator(mode="after")
+    def unique_graph_entries(self) -> "PersonalPlanInput":
+        nodes = [member.node_id for member in self.memberships]
+        edges = [(edge.node_id, edge.prerequisite_node_id) for edge in self.prerequisites]
+        if len(nodes) != len(set(nodes)):
+            raise ValueError("Each knowledge node may appear only once in a tree version")
+        if len(edges) != len(set(edges)):
+            raise ValueError("Prerequisite edges must be unique")
+        return self
+
+
+class TeachingSpecDraft(OperationInput):
+    change_reason: Text
+    items: list[TeachingItem] = Field(min_length=1, max_length=30)
+
+    @model_validator(mode="after")
+    def valid_items(self) -> "TeachingSpecDraft":
+        ids = [item.item_id for item in self.items]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Teaching item IDs must be unique")
+        if not any(item.requirement == "REQUIRED" for item in self.items):
+            raise ValueError("A specification requires at least one REQUIRED item")
+        return self
+
+
+class OfficialNodeDraftItem(Contract):
+    """A bounded official-knowledge item grounded in official-course evidence.
+
+    Evidence ids are chunk ids the builder resolved from the current official
+    corpus; the builder (never the model output alone) validates every id before
+    canonicalization.
+    """
+
+    item_id: Identifier
+    requirement: Literal["REQUIRED", "RECOMMENDED", "OPTIONAL"]
+    objective: Text
+    acceptance: Text
+    evidence_ids: list[Identifier] = Field(default_factory=list, max_length=20)
+
+
+class OfficialNodeDraftOutput(Contract):
+    """Provider contract for the M6D1 official node draft (one call of two).
+
+    Bounded to a single ATOMIC node: composite canonicalization is deliberately
+    out of the first builder version.
+    """
+
+    title: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=150)]
+    description: Text
+    major: Major
+    kind: Literal["ATOMIC"]
+    items: list[OfficialNodeDraftItem] = Field(min_length=1, max_length=10)
+
+    @model_validator(mode="after")
+    def valid_scope(self) -> "OfficialNodeDraftOutput":
+        ids = [item.item_id for item in self.items]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Official node item IDs must be unique")
+        if not any(item.requirement == "REQUIRED" for item in self.items):
+            raise ValueError("An official node requires at least one REQUIRED item")
+        return self
+
+
+class OfficialTeachingSpecDraftOutput(Contract):
+    """Provider contract for the validated Teaching Spec (second call).
+
+    The item id set must match the node draft; the builder enforces this and the
+    official-evidence grounding before anything is canonicalized.
+    """
+
+    change_reason: Text
+    items: list[OfficialNodeDraftItem] = Field(min_length=1, max_length=30)
+
+    @model_validator(mode="after")
+    def valid_scope(self) -> "OfficialTeachingSpecDraftOutput":
+        ids = [item.item_id for item in self.items]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Official spec item IDs must be unique")
+        if not any(item.requirement == "REQUIRED" for item in self.items):
+            raise ValueError("An official spec requires at least one REQUIRED item")
+        return self
+
+
+class OfficialKnowledgeDraftBundleOutput(Contract):
+    """Single-call bundle contract for bounded one-node generation."""
+
+    node: OfficialNodeDraftOutput
+    spec: OfficialTeachingSpecDraftOutput
+
+
+class AutoKnowledgeModuleDraft(Contract):
+    """One structural grouping in a machine-validated course map."""
+
+    key: Identifier
+    title: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=150)]
+    description: Text
+    major: Major = "OTHER"
+    parent_key: Identifier | None = None
+
+
+class AutoKnowledgeAtomicDraft(Contract):
+    """One learnable node, grounded in the frozen source snapshot."""
+
+    key: Identifier
+    parent_key: Identifier | None = None
+    title: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=150)]
+    description: Text
+    major: Major = "OTHER"
+    prerequisite_keys: list[Identifier] = Field(default_factory=list, max_length=20)
+    # A final compact unit may be grounded by many source chunks. These are
+    # provenance bindings, not extra navigation nodes; the frozen corpus itself
+    # is bounded to 20,000 chunks by the automatic-map service.
+    evidence_ids: list[Identifier] = Field(min_length=1, max_length=20_000)
+
+
+class AutoKnowledgeSectionDisposition(Contract):
+    """Explicit fate of one frozen source segment during map construction."""
+
+    evidence_id: Identifier
+    status: Literal["MAPPED", "DUPLICATE", "NON_TEACHING", "REVIEW_REQUIRED"]
+    reason: Text
+    node_keys: list[Identifier] = Field(default_factory=list, max_length=30)
+
+
+AUTO_KNOWLEDGE_MAP_MAX_MODULES = 500
+
+
+class AutoKnowledgeMapDraft(Contract):
+    """First model stage: hierarchy only, with source-bound atomic nodes."""
+
+    title: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
+    # A provider sees only one bounded shard.  The persisted aggregate may be
+    # much larger, so these bounds protect memory without imposing a 20/30-node
+    # product limit on a real course.
+    modules: list[AutoKnowledgeModuleDraft] = Field(
+        default_factory=list,
+        max_length=AUTO_KNOWLEDGE_MAP_MAX_MODULES,
+    )
+    nodes: list[AutoKnowledgeAtomicDraft] = Field(default_factory=list, max_length=2000)
+    dispositions: list[AutoKnowledgeSectionDisposition] = Field(
+        default_factory=list, max_length=20_000
+    )
+
+    @model_validator(mode="after")
+    def valid_graph_keys(self) -> "AutoKnowledgeMapDraft":
+        keys = [item.key for item in self.modules] + [item.key for item in self.nodes]
+        if len(keys) != len(set(keys)):
+            raise ValueError("Automatic knowledge-map keys must be unique")
+        module_keys = {item.key for item in self.modules}
+        for module in self.modules:
+            if module.parent_key is not None and module.parent_key not in module_keys:
+                raise ValueError("A module parent must be another module")
+        for node in self.nodes:
+            if node.parent_key is not None and node.parent_key not in module_keys:
+                raise ValueError("An atomic node parent must be a module")
+            if any(
+                key not in {candidate.key for candidate in self.nodes}
+                for key in node.prerequisite_keys
+            ):
+                raise ValueError("Every prerequisite must be another atomic node")
+            if node.key in node.prerequisite_keys:
+                raise ValueError("An atomic node cannot require itself")
+        disposition_ids = [item.evidence_id for item in self.dispositions]
+        if len(disposition_ids) != len(set(disposition_ids)):
+            raise ValueError("Each source segment needs one final disposition")
+        for item in self.dispositions:
+            if any(
+                key not in {candidate.key for candidate in self.nodes} for key in item.node_keys
+            ):
+                raise ValueError("A source disposition may reference only atomic nodes")
+            if item.status == "MAPPED" and not item.node_keys:
+                raise ValueError("A mapped source segment must name at least one atomic node")
+        return self
+
+
+class AutoKnowledgeCompactModuleDraft(Contract):
+    """A deliberately concise chapter returned by the compact-outline stage."""
+
+    key: Identifier
+    title: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=150)]
+    description: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=240)
+    ]
+    major: Major = "OTHER"
+    parent_key: Identifier | None = None
+
+
+class AutoKnowledgeCompactAtomicDraft(Contract):
+    """One compact curriculum unit with bounded outline-only prose."""
+
+    key: Identifier
+    parent_key: Identifier | None = None
+    title: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=150)]
+    # A retained real compact response reached 1,451 characters.  Keep a
+    # finite transport margin while leaving full instructional depth to the
+    # separately generated Teaching Spec.
+    description: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2000)
+    ]
+    major: Major = "OTHER"
+    prerequisite_keys: list[Identifier] = Field(default_factory=list, max_length=20)
+    evidence_ids: list[Identifier] = Field(min_length=1, max_length=120)
+
+
+class AutoKnowledgeCompactOutlineDraft(Contract):
+    """Output-bounded whole-course outline used before full Teaching Specs.
+
+    Disposition prose is intentionally not model-authored here. Large legacy
+    trees can have hundreds of provisional handles, and asking the provider to
+    repeat a reason object for every handle can exceed the upstream output
+    boundary before valid JSON is complete. The model returns each handle once
+    either through an atomic unit or this compact unmapped list; the service
+    expands deterministic review receipts locally.
+    """
+
+    title: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
+    # Intermediate reduction shards may legitimately return more units than
+    # the final course budget. The service validates the final combined count
+    # and refuses activation above 50; these wider transport bounds let a
+    # complete intermediate JSON response survive for the next reduction pass.
+    modules: list[AutoKnowledgeCompactModuleDraft] = Field(
+        default_factory=list, max_length=120
+    )
+    nodes: list[AutoKnowledgeCompactAtomicDraft] = Field(
+        default_factory=list, max_length=120
+    )
+    unmapped_evidence_ids: list[Identifier] = Field(default_factory=list, max_length=120)
+
+    @model_validator(mode="after")
+    def valid_graph_keys(self) -> "AutoKnowledgeCompactOutlineDraft":
+        keys = [item.key for item in self.modules] + [item.key for item in self.nodes]
+        if len(keys) != len(set(keys)):
+            raise ValueError("Compact outline keys must be unique")
+        module_keys = {item.key for item in self.modules}
+        node_keys = {item.key for item in self.nodes}
+        for module in self.modules:
+            if module.parent_key is not None and module.parent_key not in module_keys:
+                raise ValueError("A compact module parent must be another module")
+        for node in self.nodes:
+            if node.parent_key is not None and node.parent_key not in module_keys:
+                raise ValueError("A compact atomic parent must be a module")
+            if any(key not in node_keys for key in node.prerequisite_keys):
+                raise ValueError("Every compact prerequisite must be another atomic node")
+            if node.key in node.prerequisite_keys:
+                raise ValueError("A compact atomic node cannot require itself")
+        if len(self.unmapped_evidence_ids) != len(set(self.unmapped_evidence_ids)):
+            raise ValueError("Each unmapped compact handle must be unique")
+        return self
+
+
+class AutoKnowledgeNodeSpecDraft(Contract):
+    node_key: Identifier
+    change_reason: Text
+    items: list[TeachingItem] = Field(min_length=1, max_length=30)
+
+    @model_validator(mode="after")
+    def valid_items(self) -> "AutoKnowledgeNodeSpecDraft":
+        ids = [item.item_id for item in self.items]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Teaching item IDs must be unique within one node")
+        if not any(item.requirement == "REQUIRED" for item in self.items):
+            raise ValueError("Every atomic node needs at least one REQUIRED item")
+        return self
+
+
+class AutoKnowledgeSpecSetDraft(Contract):
+    """Second model stage: a complete Teaching Spec for every atomic key."""
+
+    specs: list[AutoKnowledgeNodeSpecDraft] = Field(default_factory=list, max_length=2000)
+
+    @model_validator(mode="after")
+    def unique_nodes(self) -> "AutoKnowledgeSpecSetDraft":
+        keys = [spec.node_key for spec in self.specs]
+        if len(keys) != len(set(keys)):
+            raise ValueError("Each automatic node may have only one Teaching Spec")
+        return self
+
+
+class AssessmentSlotSelection(Contract):
+    """One learner-selected slot in a pre-generation assessment configuration.
+
+    It deliberately contains no question id, prompt, option, answer, source
+    excerpt, or pool metadata.  The configuration screen therefore cannot leak
+    future exam content.
+    """
+
+    slot_id: Identifier
+    question_type: Literal["MCQ_SINGLE", "NUMERIC", "SHORT_TEXT", "EXPLANATION", "CODE"]
+    task_form: Literal["concept", "definition", "calculation", "analysis", "evaluation", "code"]
+
+
+AssessmentSecondPurpose = Literal[
+    "APPLICATION", "CONDITION_CHANGE", "DISCRIMINATION", "ERROR_DIAGNOSIS"
+]
+
+
+class PointSlotSelection(AssessmentSlotSelection):
+    primary_point_id: Identifier
+    variation_purpose: AssessmentSecondPurpose | None = None
+    independently_scored_parts: Literal[1] = 1
+
+    @field_validator("independently_scored_parts", mode="before")
+    @classmethod
+    def one_integer_scored_item(cls, value: Any) -> Any:
+        if type(value) is not int or value != 1:
+            raise ValueError("Each point slot must contain exactly one scored item")
+        return value
+
+
+class AssessmentStartInput(OperationInput):
+    node_id: Identifier
+    client_intent_id: Identifier | None = None
+    intent_action: Literal["CONFIGURE", "OPEN", "RETRY"] = "CONFIGURE"
+    configuration_id: Identifier | None = None
+    content_language: Literal["zh-CN", "en"] | None = None
+    slots: list[PointSlotSelection | AssessmentSlotSelection] = Field(
+        default_factory=list, min_length=0, max_length=10_000
+    )
+
+    @model_validator(mode="after")
+    def valid_configuration(self) -> "AssessmentStartInput":
+        ids = [slot.slot_id for slot in self.slots]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Assessment configuration slot ids must be unique")
+        return self
+
+
+class AssessmentAnswer(Contract):
+    blueprint_item_id: Identifier
+    answer: str = Field(max_length=12_000)
+
+
+class AssessmentAttachment(Contract):
+    id: Identifier
+    kind: Literal["image", "document"] = "image"
+
+
+class AssessmentSubmitInput(OperationInput):
+    """Backward-compatible unified submission.
+
+    ``answers`` keeps the existing exactly-five contract. The new optional fields
+    (``unified_answer``, ``attachments``, ``transcription``, ``submission_revision``
+    / ``submission_hash``, ``draft``) let a single composer payload be mapped to
+    the five stable blueprint ids server-side without breaking old clients.
+    """
+
+    answers: list[AssessmentAnswer] = Field(default_factory=list, max_length=30)
+    unified_answer: str | None = Field(default=None, max_length=60_000)
+    attachments: list[AssessmentAttachment] = Field(default_factory=list, max_length=12)
+    transcription: str | None = Field(default=None, max_length=30_000)
+    submission_revision: int | None = Field(default=None, ge=1)
+    submission_hash: str | None = Field(default=None, max_length=64)
+    draft: bool = False
+    confirm_unanswered: list[Identifier] = Field(default_factory=list, max_length=30)
+
+    @model_validator(mode="after")
+    def valid_submission(self) -> "AssessmentSubmitInput":
+        item_ids = [answer.blueprint_item_id for answer in self.answers]
+        if len(item_ids) != len(set(item_ids)):
+            raise ValueError("Each frozen Assessment item needs exactly one answer")
+        if not self.answers and not self.unified_answer and not self.attachments:
+            raise ValueError("Provide five answers, a unified answer, or attachments")
+        return self
+
+
+class AssessmentSolutionStep(Contract):
+    step_id: Identifier
+    ordinal: int = Field(ge=1)
+    operation: Text
+    result: Text
+    explanation: Text
+    source_refs: list[Identifier] = Field(default_factory=list, max_length=10)
+
+
+class AssessmentReferenceSolutionOutput(Contract):
+    """Point-by-point reference solution compiled from the frozen 题目 prompt."""
+
+    schema_version: Literal["v3.2"]
+    answer: Text
+    steps: list[AssessmentSolutionStep] = Field(min_length=1, max_length=12)
+
+
+class AssessmentCandidateCriterion(Contract):
+    criterion_id: Identifier
+    dimension: Literal[
+        "CONCEPT",
+        "TERMINOLOGY",
+        "METHOD_REASONING",
+        "CALCULATION",
+        "DERIVATION",
+        "CODE_APPLICATION",
+        "CLARITY",
+    ]
+    max_fraction: int = Field(ge=1, le=100)
+    description: Text
+
+
+class AssessmentCandidateQuestion(Contract):
+    family_id: Identifier
+    question_type: Literal["MCQ_SINGLE", "NUMERIC", "SHORT_TEXT", "EXPLANATION", "CODE"]
+    difficulty: int = Field(ge=1, le=5)
+    prompt: Text
+    options: list[str] = Field(default_factory=list, max_length=10)
+    answer: dict[str, Any]
+    reference_answer: Text | None = None
+    reference_steps: list[AssessmentSolutionStep] = Field(default_factory=list, max_length=12)
+    criteria: list[AssessmentCandidateCriterion] = Field(min_length=1, max_length=20)
+
+    @model_validator(mode="after")
+    def criteria_sum_to_100(self) -> "AssessmentCandidateQuestion":
+        total = sum(criterion.max_fraction for criterion in self.criteria)
+        if total != 100:
+            raise ValueError("Assessment rubric criteria must total 100 within a question")
+        return self
+
+
+class AssessmentPreparationOutput(Contract):
+    """Candidate question set with server-private answers, reference solutions and rubric."""
+
+    schema_version: Literal["v3.2"]
+    questions: list[AssessmentCandidateQuestion] = Field(min_length=5, max_length=5)
+
+    @model_validator(mode="after")
+    def five_distinct_families(self) -> "AssessmentPreparationOutput":
+        families = [question.family_id for question in self.questions]
+        if len(families) != len(set(families)):
+            raise ValueError("Assessment candidate questions need five distinct families")
+        return self
+
+
+class AssessmentDraftInput(OperationInput):
+    unified_answer: str | None = Field(default=None, max_length=60_000)
+    attachments: list[AssessmentAttachment] = Field(default_factory=list, max_length=12)
+
+
+class AssessmentPreparationStartInput(OperationInput):
+    node_id: Identifier
+
+
+class AssessmentExplanationInput(OperationInput):
+    blueprint_item_id: Identifier
+    step_id: Identifier
+
+
+class AssessmentExplanationOutput(Contract):
+    text: Text
+
+
+class AssessmentAssistInput(OperationInput):
+    blueprint_item_id: Identifier
+    action: Literal["HINT", "TEACHING", "ANSWER_REVEALED"]
+
+
+class AssessmentAbandonInput(OperationInput):
+    pass
+
+
+class AssessmentCriterionGrade(Contract):
+    criterion_id: Identifier
+    score_fraction: float = Field(ge=0, le=1)
+    answer_evidence: str = Field(max_length=2_000)
+    feedback: Text
+    confidence: float = Field(ge=0, le=1)
+    needs_review: bool = False
+
+
+class AssessmentQuestionGrade(Contract):
+    blueprint_item_id: Identifier
+    criteria: list[AssessmentCriterionGrade] = Field(min_length=1, max_length=20)
+
+    @model_validator(mode="after")
+    def unique_criteria(self) -> "AssessmentQuestionGrade":
+        criterion_ids = [criterion.criterion_id for criterion in self.criteria]
+        if len(criterion_ids) != len(set(criterion_ids)):
+            raise ValueError("Assessment criterion proposals must be unique")
+        return self
+
+
+class AssessmentGradeProposal(Contract):
+    schema_version: Literal["v3.2"]
+    questions: list[AssessmentQuestionGrade] = Field(min_length=1, max_length=30)
+    uncertainties: list[Text] = Field(default_factory=list, max_length=20)
+
+    @model_validator(mode="after")
+    def unique_questions(self) -> "AssessmentGradeProposal":
+        item_ids = [question.blueprint_item_id for question in self.questions]
+        if len(item_ids) != len(set(item_ids)):
+            raise ValueError("Assessment grading proposals must be unique per question")
+        return self
+
+
+class NumericGradeValue(Contract):
+    letter: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=20)]
+    numeric_value: float | None = None
+
+
+class RawScoreBand(Contract):
+    minimum: int = Field(ge=0, le=100)
+    maximum: int = Field(ge=0, le=100)
+    letter: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=20)]
+
+    @model_validator(mode="after")
+    def ordered_band(self) -> "RawScoreBand":
+        if self.minimum > self.maximum:
+            raise ValueError("A raw score band minimum cannot exceed its maximum")
+        return self
+
+
+class GradePolicyDraftInput(Contract):
+    scope_type: Literal["PLATFORM", "COURSE", "NODE"]
+    scope_id: Identifier
+    display_name: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)
+    ]
+    provenance_label: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)
+    ]
+    numeric_scale: list[NumericGradeValue] = Field(max_length=30)
+    raw_score_bands: list[RawScoreBand] = Field(max_length=101)
+    rounding_rule: Literal["NEAREST_INTEGER", "FLOOR", "CEILING"] | None = None
+    pass_rule: str | None = Field(default=None, max_length=1_000)
+    retake_rule: str | None = Field(default=None, max_length=1_000)
+
+    @model_validator(mode="after")
+    def unique_letters(self) -> "GradePolicyDraftInput":
+        letters = [item.letter for item in self.numeric_scale]
+        if len(letters) != len(set(letters)):
+            raise ValueError("GradePolicy letter values must be unique")
+        return self
+
+
+class GradePolicyPreviewInput(Contract):
+    raw_score: float = Field(ge=0, le=100)

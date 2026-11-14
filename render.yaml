@@ -1,0 +1,105 @@
+services:
+  - type: web
+    name: coursemate-rag-api
+    runtime: python
+    plan: starter
+    rootDir: services/rag-api
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:create_app --factory --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    disk:
+      name: rag-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.13
+      - key: RAG_DATABASE_PATH
+        value: /var/data/rag.sqlite3
+      - key: RAG_UPLOAD_DIR
+        value: /var/data/uploads
+      - key: RAG_PROVIDER_MODE
+        value: openai
+      - key: RAG_CHAT_API_KEY
+        sync: false
+      - key: RAG_CHAT_BASE_URL
+        value: https://ws-fcszqpvmuz5bcq72.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
+      - key: RAG_CHAT_MODEL
+        value: qwen3.7-plus
+      - key: RAG_EMBEDDING_API_KEY
+        sync: false
+      - key: RAG_EMBEDDING_BASE_URL
+        value: https://ws-fcszqpvmuz5bcq72.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
+      - key: RAG_EMBEDDING_MODEL
+        value: text-embedding-v4
+      - key: WEB_ORIGIN
+        sync: false
+      - key: CLERK_SECRET_KEY
+        sync: false
+      - key: CLERK_JWT_KEY
+        sync: false
+      - key: ADMIN_USER_IDS
+        sync: false
+      - key: RAG_QA_REQUESTS_PER_MINUTE
+        value: 10
+      - key: V3_ENABLED
+        value: "false"
+      - key: V3_MODEL
+        value: qwen3.8-max
+      - key: V3_MODEL_API_KEY
+        sync: false
+      - key: V3_MODEL_BASE_URL
+        sync: false
+      - key: V3_MAX_OUTPUT_TOKENS
+        value: 4000
+      - key: V3_DAILY_OPERATIONS
+        value: 30
+      - key: V3_DAILY_MODEL_CALLS_PER_USER
+        value: 60
+      - key: V3_DAILY_MODEL_CALLS_PER_USER_COURSE
+        value: 60
+      - key: USER_COURSE_MAX_COURSES
+        value: 10
+      - key: USER_COURSE_MAX_FILES
+        value: 50
+      - key: USER_COURSE_MAX_TOTAL_UPLOAD_BYTES
+        value: 524288000
+      - key: APP_ENV
+        value: production
+
+  - type: web
+    name: coursemate-agent-api
+    runtime: node
+    plan: starter
+    buildCommand: npm ci && npm run build --workspace @coursemate/agent-api
+    startCommand: node services/agent-api/dist/src/server.js
+    healthCheckPath: /health
+    disk:
+      name: agent-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_VERSION
+        value: 24.14.0
+      - key: AGENT_DATABASE_PATH
+        value: /var/data/agent.sqlite3
+      - key: AGENT_PROVIDER_MODE
+        value: openai
+      - key: AGENT_MODEL_API_KEY
+        sync: false
+      - key: AGENT_MODEL_BASE_URL
+        sync: false
+      - key: AGENT_MODEL_NAME
+        value: qwen3.8-max
+      - key: WEB_ORIGIN
+        sync: false
+      - key: CLERK_PUBLISHABLE_KEY
+        sync: false
+      - key: CLERK_SECRET_KEY
+        sync: false
+      - key: CLERK_JWT_KEY
+        sync: false
+      - key: AGENT_CHAT_REQUESTS_PER_MINUTE
+        value: 10
+      - key: AGENT_CHAT_REQUESTS_PER_DAY
+        value: 30
