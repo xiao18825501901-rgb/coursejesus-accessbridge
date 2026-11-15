@@ -1,26 +1,28 @@
 {
-  "runtime_state": "runtime/final-demo/run.json",
-  "api_health_status": "ok",
-  "web_url": "http://127.0.0.1:15273/ui-extension/",
-  "status": "PASS",
-  "api_health_service": "rag-api",
-  "checked_at": "2026-11-15T07:31:02.3007174Z",
-  "web_http_status": 200,
-  "data_isolated": "runtime/final-demo/data",
   "processes": [
     {
-      "port": 15274,
       "role": "api",
-      "listener_pid": 26312,
-      "marker": "app.main:create_app",
-      "pid": 14856
+      "pid": 34160,
+      "listener_pid": 14924,
+      "port": 15274,
+      "marker": "app.main:create_app"
     },
     {
-      "port": 15273,
       "role": "web",
-      "listener_pid": 3544,
-      "marker": "serve_web_dist.mjs",
-      "pid": 3544
+      "pid": 44260,
+      "listener_pid": 44260,
+      "port": 15273,
+      "marker": "serve_web_dist.mjs"
     }
-  ]
+  ],
+  "stop_output": "",
+  "verified_at": "2026-11-15T07:52:39.6550870Z",
+  "status": "PASS",
+  "runtime_name": "competition-local",
+  "api_status": 200,
+  "remaining_listeners_after_stop": 0,
+  "schema": "coursejesus.local-start-stop.v3",
+  "web_url": "http://127.0.0.1:15273/ui-extension/",
+  "web_status": 200,
+  "api_body": "{\"status\":\"ok\",\"service\":\"rag-api\"}"
 }

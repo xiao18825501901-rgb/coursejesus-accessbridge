@@ -41,8 +41,10 @@ def prepare(target: Path) -> tuple[Path, Path]:
     target = target.resolve()
     if not target.is_relative_to(RUNTIME_ROOT):
         raise ValueError("The browser fixture must stay under the competition runtime directory")
-    if target.exists() and any(target.iterdir()):
-        raise ValueError("The browser fixture directory must be absent or empty")
+    if target.exists() and any(path.is_file() for path in target.rglob("*")):
+        raise ValueError(
+            "The browser fixture directory must be absent, empty, or contain only empty directories"
+        )
 
     uploads = target / "uploads"
     database_path = target / "rag.sqlite3"
