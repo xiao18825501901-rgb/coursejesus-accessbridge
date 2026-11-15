@@ -66,7 +66,10 @@ async def current_user(request: Request):
     if cfg.auth_mode == 'injected':
         subject = await request.app.state.subject_resolver(request)
         if not isinstance(subject,str) or not subject: raise HTTPException(401,'请登录')
-        return require_active_user(db, ensure_user(db,subject,auto_verify))
+        user = require_active_user(db, ensure_user(db,subject,auto_verify))
+        if subject.startswith('guest_'):
+            return {**dict(user), 'is_guest': True}
+        return user
     if cfg.auth_mode == 'development':
         # No client-supplied user IDs. This endpoint mode is forbidden by production startup gates.
         token = request.cookies.get('cmui_dev_session','')

@@ -1,0 +1,40 @@
+{
+  "schema": "coursejesus.release-security-scan.v1",
+  "checked_at": "2026-11-15T07:32:23.7668202Z",
+  "status": "PASS",
+  "git_commit_count": 1,
+  "tracked_file_count": 918,
+  "sensitive_filenames": [],
+  "high_confidence_secret_matches": [
+    {
+      "match": "2ac73bbe1beaaeb48f6139055abc3ad2d8faca20:services/rag-api/tests/test_deepseek_canary.py:435:    sentinel = \"sk-deepseek-canary-sentinel-123\"",
+      "classification": "SYNTHETIC_TEST_SENTINEL"
+    }
+  ],
+  "tracked_media_files": [
+    "apps/web/brand-source/coursejesus-logo-source.png",
+    "apps/web/public/brand/apple-touch-icon-180.png",
+    "apps/web/public/brand/favicon-16.png",
+    "apps/web/public/brand/favicon-32.png",
+    "apps/web/public/brand/favicon-48.png",
+    "apps/web/public/brand/icon-192.png",
+    "apps/web/public/brand/icon-512.png",
+    "apps/web/public/brand/logo-mark-512.png"
+  ],
+  "allowed_owner_brand_media": [
+    "apps/web/brand-source/coursejesus-logo-source.png",
+    "apps/web/public/brand/apple-touch-icon-180.png",
+    "apps/web/public/brand/favicon-16.png",
+    "apps/web/public/brand/favicon-32.png",
+    "apps/web/public/brand/favicon-48.png",
+    "apps/web/public/brand/icon-192.png",
+    "apps/web/public/brand/icon-512.png",
+    "apps/web/public/brand/logo-mark-512.png"
+  ],
+  "unexpected_media_files": [],
+  "notes": [
+    "The only high-confidence string match is a synthetic canary sentinel under a test file.",
+    "Runtime data, review-inputs, node_modules, .venv, .git, caches, and generated artifacts are excluded from source packages.",
+    "Dependency vulnerability status is recorded separately in npm-audit-final-results.json and pip-check-results.txt."
+  ]
+}

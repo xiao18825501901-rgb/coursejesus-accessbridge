@@ -244,6 +244,22 @@ class V3DomainAdapter:
     def _is_admin(self, subject: str) -> bool:
         return subject in self.settings.admin_user_id_set
 
+    @staticmethod
+    def _is_guest(subject: str) -> bool:
+        return subject.startswith("guest_")
+
+    def _course_for_subject(
+        self,
+        row: sqlite3.Row | dict[str, Any],
+        subject: str,
+        *,
+        requirements: str = "",
+    ) -> dict[str, Any]:
+        dto = self._course_dto(row, requirements=requirements)
+        if self._is_guest(subject):
+            dto.pop("owner", None)
+        return dto
+
     def _workspace_row(
         self, course_id: str, subject: str, *, create: bool = True
     ) -> sqlite3.Row | None:
@@ -351,7 +367,11 @@ class V3DomainAdapter:
         if cached is not None and not write:
             return cached
         row = self._course_row(course_id, subject, write=write, content=write)
-        dto = self._course_dto(row, requirements=self._requirements(course_id, subject))
+        dto = self._course_for_subject(
+            row,
+            subject,
+            requirements=self._requirements(course_id, subject),
+        )
         _cache().courses[course_id] = dto
         return dto
 
@@ -372,7 +392,10 @@ class V3DomainAdapter:
                 " updated_at DESC, id",
                 (subject,),
             ).fetchall()
-        return [self._course_dto(row, requirements="") for row in rows]
+        return [
+            self._course_for_subject(row, subject, requirements="")
+            for row in rows
+        ]
 
     def _create_course(self, subject: str, payload: dict[str, Any]) -> dict[str, Any]:
         name = str(payload.get("name") or "").strip()

@@ -21,7 +21,8 @@ from app.learning.orchestrator import LearningOrchestrator
 from app.rag.retrieval import HybridRetriever
 from app.services.ingestion import IngestionService
 from app.ui_extension.domain import V3DomainAdapter
-from app.ui_extension.identity import clerk_subject_resolver
+from app.ui_extension.guest import GuestSessionAuthority, guest_operation_allowed
+from app.ui_extension.identity import verified_subject_resolver
 
 MOUNT_PATH = "/ui-extension"
 
@@ -111,6 +112,23 @@ def _ui_settings(settings: Settings) -> object:
     ui.integration_mode = "integrated"
     ui.auth_mode = "injected"
     ui.allowed_origins = ui_allowed_origins(settings)
+    configured_verification_secret = (
+        settings.verification_secret.get_secret_value()
+        if settings.verification_secret
+        else ""
+    )
+    configured_guest_secret = (
+        settings.guest_session_secret.get_secret_value()
+        if settings.guest_session_secret
+        else ""
+    )
+    ui.verification_secret = (
+        os.getenv("CMUI_VERIFICATION_SECRET") or configured_verification_secret
+    )
+    ui.guest_session_secret = (
+        os.getenv("GUEST_SESSION_SECRET") or configured_guest_secret
+    )
+    ui.guest_session_ttl_seconds = settings.guest_session_ttl_seconds
     ui.clerk_issuer = os.getenv("CLERK_ISSUER", "")
     ui.clerk_jwt_key = os.getenv("CLERK_JWT_KEY", "").replace("\\n", "\n")
     ui.clerk_audience = os.getenv("CLERK_AUDIENCE", "")
@@ -208,18 +226,29 @@ def mount_ui_extension(
         auto_knowledge_map=getattr(host_app.state, "auto_knowledge_map", None),
     )
     ui_settings = _ui_settings(settings)
+    guest_secret = ui_settings.guest_session_secret or ui_settings.verification_secret
+    guest_sessions = (
+        GuestSessionAuthority(
+            guest_secret,
+            ui_settings.guest_session_ttl_seconds,
+        )
+        if ui_settings.guest_session_enabled and guest_secret
+        else None
+    )
     from app.cm_update.integration import install_ui_extension
 
     ui = install_ui_extension(
         host_app,
         ui_settings,
         adapter,
-        clerk_subject_resolver(host_app),
+        verified_subject_resolver(host_app, guest_sessions),
         mount_path=mount_path,
         provider=provider,
         jev=jev,
+        guest_sessions=guest_sessions,
     )
     _allow_browser_credentials(host_app, mount_path, ui_settings.allowed_origins)
+    _enforce_guest_routes(ui, ui_settings.api_base, guest_sessions)
     _prepend_legacy_history(ui, adapter)
     if settings.visual_engine_enabled:
         from app.visual.api import install_visual_routes
@@ -309,6 +338,36 @@ def _prepend_legacy_history(ui: object, adapter: V3DomainAdapter) -> None:
         return JSONResponse(content=body)
 
     ui.routes[:0] = router.routes  # type: ignore[attr-defined]
+
+
+def _enforce_guest_routes(
+    ui: object,
+    api_base: str,
+    guest_sessions: GuestSessionAuthority | None,
+) -> None:
+    """Keep guest tokens inside the explicitly reviewed UI operation allowlist."""
+
+    if guest_sessions is None:
+        return
+    prefix = api_base.rstrip("/")
+
+    @ui.middleware("http")  # type: ignore[attr-defined]
+    async def guest_route_policy(request: Request, call_next: object) -> object:
+        if request.method != "OPTIONS" and request.url.path.startswith(prefix):
+            if guest_sessions.request_session(request) is not None:
+                api_path = request.url.path[len(prefix) :] or "/"
+                if not guest_operation_allowed(request.method, api_path):
+                    return JSONResponse(
+                        status_code=403,
+                        content={
+                            "detail": {
+                                "code": "GUEST_OPERATION_FORBIDDEN",
+                                "message": "This operation is unavailable in the public guest workspace.",
+                            }
+                        },
+                        headers={"Cache-Control": "private, no-store"},
+                    )
+        return await call_next(request)  # type: ignore[operator]
 
 
 def _allow_browser_credentials(

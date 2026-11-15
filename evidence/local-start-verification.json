@@ -1,0 +1,26 @@
+{
+  "status": "PASS",
+  "started_at": "2026-11-15T07:03:27.1110966Z",
+  "web_url": "http://127.0.0.1:15273/ui-extension/",
+  "web_http_status": 200,
+  "api_health_status": "ok",
+  "api_health_service": "rag-api",
+  "processes": [
+    {
+      "pid": 34348,
+      "listener_pid": 34216,
+      "marker": "app.main:create_app",
+      "role": "api",
+      "port": 15274
+    },
+    {
+      "pid": 33392,
+      "listener_pid": 33392,
+      "marker": "serve_web_dist.mjs",
+      "role": "web",
+      "port": 15273
+    }
+  ],
+  "runtime_state": "runtime/final-verification/run.json",
+  "data_isolated": "runtime/final-verification/data"
+}

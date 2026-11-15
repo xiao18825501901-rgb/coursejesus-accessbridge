@@ -71,6 +71,8 @@
     "sessionExpired": "Your session expired. Please sign in again",
     "signInToContinue": "Sign in to continue",
     "notConfigured": "Sign-in service is not configured",
+    "publicGuest": "Public visitor",
+    "publicGuestDescription": "You are using an isolated temporary workspace. Practice and generation history never flow into learner grades or official study records.",
     "slogan": "From Confusion to Revelation",
     "connectingBrand": "Connecting to {{brand}}…",
     "localIntegration": "Local integration · Real SQLite data",
@@ -92,12 +94,16 @@
     "closeSidebar": "Close sidebar",
     "account": "Account",
     "dashboard": "Dashboard",
+    "accessbridge": "Learn",
     "courses": "Courses",
     "calendar": "Calendar",
     "inbox": "Inbox",
     "help": "Help",
     "mainLabel": "Main navigation",
     "courseLabel": "Course navigation"
+  },
+  "accessbridge": {
+    "deterministicNote": "Deterministic VisualSpec-style SVG; no remote model or GPU call"
   },
   "dashboard": {
     "title": "Dashboard",
@@ -113,7 +119,7 @@
     "interfaceLanguage": "Interface language",
     "chinese": "中文",
     "english": "English",
-    "languageNotice": "Changes the interface only, not lesson or question language",
+    "languageNotice": "Changes the interface, lesson, and practice language",
     "themeSaveFailed": "Theme changed on this device, but the server could not save it: {{error}}"
   },
   "courses": {
@@ -141,6 +147,7 @@
     "sharedMaterialsPrivateHistory": "Shared materials · Private learning records",
     "privateCourseNote": "Private course · Only you",
     "publicCourse": "Public course",
+    "publicGuestNotice": "Public visitors can browse authorized courses, knowledge maps, materials and practice. Course management, official grades and learner records are unavailable.",
     "learningSpace": "Learning Space",
     "returnAll": "Return to all courses",
     "pin": "Add to dashboard",

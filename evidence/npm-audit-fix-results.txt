@@ -1,0 +1,47 @@
+
+changed 6 packages, and audited 261 packages in 9s
+
+68 packages are looking for funding
+  run `npm fund` for details
+
+# npm audit report
+
+@vitest/mocker  <=4.1.11
+Severity: moderate
+Vitest: Code injection via unauthenticated manual mock registration - https://github.com/advisories/GHSA-qxg6-89mg-rqv8
+Vitest: Windows backslash traversal bypasses the @vitest/mocker redirect allowlist fix - https://github.com/advisories/GHSA-xp26-3454-mjgp
+fix available via `npm audit fix --force`
+Will install vitest@4.1.12, which is outside the stated dependency range
+node_modules/@vitest/mocker
+  vitest  2.1.0-beta.1 - 4.1.11
+  Depends on vulnerable versions of @vitest/mocker
+  node_modules/vitest
+
+katex  0.11.0 - 0.18.1
+KaTeX: Existing prototype pollution can bypass trust restrictions - https://github.com/advisories/GHSA-238p-pmpm-9mq7
+fix available via `npm audit fix --force`
+Will install katex@0.19.1, which is a breaking change
+node_modules/katex
+
+vite  8.2.0 - 8.2.2
+Severity: high
+launch-editor: escapeCmdArgs() omits % escaping on Windows - https://github.com/advisories/GHSA-698v-4r3x-3vcv
+launch-editor: Editor CLI flag misinterpretation causing arbitrary command execution for some editors - https://github.com/advisories/GHSA-r825-w8mm-5pxw
+launch-editor: `fs.existsSync()` existence check can be bypassed on Windows - https://github.com/advisories/GHSA-587h-7wmj-h5pm
+Vite: Cross origin script execution through Vite custom middleware - https://github.com/advisories/GHSA-9jrq-w75r-8gcw
+Vite: Files outside `server.fs.allow` could be served when project paths match system paths on non-Windows machine - https://github.com/advisories/GHSA-rq7h-c2jc-7f22
+Vite: First 4 bytes of files outside of `server.fs` setting is exposed by `?vite-wasm-instance` - https://github.com/advisories/GHSA-vfpm-58rq-9qcg
+fix available via `npm audit fix --force`
+Will install vite@8.3.8, which is outside the stated dependency range
+node_modules/vite
+
+4 vulnerabilities (1 low, 2 moderate, 1 high)
+
+To address all issues (including breaking changes), run:
+  npm audit fix --force
+npm warn allow-scripts 1 package has install scripts not yet covered by allowScripts:
+npm warn allow-scripts   esbuild@0.28.1 (postinstall: node install.js)
+npm warn allow-scripts
+npm warn allow-scripts Run `npm approve-scripts --allow-scripts-pending` to review, or `npm approve-scripts <pkg>` to allow.
+
+EXIT_CODE=1

@@ -1,0 +1,22 @@
+{
+  "schema": "coursejesus.accessed-hacks.owner-decisions.v3",
+  "recorded_at": "2026-11-15T15:15:00+08:00",
+  "applies_to": "E:\\Hackathon-2026\\coursejesus-full-competition",
+  "decisions": {
+    "publish_current_coursejesus_website": true,
+    "publish_authorized_github_source": true,
+    "source_publication_mode": "rights_retained_public_source",
+    "judges_may_download_install_and_run": true,
+    "apply_mit_or_apache_to_owner_code": false,
+    "third_party_licenses_remain_effective": true,
+    "contact_hackathon_organizers": false,
+    "purchase_new_cloud_resources": false,
+    "prefer_existing_free_hosting": true,
+    "final_devpost_submission_authorized_if_truthful_and_account_usable": true,
+    "owner_identity_and_terms_declarations_remain_owner_actions": true,
+    "representative_course_must_be_created_by_owner": true,
+    "retry_historical_unknown_visual_qwen_eas_jobs": false
+  },
+  "supersedes": "Earlier statements that publication permission or a license choice was unresolved",
+  "original_products_must_remain_unmodified": true
+}

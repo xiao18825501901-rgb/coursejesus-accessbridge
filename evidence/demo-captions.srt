@@ -1,0 +1,51 @@
+1
+00:00:02,890 --> 00:00:10,902
+CourseJesus — AccessBridge: the real CourseJesus shell with an isolated public learning route.
+
+2
+00:00:10,904 --> 00:00:19,917
+This is an anonymous guest workspace. The public synthetic course is visible and management actions are hidden.
+
+3
+00:00:21,926 --> 00:00:30,941
+The private control course is not returned. Guests cannot create, import, administer, or claim a real learner identity.
+
+4
+00:00:31,084 --> 00:00:40,091
+The integrated Learn route adds three original bilingual lessons: stack/queue, graph search, and matrix transforms.
+
+5
+00:00:40,183 --> 00:00:49,193
+The matrix visual is computed from homogeneous column vectors: scale, then rotate, then translate.
+
+6
+00:00:51,006 --> 00:01:00,011
+The forward result is (1,3) and the reverse-order control ends at (-2,4). The answers come from the calculation.
+
+7
+00:01:00,047 --> 00:01:08,052
+Source disclosure stays next to the teaching claim, so learners can inspect the basis instead of accepting an opaque answer.
+
+8
+00:01:08,261 --> 00:01:17,270
+Three short checks provide answer-specific reasoning. This is practice evidence, not an official CourseJesus grade.
+
+9
+00:01:17,703 --> 00:01:25,708
+The same control changes interface, lesson, and practice language. Large text is an explicit learner choice.
+
+10
+00:01:26,183 --> 00:01:35,193
+The selected lesson exports as one self-contained HTML file with no remote dependency, score write-back, or offline-AI claim.
+
+11
+00:01:35,307 --> 00:01:44,314
+With network access disabled, the downloaded practice still explains the transform and checks all three answers.
+
+12
+00:01:44,340 --> 00:01:56,344
+The local evidence covers build, tests, browser accessibility, and guest isolation. It does not claim the unverified production flow.
+
+13
+00:01:56,354 --> 00:02:07,356
+Current status is partial and not submitted. The next concrete gate is the owner-created representative course and a live three-mode end-to-end record.

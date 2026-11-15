@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Matrix transforms · CourseJesus AccessBridge</title>
+<style>body{font:22px/1.65 system-ui,sans-serif;max-width:850px;margin:auto;padding:32px;color:#243844;overflow-wrap:anywhere}h1{color:#8f1c4c}h2{margin-top:32px}.rationale{padding:12px;background:#f6f8fa;border-left:4px solid #8f1c4c}fieldset{margin:24px 0;padding:18px;border:1px solid #d8e0e5}legend{font-weight:700}.notice{padding:16px;background:#fff7e6;border:1px solid #ead39c}@media(max-width:520px){body{padding:20px}}</style></head>
+<body><main><p>AccessED public learning demo</p><h1>Matrix transforms</h1><p>Scale, rotate, and translate an object in a fixed order</p>
+<p class="notice">The offline file contains only the exported lesson, answers, and feedback. It does not provide offline AI.</p>
+<h2>Text-equivalent source</h2><p>This example uses homogeneous column vectors p=(x,y,1)^T. We choose scale S, then rotation R, then translation T, so p&#39;=T R S p. This is an explicit example order, not a universal default. Affine translation uses homogeneous coordinates.</p>
+
+    <section><h2>Start from coordinates</h2><p>Represent the point (1,0) as the homogeneous column vector (1,0,1)^T. This lets a 3x3 affine matrix express translation as well as scale and rotation.</p></section>
+    <section><h2>Apply one matrix at a time</h2><p>For this lesson only, apply S then R then T, giving p&#39;=T R S p. The rightmost matrix acts first on a column vector; there is no universal default order.</p></section>
+    <section><h2>Compare the result</h2><p>Scale (1,0) by 2 to (2,0), rotate 90 degrees counterclockwise to (0,2), then add (1,1) to get (1,3). Reversing the operations gives (-2,4). Results can differ, though some special transformations commute.</p></section><h2>Short practice</h2>
+    <fieldset><legend>1. After scaling (1,0) by 2 and rotating 90 degrees counterclockwise, what point do you have before translation?</legend>
+      <p>✓ (0,2)</p><p>○ (1,3)</p><p>○ (2,0)</p>
+      <p class="rationale">Scaling gives (2,0); a 90-degree counterclockwise rotation maps it to (0,2).</p>
+    </fieldset>
+    <fieldset><legend>2. After translating (0,2) by (1,1), what is the final point?</legend>
+      <p>✓ (1,3)</p><p>○ (0,3)</p><p>○ (2,1)</p>
+      <p class="rationale">Adding (1,1) to (0,2) gives (1,3). The composition is p&#39;=T R S p for this explicit order.</p>
+    </fieldset>
+    <fieldset><legend>3. What is the reversed-order control result for translation, then rotation, then scaling?</legend>
+      <p>✓ (-2,4)</p><p>○ (1,3)</p><p>○ (-4,2)</p>
+      <p class="rationale">Translation gives (2,1), rotation gives (-1,2), and scaling gives (-2,4). This differs from the forward result (1,3); some special transforms can still commute.</p>
+    </fieldset>
+<h2>Sources and rights</h2><p><strong>AB-S1</strong> This example uses homogeneous column vectors p=(x,y,1)^T. We choose scale S, then rotation R, then translation T, so p&#39;=T R S p. This is an explicit example order, not a universal default. Affine translation uses homogeneous coordinates. For p=(1,0), scale uniformly by 2, rotate 90 degrees counterclockwise, then translate by (1,1): (1,0) -&gt; (2,0) -&gt; (0,2) -&gt; (1,3). Reversing those operations gives (-2,4), not (1,3). Some special transforms commute; order does not always change the result.</p>
+</main></body></html>

@@ -38,6 +38,9 @@ class Settings(BaseSettings):
     web_allowed_origins: str = ""
     clerk_secret_key: SecretStr | None = None
     clerk_jwt_key: SecretStr | None = None
+    verification_secret: SecretStr | None = None
+    guest_session_secret: SecretStr | None = None
+    guest_session_ttl_seconds: int = Field(default=86_400, ge=60, le=7 * 24 * 60 * 60)
     admin_user_ids: str = ""
     rag_qa_requests_per_minute: int = Field(default=10, ge=1, le=1_000)
     app_env: Literal["development", "test", "production"] = "production"

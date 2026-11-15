@@ -23,6 +23,7 @@ playwright-report/
 test-results/
 
 # Runtime data
+runtime/
 data/*.sqlite3
 data/*.sqlite3-*
 data/uploads/
@@ -36,6 +37,13 @@ Thumbs.db
 
 # Project scratch
 work/
+review-inputs/
+.firecrawl/
+.npm-cache/
+.pip-cache/
+evidence/video-build/
+evidence/demo-raw.webm
+evidence/screenshots/video-debug.png
 
 # Local Netlify folder
 .netlify

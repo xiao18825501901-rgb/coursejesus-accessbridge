@@ -1,6 +1,8 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { clearGuestSession } from "./guestSession";
+
 /**
  * The refreshed shell publishes the verified Clerk session to the delivered
  * `api.js` through `window.CourseMateAuth`. Every browser journey so far ran with
@@ -8,14 +10,22 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
  * path had no coverage at all. These tests exercise it directly.
  */
 
-const getToken = vi.fn(async () => "clerk-session-token");
+const getToken = vi.fn<() => Promise<string | null>>(
+  async () => "clerk-session-token",
+);
 const openSignIn = vi.fn();
 const signOut = vi.fn(async () => undefined);
 let clerkLoaded = true;
+let clerkSignedIn = true;
+let mockClerkToken: string | null = "clerk-session-token";
 
 vi.mock("@clerk/react", () => ({
   ClerkProvider: ({ children }: { children: React.ReactNode }) => children,
-  useAuth: () => ({ getToken, isLoaded: clerkLoaded }),
+  useAuth: () => ({
+    getToken,
+    isLoaded: clerkLoaded,
+    isSignedIn: clerkSignedIn,
+  }),
   useClerk: () => ({ openSignIn, signOut }),
 }));
 
@@ -41,8 +51,18 @@ import { CourseMateUi } from "./CourseMateUi";
  */
 beforeEach(() => {
   clerkLoaded = true;
+  clerkSignedIn = true;
+  mockClerkToken = "clerk-session-token";
+  getToken.mockReset();
+  getToken.mockImplementation(async () => mockClerkToken);
   vi.stubEnv("VITE_CLERK_PUBLISHABLE_KEY", "pk_test_coursemate");
   vi.stubEnv("VITE_AUTH_TEST_TOKEN", "");
+  window.COURSEMATE_CONFIG = {
+    apiBase: "https://api.example.test/ui/api/ui/v1",
+  };
+  sessionStorage.clear();
+  clearGuestSession(window.COURSEMATE_CONFIG.apiBase);
+  vi.restoreAllMocks();
 });
 
 afterEach(() => {
@@ -109,19 +129,46 @@ describe("production Clerk auth bridge", () => {
     expect(window.CourseMateAuth).toBeUndefined();
   });
 
-  it("fails closed without a publishable key instead of rendering the shell", () => {
+  it("still offers the isolated public shell when Clerk is not configured", async () => {
     const previous = import.meta.env.VITE_CLERK_PUBLISHABLE_KEY;
     // A production build without Clerk must not silently render an unauthenticated
     // shell; it shows the configuration boundary instead.
     vi.stubEnv("VITE_CLERK_PUBLISHABLE_KEY", "");
     vi.stubEnv("VITE_AUTH_TEST_TOKEN", "");
     try {
-      const { container } = render(<CourseMateUi />);
-      expect(container.textContent).toContain("认证未配置");
-      expect(window.CourseMateAuth).toBeUndefined();
+      render(<CourseMateUi />);
+      expect(await screen.findByTestId("course-mate-app")).toBeVisible();
+      expect(window.CourseMateAuth?.canSignIn).toBe(false);
     } finally {
       vi.unstubAllEnvs();
       void previous;
     }
+  });
+
+  it("uses a server-issued guest session when Clerk is signed out", async () => {
+    clerkSignedIn = false;
+    mockClerkToken = null;
+    const guestToken = "cjg1.server.issued";
+    const fetchMock = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          token: guestToken,
+          expires_at: Math.floor(Date.now() / 1000) + 900,
+          expires_in_seconds: 900,
+          session_kind: "guest",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<CourseMateUi />);
+    await waitFor(() => expect(window.CourseMateAuth).toBeDefined());
+
+    await expect(window.CourseMateAuth?.getToken()).resolves.toBe(guestToken);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://api.example.test/ui/api/ui/v1/guest-session",
+      expect.objectContaining({ method: "POST", credentials: "omit" }),
+    );
   });
 });

@@ -1,0 +1,7 @@
+{
+  "full_exit_code": 0,
+  "production_exit_code": 0,
+  "checked_at": "2026-11-15T07:21:22.5687464Z",
+  "production_raw": "{\r\n  \"auditReportVersion\": 2,\r\n  \"vulnerabilities\": {},\r\n  \"metadata\": {\r\n    \"vulnerabilities\": {\r\n      \"info\": 0,\r\n      \"low\": 0,\r\n      \"moderate\": 0,\r\n      \"high\": 0,\r\n      \"critical\": 0,\r\n      \"total\": 0\r\n    },\r\n    \"dependencies\": {\r\n      \"prod\": 109,\r\n      \"dev\": 210,\r\n      \"optional\": 61,\r\n      \"peer\": 0,\r\n      \"peerOptional\": 0,\r\n      \"total\": 318\r\n    }\r\n  }\r\n}\r\n",
+  "full_raw": "{\r\n  \"auditReportVersion\": 2,\r\n  \"vulnerabilities\": {},\r\n  \"metadata\": {\r\n    \"vulnerabilities\": {\r\n      \"info\": 0,\r\n      \"low\": 0,\r\n      \"moderate\": 0,\r\n      \"high\": 0,\r\n      \"critical\": 0,\r\n      \"total\": 0\r\n    },\r\n    \"dependencies\": {\r\n      \"prod\": 109,\r\n      \"dev\": 210,\r\n      \"optional\": 61,\r\n      \"peer\": 0,\r\n      \"peerOptional\": 0,\r\n      \"total\": 318\r\n    }\r\n  }\r\n}\r\n"
+}

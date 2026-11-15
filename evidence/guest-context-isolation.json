@@ -1,0 +1,9 @@
+{
+  "status": "PASS",
+  "guest_contexts": 2,
+  "tokens_are_distinct": true,
+  "cross_context_pair_status": 404,
+  "guest_authority_session_storage_only": true,
+  "local_storage_contains_guest_authority": false,
+  "cookies_empty": true
+}

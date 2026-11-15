@@ -1,0 +1,77 @@
+{
+  "schema": "coursejesus.accessed-hacks.source-map.v1",
+  "captured_at": "2026-11-15T15:15:00+08:00",
+  "competition_workspace": "E:\\Hackathon-2026\\coursejesus-full-competition",
+  "baseline": {
+    "repository": "xiao18825501901-rgb/coursemate-ai",
+    "application_commit": "f195990b9e4a280d92be60bcf1e205dce032db95",
+    "competition_baseline_commit": "2ac73bbe1beaaeb48f6139055abc3ad2d8faca20",
+    "source_archive": "E:\\Hackathon-2026\\coursejesus-full-competition-source-f195990.zip",
+    "source_archive_sha256": "58041C63429596023D79395CEC9A1AE9925043E75E4B83570CC07A21360BCFFC"
+  },
+  "visual_source": {
+    "repository": "xiao18825501901-rgb/coursemate-ai",
+    "commit": "1074b612db87c97c9caff09b5a32bcc5360d7de0",
+    "branch": "fix/visual-quality-20261105",
+    "files": [
+      {
+        "source_path": "services/rag-api/app/visual/spec.py",
+        "source_sha256": "2d6a44b780faaec3a5b9bbe4563f3c7b766257f9f37d1d818ee2840bb000b0a2",
+        "bytes": 9256,
+        "local_path": "services/rag-api/app/visual/spec.py",
+        "local_sha256": "2D6A44B780FAAEC3A5B9BBE4563F3C7B766257F9F37D1D818EE2840BB000B0A2",
+        "modification": "none"
+      },
+      {
+        "source_path": "services/rag-api/app/visual/validators.py",
+        "source_sha256": "20d6ffaf0a4c6e571c82f03ea779e46223f661bc9da2565421b119031dfb307a",
+        "bytes": 5585,
+        "local_path": "services/rag-api/app/visual/validators.py",
+        "local_sha256": "20D6FFAF0A4C6E571C82F03EA779E46223F661BC9DA2565421B119031DFB307A",
+        "modification": "none in the full competition copy"
+      },
+      {
+        "source_path": "services/rag-api/app/visual/compiler.py",
+        "source_sha256": "8d04ca79802e16b648d4f0f5397730f51678fb6181e84735e9222fe31c43c806",
+        "bytes": 22229,
+        "local_path": "services/rag-api/app/visual/compiler.py",
+        "local_sha256": "8D04CA79802E16B648D4F0F5397730F51678FB6181E84735E9222FE31C43C806",
+        "modification": "none in the full competition copy"
+      }
+    ]
+  },
+  "rejected_base": {
+    "commit": "5b622b9d0bfde519cd3eb34e7229dbbcbbfcea5b",
+    "label": "CleanRebuild",
+    "reason": "Inspected as NanoJev research tooling rather than a compatible CourseJesus application scaffold"
+  },
+  "competition_period_areas": [
+    "services/rag-api/app/ui_extension/guest.py",
+    "services/rag-api/app/ui_extension/identity.py",
+    "services/rag-api/app/ui_extension/mount.py",
+    "services/rag-api/app/ui_extension/domain.py",
+    "services/rag-api/app/cm_update/app.py",
+    "services/rag-api/app/cm_update/auth.py",
+    "services/rag-api/app/cm_update/config.py",
+    "services/rag-api/app/cm_update/integration.py",
+    "services/rag-api/tests/test_public_guest_session.py",
+    "apps/web/src/guestSession.ts",
+    "apps/web/src/CourseMateUi.tsx",
+    "apps/web/src/ui/App.jsx",
+    "apps/web/src/ui/pages.jsx",
+    "apps/web/src/ui/DashboardQuickActions.tsx",
+    "apps/web/src/competition/",
+    "apps/web/src/ui/AccessBridgeDemo.jsx",
+    "apps/web/src/ui/AccessBridgeDiagram.jsx",
+    "tests/e2e/competition-public-guest.spec.ts",
+    "scripts/check_local_guest.py",
+    "scripts/prepare_competition_browser.py",
+    "scripts/purge_expired_guest_data.py",
+    "scripts/seed_local_smoke.py",
+    "scripts/start_competition.ps1",
+    "scripts/stop_competition.ps1"
+  ],
+  "private_inputs_excluded": [
+    "review-inputs/"
+  ]
+}

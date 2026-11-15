@@ -1,0 +1,11 @@
+
+ RUN  v4.1.12 E:/Hackathon-2026/coursejesus-full-competition/apps/web
+
+
+ Test Files  60 passed (60)
+      Tests  268 passed (268)
+   Start at  15:21:37
+   Duration  140.07s (transform 1.82s, setup 20.48s, import 6.57s, tests 14.20s, environment 84.90s)
+
+
+EXIT_CODE=0

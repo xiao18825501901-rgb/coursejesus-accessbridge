@@ -58,6 +58,11 @@ class Settings:
     api_base: str = field(default_factory=lambda: os.getenv('CMUI_PUBLIC_API_BASE', '/api/ui/v1'))
     web_dir: Path = field(default_factory=lambda: Path(__file__).resolve().parents[2] / 'web' / 'dist')
     verification_secret: str = field(default_factory=lambda: os.getenv('CMUI_VERIFICATION_SECRET', ''))
+    guest_session_secret: str = field(default_factory=lambda: os.getenv('GUEST_SESSION_SECRET', ''))
+    guest_session_enabled: bool = True
+    guest_session_ttl_seconds: int = field(
+        default_factory=lambda: int(os.getenv('GUEST_SESSION_TTL_SECONDS', '86400'))
+    )
     auto_verify_new_users: bool = field(default_factory=lambda: flag('CMUI_AUTO_VERIFY_NEW_USERS'))
     # Campus access is independent from the retained student-verification data.
     # The current owner policy admits every active authenticated account.  A
@@ -77,6 +82,8 @@ class Settings:
         if not 256<=self.prompt_tokens<=12000 or not 256<=self.answer_tokens<=16000: raise ValueError('Model output bounds invalid')
         if not 1024<=self.image_max_pixels<=16777216: raise ValueError('Image pixel bound invalid')
         if not 10<=self.timeout<=300: raise ValueError('Model timeout invalid')
+        if not 60 <= self.guest_session_ttl_seconds <= 7*24*60*60:
+            raise ValueError('Guest session TTL must be between 60 seconds and 7 days')
         if self.auth_mode not in {'development', 'clerk', 'injected'}:
             raise ValueError('Unsupported authentication mode')
         from .campus_access import validate_policy

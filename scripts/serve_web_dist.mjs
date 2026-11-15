@@ -27,9 +27,11 @@ import path from "node:path";
 const root = path.resolve(process.argv[2] ?? "apps/web/dist");
 const port = Number(process.argv[3] ?? 5273);
 const proxyTarget = (process.env.COURSEMATE_API_PROXY ?? "").trim();
-// `/api` is the deployed shape; `/ui-extension` is the RAG service's own mount path
-// for the UI extension, which is where the shell's API base points by default.
-const PROXY_PREFIXES = ["/api", "/ui-extension", "/health"];
+// `/api` is the deployed shape. The shell's default API base points beneath
+// `/ui-extension/api`; proxy only that API subtree so `/ui-extension/` itself
+// remains the static application document instead of inheriting the API's
+// deliberately strict JSON-response CSP.
+const PROXY_PREFIXES = ["/api", "/ui-extension/api", "/health"];
 
 function shouldProxy(pathname) {
   if (proxyTarget === "") return false;

@@ -1,0 +1,288 @@
+{
+  "lesson_id": "matrix-transform",
+  "title": {
+    "en": "Matrix transforms",
+    "zh": "矩阵变换"
+  },
+  "concept": {
+    "en": "Scale, rotate, and translate an object in a fixed order",
+    "zh": "按固定顺序缩放、旋转和平移对象"
+  },
+  "original_source_excerpt": {
+    "en": "This example uses homogeneous column vectors p=(x,y,1)^T. We choose scale S, then rotation R, then translation T, so p'=T R S p. This is an explicit example order, not a universal default. Affine translation uses homogeneous coordinates.",
+    "zh": "本例使用齐次列向量 p=(x,y,1)^T，明确选定先缩放 S、再旋转 R、最后平移 T，因此 p'=T R S p。这是本例约定，并非通用默认顺序；平移使用齐次坐标表示。"
+  },
+  "sources": [
+    {
+      "id": "AB-S1",
+      "title": {
+        "en": "Original synthetic transform note",
+        "zh": "原创变换说明"
+      },
+      "rights": "Original synthetic teaching text created for this competition; no school, course, or learner records.",
+      "text": {
+        "en": "This example uses homogeneous column vectors p=(x,y,1)^T. We choose scale S, then rotation R, then translation T, so p'=T R S p. This is an explicit example order, not a universal default. Affine translation uses homogeneous coordinates. For p=(1,0), scale uniformly by 2, rotate 90 degrees counterclockwise, then translate by (1,1): (1,0) -> (2,0) -> (0,2) -> (1,3). Reversing those operations gives (-2,4), not (1,3). Some special transforms commute; order does not always change the result.",
+        "zh": "本例使用齐次列向量 p=(x,y,1)^T，明确选定先缩放 S、再旋转 R、最后平移 T，因此 p'=T R S p。这是本例约定，并非通用默认顺序；平移使用齐次坐标表示。 对点 (1,0)，均匀放大 2 倍、逆时针旋转 90 度，再平移 (1,1)：(1,0) → (2,0) → (0,2) → (1,3)。把这些操作反序执行则得到 (-2,4)。部分特殊变换可交换次序，因此不能说换序后结果一定不同。"
+      }
+    }
+  ],
+  "steps": [
+    {
+      "id": "AB-S1",
+      "title": {
+        "en": "Start from coordinates",
+        "zh": "从坐标开始"
+      },
+      "body": {
+        "en": "Represent the point (1,0) as the homogeneous column vector (1,0,1)^T. This lets a 3x3 affine matrix express translation as well as scale and rotation.",
+        "zh": "将点 (1,0) 表示为齐次列向量 (1,0,1)^T。这样，3×3 仿射矩阵就能同时表示平移、缩放和旋转。"
+      },
+      "source_id": "AB-S1"
+    },
+    {
+      "id": "AB-S2",
+      "title": {
+        "en": "Apply one matrix at a time",
+        "zh": "每次应用一个矩阵"
+      },
+      "body": {
+        "en": "For this lesson only, apply S then R then T, giving p'=T R S p. The rightmost matrix acts first on a column vector; there is no universal default order.",
+        "zh": "本课明确约定依次执行 S、R、T，得到 p'=T R S p。对列向量而言，最右侧矩阵先作用；不存在通用默认顺序。"
+      },
+      "source_id": "AB-S1"
+    },
+    {
+      "id": "AB-S3",
+      "title": {
+        "en": "Compare the result",
+        "zh": "比较结果"
+      },
+      "body": {
+        "en": "Scale (1,0) by 2 to (2,0), rotate 90 degrees counterclockwise to (0,2), then add (1,1) to get (1,3). Reversing the operations gives (-2,4). Results can differ, though some special transformations commute.",
+        "zh": "将 (1,0) 放大 2 倍得到 (2,0)，逆时针旋转 90 度得到 (0,2)，再加 (1,1) 得到 (1,3)。反序执行得到 (-2,4)。结果可能不同，但某些特殊变换可以交换次序。"
+      },
+      "source_id": "AB-S1"
+    }
+  ],
+  "visual_spec": {
+    "visual_spec_version": "1.0",
+    "should_generate": true,
+    "pedagogical_reason": "Show this lesson's explicit column-vector order and the different numeric result from reversing the operations.",
+    "visual_goal": "Show homogeneous coordinates moving through scale by 2, rotate 90 degrees counterclockwise, then translate by (1,1).",
+    "visual_type": "DIAGRAM",
+    "renderer": "DETERMINISTIC_DIAGRAM",
+    "importance": "HIGH",
+    "timing": "INLINE",
+    "source_grounding": [
+      {
+        "source_id": "AB-S1",
+        "source_version": "1.0",
+        "locator": "synthetic-note/order",
+      "supported_claim": "The explicit TRS example maps (1,0) to (1,3), while reversing the operations maps it to (-2,4)."
+      }
+    ],
+    "must_include": [
+      "Homogeneous column-vector convention",
+      "Scale by 2 first",
+      "Rotate 90 degrees counterclockwise second",
+      "Translate by (1,1) third",
+      "Forward result (1,3)",
+      "Reversed-order result (-2,4)"
+    ],
+    "must_not_include": [
+      "A claim that one operation order is a universal default",
+      "An unstated coordinate convention"
+    ],
+    "exact_labels": [],
+    "equations": [
+      "p=(1,0,1)^T",
+      "p'=T R S p=(1,3,1)^T",
+      "p''=S R T p=(-2,4,1)^T"
+    ],
+    "code_elements": [],
+    "reference_assets": [],
+    "style": {
+      "tone": "MINIMAL",
+      "background": "light neutral",
+      "composition": "explicit TRS chain with worked point",
+      "camera": "",
+      "color_guidance": "neutral blue and grey"
+    },
+    "duration_seconds": null,
+    "aspect_ratio": "16:9",
+    "cost_tier": "FREE",
+    "confidence": 1.0,
+    "fallback_renderer": "DETERMINISTIC_DIAGRAM",
+    "cache_policy": "NO_CACHE",
+    "language": "en",
+    "motion_is_essential": false,
+    "semantic_precision": "EXACT",
+    "diagram": {
+      "layout": "LEFT_RIGHT",
+      "nodes": [
+        {
+          "id": "coords",
+          "label": "Coordinates",
+          "kind": "start"
+        },
+        {
+          "id": "scale",
+          "label": "Scale",
+          "kind": "operation"
+        },
+        {
+          "id": "rotate",
+          "label": "Rotate",
+          "kind": "operation"
+        },
+        {
+          "id": "translate",
+          "label": "Translate",
+          "kind": "operation"
+        }
+      ],
+      "edges": [
+        {
+          "from": "coords",
+          "to": "scale",
+          "kind": "step"
+        },
+        {
+          "from": "scale",
+          "to": "rotate",
+          "kind": "step"
+        },
+        {
+          "from": "rotate",
+          "to": "translate",
+          "kind": "step"
+        }
+      ]
+    },
+    "animation_steps": []
+  },
+  "alt_text": {
+    "en": "Homogeneous column vector (1,0,1), then scale by 2, rotate 90 degrees counterclockwise, and translate by (1,1), producing (1,3,1). Reversing the operations produces (-2,4,1).",
+    "zh": "齐次列向量 (1,0,1) 先放大 2 倍、再逆时针旋转 90 度、最后平移 (1,1)，得到 (1,3,1)；反序执行得到 (-2,4,1)。"
+  },
+  "long_description": {
+    "en": "This example uses homogeneous column vectors and the explicit order p'=T R S p. The point (1,0) becomes (2,0), then (0,2), then (1,3). Reversing the operations gives (-2,4).",
+    "zh": "本例使用齐次列向量，并明确采用 p′=T R S p 的顺序。点 (1,0) 依次变为 (2,0)、(0,2)、(1,3)；反序执行得到 (-2,4)。"
+  },
+  "glossary": [
+    {
+      "term": {
+        "en": "Scale",
+        "zh": "缩放"
+      },
+      "definition": {
+        "en": "Multiply coordinates to make the object larger or smaller.",
+        "zh": "通过乘法把对象变大或变小。"
+      }
+    },
+    {
+      "term": {
+        "en": "Rotate",
+        "zh": "旋转"
+      },
+      "definition": {
+        "en": "Turn coordinates around a fixed origin.",
+        "zh": "绕固定原点旋转坐标。"
+      }
+    },
+    {
+      "term": {
+        "en": "Translate",
+        "zh": "平移"
+      },
+      "definition": {
+        "en": "Shift coordinates without changing size or orientation.",
+        "zh": "平移坐标，不改变大小或方向。"
+      }
+    }
+  ],
+  "quiz": [
+    {
+      "id": "Q1",
+      "prompt": {
+        "en": "After scaling (1,0) by 2 and rotating 90 degrees counterclockwise, what point do you have before translation?",
+        "zh": "将 (1,0) 放大 2 倍并逆时针旋转 90 度后、平移前，得到哪个点？"
+      },
+      "options": [
+        {
+          "en": "(0,2)",
+          "zh": "(0,2)"
+        },
+        {
+          "en": "(1,3)",
+          "zh": "(1,3)"
+        },
+        {
+          "en": "(2,0)",
+          "zh": "(2,0)"
+        }
+      ],
+      "answer": 0,
+      "rationale": {
+        "en": "Scaling gives (2,0); a 90-degree counterclockwise rotation maps it to (0,2).",
+        "zh": "缩放后得到 (2,0)，再逆时针旋转 90 度得到 (0,2)。"
+      },
+      "source_id": "AB-S1"
+    },
+    {
+      "id": "Q2",
+      "prompt": {
+        "en": "After translating (0,2) by (1,1), what is the final point?",
+        "zh": "再将 (0,2) 平移 (1,1)，最终得到哪个点？"
+      },
+      "options": [
+        {
+          "en": "(1,3)",
+          "zh": "(1,3)"
+        },
+        {
+          "en": "(0,3)",
+          "zh": "(0,3)"
+        },
+        {
+          "en": "(2,1)",
+          "zh": "(2,1)"
+        }
+      ],
+      "answer": 0,
+      "rationale": {
+        "en": "Adding (1,1) to (0,2) gives (1,3). The composition is p'=T R S p for this explicit order.",
+        "zh": "将 (1,1) 加到 (0,2) 上得到 (1,3)。按本例明确顺序，矩阵合成为 p′=T R S p。"
+      },
+      "source_id": "AB-S1"
+    },
+    {
+      "id": "Q3",
+      "prompt": {
+        "en": "What is the reversed-order control result for translation, then rotation, then scaling?",
+        "zh": "反序执行平移、旋转、缩放时，对照结果是什么？"
+      },
+      "options": [
+        {
+          "en": "(-2,4)",
+          "zh": "(-2,4)"
+        },
+        {
+          "en": "(1,3)",
+          "zh": "(1,3)"
+        },
+        {
+          "en": "(-4,2)",
+          "zh": "(-4,2)"
+        }
+      ],
+      "answer": 0,
+      "rationale": {
+        "en": "Translation gives (2,1), rotation gives (-1,2), and scaling gives (-2,4). This differs from the forward result (1,3); some special transforms can still commute.",
+        "zh": "平移后得到 (2,1)，旋转后得到 (-1,2)，再缩放得到 (-2,4)。它与正序结果 (1,3) 不同；某些特殊变换仍可交换。"
+      },
+      "source_id": "AB-S1"
+    }
+  ],
+  "source_reference": "AB-S1 · original synthetic transform note"
+}

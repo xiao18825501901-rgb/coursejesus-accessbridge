@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, expect, test, vi } from "vitest";
 import { StrictMode, useState } from "react";
 import type { ReactNode } from "react";
@@ -73,9 +73,10 @@ test("mounted course frame translates navigation without changing route or cours
   const original=instance, route=instance.state.route;
   const fetchSpy=vi.spyOn(globalThis,"fetch");
   fireEvent.click(screen.getByRole("button",{name:"English"}));
+  const courseNavigation = document.querySelector(".side-nav") as HTMLElement;
   expect(screen.getByRole("button",{name:"All courses"})).toBeVisible();
-  expect(screen.getByRole("button",{name:"Discussion"})).toBeVisible();
-  expect(screen.getByRole("button",{name:"Learn"})).toBeVisible();
+  expect(within(courseNavigation).getByRole("button",{name:"Discussion"})).toBeVisible();
+  expect(within(courseNavigation).getByRole("button",{name:"Learn"})).toBeVisible();
   expect(screen.getByText(/^Private course · Only you/)).toBeVisible();
   expect(screen.getByText("用户 Qwen 课程")).toBeVisible();
   expect(instance).toBe(original);
@@ -97,11 +98,22 @@ test("actual entry StrictMode replay still delivers original preview and ignores
       scope:"private",mime:"text/plain"}],loading:false});
   });
   let resolveStale!: (response: Response) => void;
+  let previewCalls = 0;
   const response = (text: string) => new Response(JSON.stringify({pages:[{text}]}),
     {status:200,headers:{"Content-Type":"application/json"}});
-  const fetchSpy = vi.spyOn(globalThis,"fetch")
-    .mockImplementationOnce(() => new Promise<Response>(resolve => { resolveStale = resolve; }))
-    .mockResolvedValueOnce(response("当前挂载原始正文 Qwen"));
+  vi.spyOn(globalThis,"fetch").mockImplementation(input => {
+    const url = String(input);
+    if (url.endsWith("/knowledge-build-status"))
+      return Promise.resolve(new Response(JSON.stringify({status:"READY"}), {
+        status:200,headers:{"Content-Type":"application/json"}
+      }));
+    previewCalls += 1;
+    if (previewCalls === 1)
+      return new Promise<Response>(resolve => { resolveStale = resolve; });
+    if (previewCalls === 2)
+      return Promise.resolve(response("当前挂载原始正文 Qwen"));
+    return Promise.reject(new Error(`unexpected preview fetch ${previewCalls}`));
+  });
   render(<StrictMode><FilesWithPreview /></StrictMode>);
   fireEvent.click(screen.getByRole("button",{name:/^原文件\.txt\s*仅自己$/}));
   expect(await screen.findByText("当前挂载原始正文 Qwen")).toBeVisible();
@@ -111,7 +123,7 @@ test("actual entry StrictMode replay still delivers original preview and ignores
   fireEvent.click(screen.getByRole("button",{name:"English"}));
   expect(screen.getByText("当前挂载原始正文 Qwen")).toBeVisible();
   expect(screen.getByRole("button",{name:"Download"})).toBeVisible();
-  expect(fetchSpy).toHaveBeenCalledTimes(2);
+  expect(previewCalls).toBe(2);
 });
 
 test.each(["用户原始 Qwen 正文，不得翻译。", ""])(
@@ -120,20 +132,30 @@ test.each(["用户原始 Qwen 正文，不得翻译。", ""])(
       this.setState({files:[{id:"file-original",name:"原文件.txt",folder:"",size:12,
         scope:"private",mime:"text/plain"}],loading:false});
     });
-    const fetchSpy = vi.spyOn(globalThis,"fetch").mockResolvedValue(new Response(
-      JSON.stringify({pages:text ? [{text}] : []}), {status:200,headers:{"Content-Type":"application/json"}}
-    ));
+    let previewCalls = 0;
+    vi.spyOn(globalThis,"fetch").mockImplementation(input => {
+      const url = String(input);
+      if (url.endsWith("/knowledge-build-status"))
+        return Promise.resolve(new Response(JSON.stringify({status:"READY"}), {
+          status:200,headers:{"Content-Type":"application/json"}
+        }));
+      previewCalls += 1;
+      return Promise.resolve(new Response(
+        JSON.stringify({pages:text ? [{text}] : []}),
+        {status:200,headers:{"Content-Type":"application/json"}}
+      ));
+    });
     render(<FilesWithPreview />);
     fireEvent.click(screen.getByRole("button",{name:/^原文件\.txt\s*仅自己$/}));
     if (text) expect(await screen.findByText(text)).toBeVisible();
     else expect(await screen.findByText("暂不支持预览此文件，可下载查看")).toBeVisible();
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(previewCalls).toBe(1);
     fireEvent.click(screen.getByRole("button",{name:"English"}));
     expect(screen.getByText(/Course material preview/)).toBeVisible();
     if (text) expect(screen.getByText(text)).toBeVisible();
     else expect(screen.getByText("Preview is unavailable for this file. Download it to view")).toBeVisible();
     expect(screen.getByRole("button",{name:"Download"})).toBeVisible();
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(previewCalls).toBe(1);
   }
 );
 

@@ -12,6 +12,7 @@ type DashboardQuickActionsProps = {
   onImportCanvas: () => void;
   onCreateCourse: () => void;
   onViewAllCourses: () => void;
+  canManage?: boolean;
 };
 
 function CourseGridIcon() {
@@ -35,10 +36,15 @@ export function DashboardQuickActions({
   onImportCanvas,
   onCreateCourse,
   onViewAllCourses,
+  canManage = true,
 }: DashboardQuickActionsProps) {
   const actions = [
-    { key: "canvas", label: importCanvasLabel, icon: importCanvasIcon, onClick: onImportCanvas },
-    { key: "course", label: createCourseLabel, icon: createCourseIcon, onClick: onCreateCourse },
+    ...(canManage
+      ? [
+          { key: "canvas", label: importCanvasLabel, icon: importCanvasIcon, onClick: onImportCanvas },
+          { key: "course", label: createCourseLabel, icon: createCourseIcon, onClick: onCreateCourse },
+        ]
+      : []),
     { key: "all", label: viewAllCoursesLabel, icon: <CourseGridIcon />, onClick: onViewAllCourses },
   ];
 

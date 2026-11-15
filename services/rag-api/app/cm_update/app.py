@@ -40,6 +40,7 @@ from app.jev.capability_router import (
 from app.jev.service import SemanticDecisionService, TemplateOption
 from app.learning.intent_commands import route_explicit_command
 from app.learning.question_runtime import GeneratedExercise
+from app.ui_extension.guest import GuestSessionAuthority, prune_expired_guest_data
 
 from . import classification as classification_state
 from . import share_recovery, social, templates
@@ -281,7 +282,15 @@ def audit_answer_citations(
     return citations
 
 
-def create_app(settings: Settings|None=None, *, provider=None, domain=None, subject_resolver=None, jev: SemanticDecisionService|None=None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    *,
+    provider=None,
+    domain=None,
+    subject_resolver=None,
+    jev: SemanticDecisionService | None = None,
+    guest_sessions: GuestSessionAuthority | None = None,
+) -> FastAPI:
     cfg=settings or Settings()
     cfg.validate()
     if cfg.integration_mode=='integrated' and domain is None:
@@ -496,6 +505,7 @@ def create_app(settings: Settings|None=None, *, provider=None, domain=None, subj
     app.state.cfg,app.state.db,app.state.provider,app.state.domain=cfg,db,model,domain
     app.state.jobs=jobs
     app.state.subject_resolver=subject_resolver
+    app.state.guest_sessions=guest_sessions
     app.add_middleware(CORSMiddleware,allow_origins=list(cfg.allowed_origins),allow_credentials=True,
         allow_methods=['GET','POST','PATCH','PUT','DELETE','HEAD'],allow_headers=['Authorization','Content-Type','Last-Event-ID'])
     if cfg.environment!='production':
@@ -650,9 +660,23 @@ def create_app(settings: Settings|None=None, *, provider=None, domain=None, subj
             'student_verification_required_for_campus':cfg.campus_access_mode!='open_to_registered',
             'verification_effective_at':cfg.verification_effective_at or None,
             'reasoning_policy':{'strength':FORCED_REASONING_STRENGTH,'application_usd_cap':None},
+            'guest_sessions_enabled':bool(guest_sessions),
             'visual_engine_enabled':bool(cfg.visual_engine_enabled),
             'visual_auto_enabled':bool(cfg.visual_auto_enabled),
             'visual_video_enabled':bool(cfg.visual_video_enabled)}
+
+    @r.post('/guest-session')
+    def create_guest_session():
+        if not cfg.guest_session_enabled or guest_sessions is None:
+            raise HTTPException(
+                503,
+                {
+                    'code': 'GUEST_SESSIONS_UNAVAILABLE',
+                    'message': 'Public guest sessions are not configured.',
+                },
+            )
+        prune_expired_guest_data(db, cfg.guest_session_ttl_seconds)
+        return guest_sessions.issue()
 
     @r.post('/dev/login')
     async def dev_login(request:Request,response:Response):

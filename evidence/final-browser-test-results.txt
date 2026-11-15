@@ -1,0 +1,17 @@
+database=E:\Hackathon-2026\coursejesus-full-competition\runtime\competition-browser-37324-1794727877636\rag.sqlite3
+uploads=E:\Hackathon-2026\coursejesus-full-competition\runtime\competition-browser-37324-1794727877636\uploads
+
+Running 4 tests using 1 worker
+
+(node:38520) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+database=E:\Hackathon-2026\coursejesus-full-competition\runtime\competition-browser-38520-1794727886181\rag.sqlite3
+uploads=E:\Hackathon-2026\coursejesus-full-competition\runtime\competition-browser-38520-1794727886181\uploads
+  ok 1 tests\e2e\competition-public-guest.spec.ts:74:5 › anonymous guest can use the complete public shell without host controls (2.5s)
+  ok 2 tests\e2e\competition-public-guest.spec.ts:169:5 › narrow viewports and 200 percent reflow preserve course access (1.4s)
+  ok 3 tests\e2e\competition-public-guest.spec.ts:206:5 › AccessBridge lessons are keyboard-operable, accessible, and offline-ready (3.1s)
+  ok 4 tests\e2e\competition-public-guest.spec.ts:357:5 › two guest browser contexts remain isolated (1.3s)
+
+  4 passed (19.7s)
+
+EXIT_CODE=0

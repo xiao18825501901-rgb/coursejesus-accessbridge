@@ -71,6 +71,8 @@
     "sessionExpired": "登录已过期，请重新登录",
     "signInToContinue": "登录后继续",
     "notConfigured": "登录服务暂未配置",
+    "publicGuest": "公开访客",
+    "publicGuestDescription": "你正在使用独立的临时访客空间。练习与生成历史不会写入学生成绩或正式学习记录。",
     "slogan": "From Confusion to Revelation",
     "connectingBrand": "正在连接 {{brand}}…",
     "localIntegration": "本地联调模式 · 真实 SQLite 数据",
@@ -92,12 +94,16 @@
     "closeSidebar": "关闭侧栏",
     "account": "账户",
     "dashboard": "控制面板",
+    "accessbridge": "学习",
     "courses": "课程",
     "calendar": "日历",
     "inbox": "收件箱",
     "help": "帮助",
     "mainLabel": "主导航",
     "courseLabel": "课程导航"
+  },
+  "accessbridge": {
+    "deterministicNote": "确定性 VisualSpec 风格 SVG；不调用远程模型或 GPU"
   },
   "dashboard": {
     "title": "控制面板",
@@ -113,7 +119,7 @@
     "interfaceLanguage": "界面语言",
     "chinese": "中文",
     "english": "English",
-    "languageNotice": "只切换界面，不改变教学和题目语言",
+    "languageNotice": "切换界面、课程讲解和练习语言",
     "themeSaveFailed": "主题已在本机切换，但服务器保存失败：{{error}}"
   },
   "courses": {
@@ -141,6 +147,7 @@
     "sharedMaterialsPrivateHistory": "课程共享资料 · 个人学习记录",
     "privateCourseNote": "私人课程 · 仅自己可见",
     "publicCourse": "公开课程",
+    "publicGuestNotice": "公开访客可浏览已授权课程、知识点、资料与练习；课程管理、正式成绩和学习档案不可用。",
     "learningSpace": "学习空间",
     "returnAll": "返回所有课程",
     "pin": "添加到控制面板",

@@ -1,0 +1,15 @@
+
+> @coursemate/agent-api@0.1.0 test
+> vitest run --pool=threads --maxWorkers=1
+
+
+ RUN  v4.1.12 E:/Hackathon-2026/coursejesus-full-competition/services/agent-api
+
+
+ Test Files  13 passed (13)
+      Tests  100 passed (100)
+   Start at  15:23:59
+   Duration  5.19s (transform 234ms, setup 0ms, import 1.75s, tests 366ms, environment 1ms)
+
+
+EXIT_CODE=0

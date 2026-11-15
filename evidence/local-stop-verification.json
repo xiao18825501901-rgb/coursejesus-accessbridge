@@ -1,0 +1,8 @@
+{
+  "status": "PASS",
+  "stopped_at": "2026-11-15T07:04:02.7894349Z",
+  "state_file_exists": false,
+  "remaining_listeners": 0,
+  "api_process_stopped": true,
+  "web_process_stopped": true
+}

@@ -1,0 +1,60 @@
+{
+  "status": "PASS",
+  "checked_at": "2026-11-15T07:31:37.756Z",
+  "browser": "Google Chrome (installed executable)",
+  "axe_version": "4.10.2",
+  "checks": [
+    "ANONYMOUS_GUEST_DASHBOARD",
+    "PUBLIC_COURSE_VISIBLE",
+    "PRIVATE_COURSE_HIDDEN",
+    "HOST_MANAGEMENT_CONTROLS_HIDDEN",
+    "COURSE_FILES_AND_LEARNING_ROUTES_LOAD",
+    "KEYBOARD_ACCOUNT_DRAWER",
+    "BILINGUAL_LANGUAGE_TOGGLE",
+    "THEME_TOGGLE",
+    "AXE_WCAG_A_AA_ZERO_VIOLATIONS",
+    "VIEWPORT_360_390_768",
+    "WCAG_200_PERCENT_REFLOW_640",
+    "TWO_GUEST_CONTEXTS_ISOLATED",
+    "NO_LOCAL_STORAGE_OR_COOKIES",
+    "NO_CONSOLE_OR_PAGE_ERRORS",
+    "NO_FAILED_HTTP_REQUESTS",
+    "ACCESSBRIDGE_THREE_LESSONS",
+    "ACCESSBRIDGE_KEYBOARD_LESSON_AND_SOURCE",
+    "ACCESSBRIDGE_BILINGUAL_QUIZ_FEEDBACK",
+    "ACCESSBRIDGE_LARGE_TEXT",
+    "ACCESSBRIDGE_SELF_CONTAINED_OFFLINE_DOWNLOAD",
+    "ACCESSBRIDGE_AXE_WCAG_A_AA_ZERO_VIOLATIONS",
+    "ACCESSBRIDGE_RESPONSIVE_390_AND_200_PERCENT_REFLOW_640"
+  ],
+  "axe_violation_counts": {
+    "critical": 0,
+    "serious": 0,
+    "moderate": 0,
+    "minor": 0
+  },
+  "viewports": [
+    360,
+    390,
+    640,
+    768,
+    1280
+  ],
+  "guest_contexts": 2,
+  "cross_context_pair_status": 404,
+  "screenshot_files": [
+    "complete-site-guest-desktop.png",
+    "complete-site-guest-mobile-360.png",
+    "complete-site-guest-mobile-390.png",
+    "complete-site-guest-tablet.png",
+    "complete-site-guest-zoom200-reflow.png",
+    "complete-site-accessbridge-desktop.png",
+    "complete-site-accessbridge-mobile-390.png",
+    "complete-site-accessbridge-zoom200-reflow.png",
+    "AccessBridge_matrix-transform_en.html"
+  ],
+  "console_errors": [],
+  "page_errors": [],
+  "failed_requests": [],
+  "representative_course_e2e": "BLOCKED_OWNER"
+}

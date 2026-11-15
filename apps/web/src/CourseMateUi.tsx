@@ -4,6 +4,10 @@ import { useEffect, useState } from "react";
 
 import { App as CourseMateApp } from "./ui/App.jsx";
 import { BRAND } from "./brand";
+import {
+  clearGuestSession,
+  getGuestSessionToken,
+} from "./guestSession";
 import { UiLocaleProvider } from "./ui/UiLocale";
 
 import "./ui/styles.css";
@@ -21,6 +25,7 @@ interface CourseMateAuthBridge {
   subscribe: (listener: () => void) => () => void;
   signIn: () => void;
   signOut: () => Promise<void>;
+  canSignIn?: boolean;
 }
 
 declare global {
@@ -41,6 +46,14 @@ declare global {
  */
 const testToken = import.meta.env.VITE_AUTH_TEST_TOKEN;
 
+function currentApiBase(): string {
+  return (
+    window.COURSEMATE_CONFIG?.apiBase ??
+    import.meta.env.VITE_UI_API_BASE ??
+    "/ui-extension/api/ui/v1"
+  );
+}
+
 function TestAuthBridge({ token }: { token: string }) {
   const [bridgeReady, setBridgeReady] = useState(false);
 
@@ -50,12 +63,36 @@ function TestAuthBridge({ token }: { token: string }) {
       subscribe: () => () => undefined,
       signIn: () => undefined,
       signOut: async () => undefined,
+      canSignIn: false,
     };
     setBridgeReady(true);
     return () => {
       delete window.CourseMateAuth;
     };
   }, [token]);
+
+  return bridgeReady ? <UiLocaleProvider><CourseMateApp /></UiLocaleProvider> : null;
+}
+
+function GuestOnlyAuthBridge() {
+  const [bridgeReady, setBridgeReady] = useState(false);
+
+  useEffect(() => {
+    const apiBase = currentApiBase();
+    window.CourseMateAuth = {
+      getToken: () => getGuestSessionToken(apiBase),
+      subscribe: () => () => undefined,
+      signIn: () => undefined,
+      signOut: async () => {
+        clearGuestSession(apiBase);
+      },
+      canSignIn: false,
+    };
+    setBridgeReady(true);
+    return () => {
+      delete window.CourseMateAuth;
+    };
+  }, []);
 
   return bridgeReady ? <UiLocaleProvider><CourseMateApp /></UiLocaleProvider> : null;
 }
@@ -69,14 +106,26 @@ function TestAuthBridge({ token }: { token: string }) {
  * bearer token is never handed to React through an environment variable.
  */
 function AuthBridge() {
-  const { getToken, isLoaded } = useAuth();
+  const { getToken, isLoaded, isSignedIn } = useAuth();
   const clerk = useClerk();
   const [bridgeReady, setBridgeReady] = useState(false);
 
   useEffect(() => {
     window.CourseMateAuth = {
-      getToken: () => getToken(),
-      subscribe: () => () => undefined,
+      getToken: async () => {
+        if (isSignedIn) {
+          return getToken();
+        }
+        return getGuestSessionToken(currentApiBase());
+      },
+      subscribe: (listener) => {
+        const addListener = (
+          clerk as typeof clerk & {
+            addListener?: (handler: () => void) => () => void;
+          }
+        ).addListener;
+        return addListener ? addListener(listener) : () => undefined;
+      },
       signIn: () => {
         // The signed-out login card only exists inside the new shell document,
         // and the shell is the default entry at `/`, so after sign-in Clerk must
@@ -87,13 +136,15 @@ function AuthBridge() {
       },
       signOut: async () => {
         await clerk.signOut();
+        clearGuestSession(currentApiBase());
       },
+      canSignIn: true,
     };
     setBridgeReady(true);
     return () => {
       delete window.CourseMateAuth;
     };
-  }, [clerk, getToken]);
+  }, [clerk, getToken, isSignedIn]);
 
   return bridgeReady && isLoaded ? <UiLocaleProvider><CourseMateApp /></UiLocaleProvider> : null;
 }
@@ -104,14 +155,7 @@ export function CourseMateUi() {
     return <TestAuthBridge token={testToken} />;
   }
   if (!publishableKey) {
-    return (
-      <div className="login-page">
-        <div className="login-card">
-          <h1>认证未配置</h1>
-          <p>部署时需要设置 VITE_CLERK_PUBLISHABLE_KEY。</p>
-        </div>
-      </div>
-    );
+    return <GuestOnlyAuthBridge />;
   }
   return (
     <ClerkProvider publishableKey={publishableKey}>
