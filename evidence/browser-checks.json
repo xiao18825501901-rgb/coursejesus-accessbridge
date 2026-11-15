@@ -1,6 +1,6 @@
 {
   "status": "PASS",
-  "checked_at": "2026-11-15T07:31:37.756Z",
+  "checked_at": "2026-11-15T07:49:03.697Z",
   "browser": "Google Chrome (installed executable)",
   "axe_version": "4.10.2",
   "checks": [
@@ -25,7 +25,8 @@
     "ACCESSBRIDGE_LARGE_TEXT",
     "ACCESSBRIDGE_SELF_CONTAINED_OFFLINE_DOWNLOAD",
     "ACCESSBRIDGE_AXE_WCAG_A_AA_ZERO_VIOLATIONS",
-    "ACCESSBRIDGE_RESPONSIVE_390_AND_200_PERCENT_REFLOW_640"
+    "ACCESSBRIDGE_RESPONSIVE_390_AND_200_PERCENT_REFLOW_640",
+    "PUBLIC_STATIC_ENTRY_NO_ACCOUNT_OR_API"
   ],
   "axe_violation_counts": {
     "critical": 0,
@@ -51,6 +52,8 @@
     "complete-site-accessbridge-desktop.png",
     "complete-site-accessbridge-mobile-390.png",
     "complete-site-accessbridge-zoom200-reflow.png",
+    "public-accessbridge-entry-desktop.png",
+    "public-accessbridge-entry-mobile-390.png",
     "AccessBridge_matrix-transform_en.html"
   ],
   "console_errors": [],

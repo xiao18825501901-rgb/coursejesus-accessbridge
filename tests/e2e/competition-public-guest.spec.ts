@@ -354,6 +354,75 @@ test("AccessBridge lessons are keyboard-operable, accessible, and offline-ready"
   expect(failedRequests).toEqual([]);
 });
 
+test("public static judging entry needs no account or API", async ({ page }, testInfo) => {
+  fs.mkdirSync(screenshotDirectory, { recursive: true });
+  const consoleErrors: string[] = [];
+  const pageErrors: string[] = [];
+  const failedRequests: string[] = [];
+  const apiRequests: string[] = [];
+  page.on("console", (message) => {
+    if (message.type() === "error") consoleErrors.push(message.text());
+  });
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+  page.on("requestfailed", (request) => failedRequests.push(request.url()));
+  page.on("request", (request) => {
+    if (request.url().includes("/ui-extension/api/")) {
+      apiRequests.push(request.url());
+    }
+  });
+
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.goto("/accessbridge.html");
+  await expect(
+    page.getByRole("heading", {
+      level: 1,
+      name: "AccessBridge 分步学习",
+    }),
+  ).toBeVisible();
+  await expect(page.getByText("Public judging demo", { exact: true })).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: /广度优先与深度优先搜索/ }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: /矩阵变换/ }),
+  ).toBeVisible();
+  await page.screenshot({
+    path: path.join(screenshotDirectory, "public-accessbridge-entry-desktop.png"),
+    fullPage: true,
+  });
+
+  const accessibility = await new AxeBuilder({ page })
+    .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"])
+    .analyze();
+  for (const violation of accessibility.violations) {
+    testInfo.annotations.push({
+      type: `axe-public-entry:${violation.impact ?? "unknown"}`,
+      description: `${violation.id}: ${violation.help}`,
+    });
+  }
+  expect(
+    accessibility.violations,
+    accessibility.violations
+      .map((violation) => `${violation.id}: ${violation.help}`)
+      .join("\n"),
+  ).toEqual([]);
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  const overflow = await page.evaluate(
+    () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+  );
+  expect(overflow).toBeLessThanOrEqual(1);
+  await page.screenshot({
+    path: path.join(screenshotDirectory, "public-accessbridge-entry-mobile-390.png"),
+    fullPage: true,
+  });
+
+  expect(apiRequests).toEqual([]);
+  expect(consoleErrors).toEqual([]);
+  expect(pageErrors).toEqual([]);
+  expect(failedRequests).toEqual([]);
+});
+
 test("two guest browser contexts remain isolated", async ({ browser }) => {
   const contextA = await browser.newContext();
   const contextB = await browser.newContext();
@@ -445,6 +514,7 @@ test.afterAll(async () => {
       "ACCESSBRIDGE_SELF_CONTAINED_OFFLINE_DOWNLOAD",
       "ACCESSBRIDGE_AXE_WCAG_A_AA_ZERO_VIOLATIONS",
       "ACCESSBRIDGE_RESPONSIVE_390_AND_200_PERCENT_REFLOW_640",
+      "PUBLIC_STATIC_ENTRY_NO_ACCOUNT_OR_API",
     ],
     axe_violation_counts: {
       critical: 0,
@@ -464,6 +534,8 @@ test.afterAll(async () => {
       "complete-site-accessbridge-desktop.png",
       "complete-site-accessbridge-mobile-390.png",
       "complete-site-accessbridge-zoom200-reflow.png",
+      "public-accessbridge-entry-desktop.png",
+      "public-accessbridge-entry-mobile-390.png",
       "AccessBridge_matrix-transform_en.html",
     ],
     console_errors: [],

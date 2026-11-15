@@ -1,0 +1,24 @@
+{
+  "schema": "coursejesus.accessed-hacks.live-access.v1",
+  "status": "VERIFIED_LIVE",
+  "captured_at": "2026-11-15T15:49:03.697Z",
+  "url": "https://coursejesus-accessbridge.netlify.app/",
+  "netlify_site_id": "b1d3fb90-daad-42a3-962b-84608e74c2be",
+  "deploy_id": "6af963d2e77de0e9a286931a",
+  "anonymous": true,
+  "http_status": 200,
+  "title": "CourseJesus — AccessBridge",
+  "heading": "AccessBridge 分步学习",
+  "lesson_count": 3,
+  "console_errors": [],
+  "failed_requests": [],
+  "api_requests": [],
+  "security_headers": {
+    "strict_transport_security": true,
+    "x_content_type_options": "nosniff",
+    "x_frame_options": "DENY",
+    "referrer_policy": "strict-origin-when-cross-origin"
+  },
+  "screenshot": "evidence/screenshots/live-public-accessbridge.png",
+  "boundary": "The public host serves the deterministic AccessBridge learning surface. The complete FastAPI guest API is verified only in the local isolated runtime."
+}

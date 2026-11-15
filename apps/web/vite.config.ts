@@ -162,6 +162,7 @@ export default defineConfig({
       input: {
         main: "index.html",
         ui: "ui.html",
+        accessbridge: "accessbridge.html",
       },
     },
   },

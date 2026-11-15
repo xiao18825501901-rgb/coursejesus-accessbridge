@@ -1,0 +1,29 @@
+[build]
+  command = "npm run build --workspace @coursemate/web"
+  publish = "apps/web/dist"
+
+[build.environment]
+  NODE_VERSION = "24.14.0"
+
+# The public judging entry is a static, deterministic learning surface. The
+# complete guest shell requires the FastAPI guest service and is run locally
+# from the source archive; this static host does not pretend to provide it.
+[[redirects]]
+  from = "/"
+  to = "/accessbridge.html"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/*"
+  to = "/accessbridge.html"
+  status = 200
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    Strict-Transport-Security = "max-age=31536000; includeSubDomains"
+    X-Content-Type-Options = "nosniff"
+    X-Frame-Options = "DENY"
+    Referrer-Policy = "strict-origin-when-cross-origin"
+    Permissions-Policy = "camera=(), microphone=(), geolocation=()"
