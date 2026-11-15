@@ -1,0 +1,41 @@
+{
+  "schema": "coursejesus.accessed-hacks.package-audit.v1",
+  "captured_at": "2026-11-15T16:05:37+08:00",
+  "status": "PASS",
+  "source_commit": "8b1f9bd",
+  "packages": [
+    {
+      "path": "submission/CourseJesus_AccessBridge_Source_20261115.zip",
+      "bytes": 9789148,
+      "entries": 1082,
+      "sha256": "c6345009251535f910dec9a2ec1c6474eda44d106ec89a009be819c0e4f8b613",
+      "forbidden_entry_count": 0
+    },
+    {
+      "path": "submission/CourseJesus_AccessBridge_Demo_20261115.zip",
+      "bytes": 6056835,
+      "entries": 54,
+      "sha256": "405b980d224639e2c20e0e2cabafb3fee16a7cd15e46d7a535a3dae1cb20fb91",
+      "forbidden_entry_count": 0
+    }
+  ],
+  "demo_package_run": {
+    "status": "PASS",
+    "http_status": 200,
+    "accessbridge_document_served": true,
+    "listener_closed_after_check": true,
+    "evidence": "evidence/final-demo-package-verification.json"
+  },
+  "excluded": [
+    ".git",
+    ".env and populated environment files",
+    "node_modules",
+    ".venv",
+    "runtime data",
+    "databases",
+    "uploads",
+    "review-only inputs",
+    "private media",
+    "credentials and model weights"
+  ]
+}

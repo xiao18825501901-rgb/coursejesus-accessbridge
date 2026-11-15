@@ -1,0 +1,9 @@
+{
+  "status": "PASS",
+  "package": "submission/CourseJesus_AccessBridge_Demo_20261115.zip",
+  "http_status": 200,
+  "title_contains_accessbridge": true,
+  "content_bytes": 1334,
+  "server_pid": 8652,
+  "verified_at": "2026-11-15T08:05:37.6432215Z"
+}
