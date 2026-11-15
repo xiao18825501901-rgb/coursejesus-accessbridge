@@ -73,6 +73,12 @@
     "scripts/start_competition.ps1",
     "scripts/stop_competition.ps1",
     "scripts/prepare_netlify_demo.ps1",
+    "scripts/verify_live_accessbridge.mjs",
+    "scripts/make_hash_manifest.py",
+    "scripts/package_submission.ps1",
+    "scripts/scan_release_security.ps1",
+    "submission/PUBLIC_RELEASE.md",
+    "submission/DEMO_RUN.md",
     "netlify.competition.toml"
   ],
   "private_inputs_excluded": [

@@ -113,7 +113,10 @@
   },
   "external_status": {
     "public_full_stack_demo": "BLOCKED_ACCOUNT",
-    "public_github_repository_and_release": "NOT_DONE",
+    "public_github_repository_and_release": "VERIFIED_LIVE",
+    "public_github_branch": "full-coursejesus-app-20261115",
+    "public_github_tag": "accessed-hacks-submission-20261115",
+    "public_github_release_url": "https://github.com/xiao18825501901-rgb/coursejesus-accessbridge/releases/tag/accessed-hacks-submission-20261115",
     "accessed_rules_live_readback": "VERIFIED_LIVE",
     "devpost_submission": "NOT_SUBMITTED",
     "temporary_delivery_cleanup": "BLOCKED_POLICY",
@@ -123,6 +126,7 @@
     "The synthetic public/private fixtures prove guest isolation behavior; they are not the owner representative course.",
     "Zero axe violations are evidence for the tested Chromium pages, not WCAG certification.",
     "The public Netlify entry is VERIFIED_LIVE for the API-independent AccessBridge component only.",
-    "Static-only hosting cannot prove the FastAPI guest API, so public full-stack behavior remains BLOCKED_ACCOUNT."
+    "Static-only hosting cannot prove the FastAPI guest API, so public full-stack behavior remains BLOCKED_ACCOUNT.",
+    "The public GitHub branch, tag, and Release were read back after publication; the repository's existing main branch was not rewritten."
   ]
 }

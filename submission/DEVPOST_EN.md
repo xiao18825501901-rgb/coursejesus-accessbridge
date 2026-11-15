@@ -25,6 +25,13 @@ backend service, model, GPU, or private learner data. The complete guest shell
 and its FastAPI visitor-isolation boundary are verified in the source copy and
 run locally; the static host does not pretend to be that full-stack service.
 
+The full competition source is public on the independent
+[`full-coursejesus-app-20261115` branch](https://github.com/xiao18825501901-rgb/coursejesus-accessbridge/tree/full-coursejesus-app-20261115)
+and in the
+[AccessED Hacks release](https://github.com/xiao18825501901-rgb/coursejesus-accessbridge/releases/tag/accessed-hacks-submission-20261115).
+CourseJesus-authored code remains rights-retained and is not presented as an OSI
+open-source grant.
+
 AccessBridge currently includes three original bilingual lessons:
 
 - stack and queue order;
@@ -115,8 +122,8 @@ demo**. The owner still needs to create the representative course and knowledge
 point, after which the team must verify course, tree, current live image/video,
 historical visual, practice, and feedback in one recorded flow. Production RAG
 and Agent E2E, authenticated production account isolation, public full-stack
-hosting, a public GitHub release, human educator review, and measured learning
-improvement are not claimed.
+hosting, human educator review, and measured learning improvement are not
+claimed.
 
 The official AccessED rules were re-read on 2026-11-15. The recorded deadline is
 2026-11-21 06:00 UTC+8. Entrants must be students above the legal age of
@@ -127,9 +134,9 @@ required.
 
 The next milestone is a representative-course E2E with a visibly separate
 current generation and historical work. After that, the same build should be
-published under an independent full-stack URL, tested anonymously, packaged
-with rights-retained source, and submitted only after the owner confirms current
-rules, eligibility, and final identity declarations.
+published under an independent full-stack URL and tested anonymously. The
+public source and deterministic judging experience are already available;
+Devpost submission waits for the owner content and final identity declarations.
 
 ## Built with
 

@@ -34,6 +34,7 @@ during AccessED Hacks.
 | Verification | Added frontend, backend, HTTP isolation, build, and real-Chrome acceptance tests | `evidence/` |
 | Public judging entry | Added an API-independent static entry using the same integrated AccessBridge component and published it under an independent Netlify site | `apps/web/accessbridge.html`; `apps/web/src/main.accessbridge.tsx`; `netlify.competition.toml` |
 | Documentation | Added source map, license notes, data boundaries, Devpost draft, screenshots, and operator card | `README.md`; `submission/` |
+| Public source | Published an independent rights-retained competition branch, tag, and Release without changing the repository's existing `main` | `submission/PUBLIC_RELEASE.md` |
 
 ## Reused source
 
@@ -62,7 +63,7 @@ account decisions, and final submission.
 No claim is made for live production generation, representative-course
 end-to-end completion, authentic student-data isolation, human educator review,
 measured learning improvement, full WCAG certification, public full-stack
-hosting, a refreshed public repository Release, or Devpost submission until
-their respective evidence exists. The API-independent static judging entry is
+hosting, or Devpost submission until their respective evidence exists. The
+API-independent static judging entry and public competition source are
 separately `VERIFIED_LIVE`.
 

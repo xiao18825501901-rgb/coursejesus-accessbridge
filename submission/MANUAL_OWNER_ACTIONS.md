@@ -44,19 +44,7 @@ Required configuration:
 Status: `BLOCKED_ACCOUNT` for the full-stack environment; the static
 AccessBridge entry is `VERIFIED_LIVE`.
 
-## 3. Publish the competition GitHub source
-
-The source is prepared for a competition branch, tag, and Release in the public
-`xiao18825501901-rgb/coursejesus-accessbridge` repository with rights retained.
-
-Do not rewrite or force-push existing CourseJesus history. Do not publish
-`.env`, credentials, student data, private media, model weights, runtime data, or
-`review-inputs/`.
-
-Status: publication is authorized; release/tag verification remains pending
-until the authenticated repository operation and public readback complete.
-
-## 4. Devpost identity and final submit
+## 3. Devpost identity and final submit
 
 Re-open the current official AccessED Hacks overview and rules, confirm the
 deadline, eligibility, team declaration, and required licenses, then complete
@@ -67,7 +55,7 @@ The final Submit action and identity/terms declaration remain with the owner.
 
 Status: `NOT_SUBMITTED`.
 
-## 5. Exact temporary-directory cleanup
+## 4. Exact temporary-directory cleanup
 
 The requested cleanup target is:
 

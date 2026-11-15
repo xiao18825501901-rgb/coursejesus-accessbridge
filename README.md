@@ -10,6 +10,12 @@ Current delivery state: **PARTIAL / NOT_SUBMISSION_READY / NOT_SUBMITTED**.
 Public deterministic judging entry:
 <https://coursejesus-accessbridge.netlify.app/>
 
+Public source branch:
+<https://github.com/xiao18825501901-rgb/coursejesus-accessbridge/tree/full-coursejesus-app-20261115>
+
+Public release:
+<https://github.com/xiao18825501901-rgb/coursejesus-accessbridge/releases/tag/accessed-hacks-submission-20261115>
+
 The public site is an accessible static presentation of the same AccessBridge
 component integrated into this complete CourseJesus source copy. It needs no
 account, API server, private learner data, model, or GPU. The complete guest
@@ -101,6 +107,20 @@ Final per-run results are recorded under `evidence/`. Historical results from
 the standalone three-lesson AccessBridge demo are not evidence for this full
 application copy.
 
+## Package
+
+After committing the final tree:
+
+```powershell
+.\scripts\package_submission.ps1 -Version 20261115
+.\.venv\Scripts\python.exe .\scripts\make_hash_manifest.py --include-submission-artifacts
+```
+
+This writes the source ZIP, demo ZIP, `SHA256SUMS.txt`, and the hash manifest
+under `submission/` and `evidence/`. Runtime directories, dependencies,
+credentials, databases, uploads, private media, and review-only inputs are
+excluded.
+
 ## Public visitor boundary
 
 Guests use an HMAC-signed token with a `guest_` subject namespace. The token is
@@ -134,7 +154,8 @@ Verified locally and in the bundled browser evidence:
   WCAG A/AA violations on the tested surfaces, and offline `file://` practice.
 - Local start and stop scripts with independent ports and data directories.
 - Anonymous Chromium access to the public AccessBridge entry, with three
-  lessons, zero console errors, zero failed requests, and no API dependency.
+  lessons, large text, expandable sources, a downloaded self-contained practice
+  page, zero console errors, zero failed requests, and no API dependency.
 
 Not verified or not completed:
 
@@ -153,8 +174,6 @@ Not verified or not completed:
 - `BLOCKED_ACCOUNT`: public full-stack hosting requires an existing free runtime
   account that can serve the FastAPI guest API. The public static entry is
   `VERIFIED_LIVE`; it is not evidence for the full-stack production flow.
-- `NOT_DONE`: competition-branch refresh, tag, and Release in the public GitHub
-  repository.
 - `NOT_SUBMITTED`: Devpost.
 - `VERIFIED_LIVE`: AccessED rules were re-read on 2026-11-15. The deadline is
   `2026-11-21 06:00 UTC+8`. Entrants must be students above the legal age of
@@ -184,6 +203,7 @@ own license. See `LICENSE_NOTES.md`, `THIRD_PARTY_NOTICES.md`, and
 - `evidence/pip-check-results.txt`
 - `evidence/security-scan-results.json`
 - `evidence/LIVE_ACCESS_EVIDENCE.json`
+- `scripts/verify_live_accessbridge.mjs`
 - `evidence/RULES_READBACK.json`
 - `evidence/demo-captioned.mp4`
 - `evidence/demo-captions.srt`
@@ -191,4 +211,5 @@ own license. See `LICENSE_NOTES.md`, `THIRD_PARTY_NOTICES.md`, and
 - `submission/DEVPOST_EN.md`
 - `submission/CONTRIBUTIONS.md`
 - `submission/MANUAL_OWNER_ACTIONS.md`
+- `submission/PUBLIC_RELEASE.md`
 
