@@ -1,0 +1,36 @@
+{
+  "schema": "coursejesus.accessed-hacks.rules-readback.v1",
+  "status": "VERIFIED_LIVE",
+  "captured_at": "2026-11-15T15:50:00+08:00",
+  "source_url": "https://accessed-hacks.devpost.com/rules",
+  "event_window": {
+    "start": "2026-10-17T00:00:00-04:00",
+    "submission_deadline_displayed": "2026-11-21T06:00:00+08:00",
+    "judging": "2026-11-21 through 2026-11-22 Eastern Time"
+  },
+  "entry_requirements": [
+    "Entrants must be students at a recognized educational institution.",
+    "Entrants must be above the legal age of majority in their country of residence.",
+    "Entrants must satisfy the geographic requirements displayed on the official site.",
+    "Companies, organizers, and judges are excluded.",
+    "Solo and team entries are allowed only when every team member is eligible."
+  ],
+  "submission_requirements": [
+    "Submit one Devpost entry per project addressing a specific barrier to learning.",
+    "Include a project story, screenshots, and an accessible demo, build, or recorded walkthrough.",
+    "Identify work created during the event and distinguish it from pre-existing work.",
+    "Use synthetic or permission-cleared examples and do not upload private educational records or identifiable learner data.",
+    "Credit third-party work and AI assistance.",
+    "Use only material with permission.",
+    "Do not require judges to provide private personal information to test the demo.",
+    "Keep judging links available through 2026-11-22."
+  ],
+  "scoring_criteria_equal_weight": [
+    "Barrier Removed",
+    "Learning Value",
+    "Inclusive Experience",
+    "Working Prototype & Explanation"
+  ],
+  "license_observation": "No OSI-approved license requirement was stated on the captured rules page. The rules require permission-cleared material and third-party credit.",
+  "owner_identity_declaration": "NOT_VERIFIED"
+}

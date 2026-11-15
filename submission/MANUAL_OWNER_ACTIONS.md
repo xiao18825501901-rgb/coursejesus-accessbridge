@@ -28,6 +28,10 @@ guest-capable backend under a new name that does not target `coursejesus.com`.
 Use free capacity already present on the account; do not purchase a paid plan
 for this task.
 
+The API-independent static judging entry is already public and verified at
+<https://coursejesus-accessbridge.netlify.app/>. This action remains necessary
+only for a public complete-shell and public FastAPI guest API.
+
 Required configuration:
 
 - A new competition-only project.
@@ -37,21 +41,20 @@ Required configuration:
 - Deterministic/mock providers for the safe demo.
 - No production secrets or private course files.
 
-Status: `BLOCKED_ACCOUNT`.
+Status: `BLOCKED_ACCOUNT` for the full-stack environment; the static
+AccessBridge entry is `VERIFIED_LIVE`.
 
 ## 3. Publish the competition GitHub source
 
-The source is ready for a clean competition repository or release artifact with
-rights retained. If account-side repository creation or authentication is not
-already available, create a public repository named
-`coursejesus-accessed-hacks-2026`, then provide the clone/push URL.
+The source is prepared for a competition branch, tag, and Release in the public
+`xiao18825501901-rgb/coursejesus-accessbridge` repository with rights retained.
 
 Do not rewrite or force-push existing CourseJesus history. Do not publish
 `.env`, credentials, student data, private media, model weights, runtime data, or
 `review-inputs/`.
 
-Status: `OWNER_ACCOUNT_ACTION` unless an existing authenticated session becomes
-available.
+Status: publication is authorized; release/tag verification remains pending
+until the authenticated repository operation and public readback complete.
 
 ## 4. Devpost identity and final submit
 

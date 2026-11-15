@@ -27,3 +27,8 @@ authenticated production account isolation, human review, measured learning
 improvement, full WCAG certification, public full-stack hosting, GitHub release,
 or Devpost submission.
 
+The final public judging entry is
+<https://coursejesus-accessbridge.netlify.app/>. It serves the deterministic,
+API-independent AccessBridge learning component from the same competition
+source tree.
+

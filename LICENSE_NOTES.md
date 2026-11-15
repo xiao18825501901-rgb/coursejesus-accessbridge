@@ -36,9 +36,12 @@ keys, or production databases are included.
 
 ## Hackathon rules
 
-The owner asked not to contact the organizers. The AccessED official rules pages
-were attempted on 2026-11-15 but were stopped by Cloudflare verification in both
-available browsers. Any statement that an OSI-approved license is mandatory
-therefore remains `UNKNOWN`. Do not substitute an invented license to satisfy
-an unverified rule.
+The AccessED official rules were re-read successfully on 2026-11-15. The page
+states that entrants must use material they have permission to use, credit
+third-party work and AI assistance, and use synthetic or permission-cleared
+examples. That readback did not state that an OSI-approved license is required.
+The owner still chose a source-available, rights-retained publication mode, so
+this delivery does not apply MIT, Apache-2.0, or another open-source license to
+owner-authored code. The exact captured rules are summarized in
+`evidence/RULES_READBACK.json`.
 

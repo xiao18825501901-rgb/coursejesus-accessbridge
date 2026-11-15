@@ -7,6 +7,15 @@ worktree, production database, uploads, credentials, and deployment untouched.
 
 Current delivery state: **PARTIAL / NOT_SUBMISSION_READY / NOT_SUBMITTED**.
 
+Public deterministic judging entry:
+<https://coursejesus-accessbridge.netlify.app/>
+
+The public site is an accessible static presentation of the same AccessBridge
+component integrated into this complete CourseJesus source copy. It needs no
+account, API server, private learner data, model, or GPU. The complete guest
+shell and its FastAPI isolation boundary run locally from this repository. The
+static host does not claim to provide the production RAG/Agent stack.
+
 ## What this copy adds
 
 - A signed, expiring guest session boundary for public visitors.
@@ -20,6 +29,8 @@ Current delivery state: **PARTIAL / NOT_SUBMISSION_READY / NOT_SUBMITTED**.
   keyboard operation, large text, English/Chinese switching, quiz feedback, and
   a self-contained offline practice download.
 - Browser, API, security, build, and retention tests in the isolated copy.
+- A public, API-independent judging entry for the integrated AccessBridge
+  lessons.
 
 The pre-existing CourseJesus product remains the foundation. This copy does not
 claim that its historical RAG, Agent, Canvas, knowledge-tree, or visual
@@ -122,6 +133,8 @@ Verified locally and in the bundled browser evidence:
   bilingual controls, large text, 390/640/768 px layouts, zero axe
   WCAG A/AA violations on the tested surfaces, and offline `file://` practice.
 - Local start and stop scripts with independent ports and data directories.
+- Anonymous Chromium access to the public AccessBridge entry, with three
+  lessons, zero console errors, zero failed requests, and no API dependency.
 
 Not verified or not completed:
 
@@ -138,12 +151,16 @@ Not verified or not completed:
 - `UNKNOWN`: full WCAG certification. Automated axe checks are not a
   certification.
 - `BLOCKED_ACCOUNT`: public full-stack hosting requires an existing free runtime
-  account that can serve the FastAPI guest API. A static-only host cannot prove
-  the complete application flow.
-- `NOT_DONE`: public GitHub repository/tag/Release.
+  account that can serve the FastAPI guest API. The public static entry is
+  `VERIFIED_LIVE`; it is not evidence for the full-stack production flow.
+- `NOT_DONE`: competition-branch refresh, tag, and Release in the public GitHub
+  repository.
 - `NOT_SUBMITTED`: Devpost.
-- `UNKNOWN`: AccessED rules re-read from the official page. Both test browsers
-  were stopped by the site's Cloudflare verification on 2026-11-15.
+- `VERIFIED_LIVE`: AccessED rules were re-read on 2026-11-15. The deadline is
+  `2026-11-21 06:00 UTC+8`. Entrants must be students above the legal age of
+  majority and satisfy geographic eligibility. Entries must distinguish event
+  work from pre-existing work, credit third parties and AI assistance, use
+  permission-cleared material, and require no private judge information.
 
 ## Source and rights
 
@@ -166,6 +183,8 @@ own license. See `LICENSE_NOTES.md`, `THIRD_PARTY_NOTICES.md`, and
 - `evidence/npm-audit-final-results.json`
 - `evidence/pip-check-results.txt`
 - `evidence/security-scan-results.json`
+- `evidence/LIVE_ACCESS_EVIDENCE.json`
+- `evidence/RULES_READBACK.json`
 - `evidence/demo-captioned.mp4`
 - `evidence/demo-captions.srt`
 - `evidence/screenshots/`

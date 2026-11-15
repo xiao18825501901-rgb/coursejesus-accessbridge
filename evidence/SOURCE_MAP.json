@@ -1,6 +1,6 @@
 {
   "schema": "coursejesus.accessed-hacks.source-map.v1",
-  "captured_at": "2026-11-15T15:15:00+08:00",
+  "captured_at": "2026-11-15T15:55:00+08:00",
   "competition_workspace": "E:\\Hackathon-2026\\coursejesus-full-competition",
   "baseline": {
     "repository": "xiao18825501901-rgb/coursemate-ai",
@@ -63,13 +63,17 @@
     "apps/web/src/competition/",
     "apps/web/src/ui/AccessBridgeDemo.jsx",
     "apps/web/src/ui/AccessBridgeDiagram.jsx",
+    "apps/web/accessbridge.html",
+    "apps/web/src/main.accessbridge.tsx",
     "tests/e2e/competition-public-guest.spec.ts",
     "scripts/check_local_guest.py",
     "scripts/prepare_competition_browser.py",
     "scripts/purge_expired_guest_data.py",
     "scripts/seed_local_smoke.py",
     "scripts/start_competition.ps1",
-    "scripts/stop_competition.ps1"
+    "scripts/stop_competition.ps1",
+    "scripts/prepare_netlify_demo.ps1",
+    "netlify.competition.toml"
   ],
   "private_inputs_excluded": [
     "review-inputs/"

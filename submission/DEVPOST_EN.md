@@ -18,6 +18,13 @@ isolated guest workspace, can browse authorized public courses, and can use the
 new AccessBridge learning route. They cannot see private courses, owner
 identifiers, learner records, grades, profiles, or administrative controls.
 
+The API-independent public judging surface is available at
+<https://coursejesus-accessbridge.netlify.app/>. It runs the same accessible
+AccessBridge component as the complete competition build and needs no account,
+backend service, model, GPU, or private learner data. The complete guest shell
+and its FastAPI visitor-isolation boundary are verified in the source copy and
+run locally; the static host does not pretend to be that full-stack service.
+
 AccessBridge currently includes three original bilingual lessons:
 
 - stack and queue order;
@@ -111,9 +118,10 @@ and Agent E2E, authenticated production account isolation, public full-stack
 hosting, a public GitHub release, human educator review, and measured learning
 improvement are not claimed.
 
-The official AccessED pages were attempted on 2026-11-15 but were blocked by
-Cloudflare verification in both available browsers. The previously recorded
-deadline remains provisional until the owner reopens the official pages.
+The official AccessED rules were re-read on 2026-11-15. The recorded deadline is
+2026-11-21 06:00 UTC+8. Entrants must be students above the legal age of
+majority and satisfy geographic eligibility. The final owner declaration remains
+required.
 
 ## What's next
 
