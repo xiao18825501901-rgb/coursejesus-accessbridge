@@ -11,6 +11,11 @@
 # checked-out form LF regardless of core.autocrlf.
 *.sh text eol=lf
 *.py text eol=lf
+evidence/**/*.json text eol=lf
+evidence/**/*.md text eol=lf
+evidence/**/*.txt text eol=lf
+evidence/**/*.srt text eol=lf
+submission/**/*.md text eol=lf
 
 # Workflow files are integrity-checked byte-for-byte against their registered
 # SHA-256 values. Keep the committed bytes unchanged on every platform.

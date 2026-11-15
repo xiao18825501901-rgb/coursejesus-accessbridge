@@ -55,6 +55,10 @@
       "api_health": "ok",
       "remaining_listeners_after_stop": 0
     },
+    "competition_script_tests": {
+      "status": "PASS",
+      "tests": 2
+    },
     "dependency_audit": {
       "status": "PASS",
       "production_vulnerabilities": 0,
