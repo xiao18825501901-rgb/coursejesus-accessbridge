@@ -36,8 +36,14 @@ foreach ($commit in $commits) {
 
 $classifiedMatches = @(
     $rawSecretMatches | ForEach-Object {
-        $classification = if ($_ -match 'services/rag-api/tests/test_deepseek_canary\.py:.*sk-deepseek-canary-sentinel-123') {
+        $classification = if (
+            $_ -match 'services/rag-api/tests/test_deepseek_canary\.py:.*sk-deepseek-canary-sentinel-123'
+        ) {
             "SYNTHETIC_TEST_SENTINEL"
+        } elseif ($_ -match 'scripts/scan_release_security\.ps1:') {
+            "SCANNER_PATTERN_DEFINITION"
+        } elseif ($_ -match 'evidence/security-scan-results[^:]*\.json:') {
+            "SCANNER_EVIDENCE_RECORD"
         } else {
             "REVIEW_REQUIRED"
         }
@@ -60,7 +66,10 @@ $allowedBrandMedia = @(
     "apps/web/public/brand/icon-512.png",
     "apps/web/public/brand/logo-mark-512.png"
 )
-$unexpectedMedia = @($mediaFiles | Where-Object { $_ -notin $allowedBrandMedia })
+$unexpectedMedia = @(
+    $mediaFiles |
+        Where-Object { $_ -notin $allowedBrandMedia -and $_ -notmatch '^evidence/(screenshots/|[^/]+\.(mp4|webm)$)' }
+)
 $reviewRequired = @($classifiedMatches | Where-Object classification -eq "REVIEW_REQUIRED")
 $status = if (
     $sensitiveFilenames.Count -eq 0 -and
@@ -80,7 +89,8 @@ $result = [ordered]@{
     allowed_owner_brand_media = $allowedBrandMedia
     unexpected_media_files = $unexpectedMedia
     notes = @(
-        "The only high-confidence string match is a synthetic canary sentinel under a test file.",
+        "In addition to the synthetic canary sentinel, matches for this scanner's regex text and its prior JSON evidence are classified separately.",
+        "Tracked media under evidence/screenshots and the captioned demo are competition-owned verification artifacts.",
         "Runtime data, review-inputs, node_modules, .venv, .git, caches, and generated artifacts are excluded from source packages.",
         "Dependency vulnerability status is recorded separately in npm-audit-final-results.json and pip-check-results.txt."
     )

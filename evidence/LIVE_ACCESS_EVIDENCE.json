@@ -1,16 +1,35 @@
 {
   "schema": "coursejesus.accessed-hacks.live-access.v1",
   "status": "VERIFIED_LIVE",
-  "captured_at": "2026-11-15T15:49:03.697Z",
+  "captured_at": "2026-11-15T07:59:56.644Z",
   "url": "https://coursejesus-accessbridge.netlify.app/",
   "netlify_site_id": "b1d3fb90-daad-42a3-962b-84608e74c2be",
-  "deploy_id": "6af963d2e77de0e9a286931a",
+  "deploy_id": "6af9665158650655e38c3b21",
   "anonymous": true,
   "http_status": 200,
   "title": "CourseJesus — AccessBridge",
   "heading": "AccessBridge 分步学习",
   "lesson_count": 3,
+  "matrix_lesson_rendered": true,
+  "large_text_toggle_verified": true,
+  "expandable_source_count": 4,
+  "offline_download": {
+    "suggested_filename": "AccessBridge_matrix-transform_zh-CN.html",
+    "self_contained_html_verified": true,
+    "bytes": 3185
+  },
+  "mobile_390_horizontal_overflow_css_px": 0,
+  "axe": {
+    "version": "4.10.3",
+    "wcag_a_aa_violations": []
+  },
+  "auth_state": {
+    "cookie_count": 0,
+    "local_storage_keys": [],
+    "session_storage_keys": []
+  },
   "console_errors": [],
+  "page_errors": [],
   "failed_requests": [],
   "api_requests": [],
   "security_headers": {
@@ -20,5 +39,5 @@
     "referrer_policy": "strict-origin-when-cross-origin"
   },
   "screenshot": "evidence/screenshots/live-public-accessbridge.png",
-  "boundary": "The public host serves the deterministic AccessBridge learning surface. The complete FastAPI guest API is verified only in the local isolated runtime."
+  "boundary": "The public host serves the deterministic API-independent AccessBridge learning surface. The complete FastAPI guest API is verified only in the isolated local runtime."
 }

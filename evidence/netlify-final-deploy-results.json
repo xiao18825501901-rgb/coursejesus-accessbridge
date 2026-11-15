@@ -1,0 +1,10 @@
+{
+  "site_id": "b1d3fb90-daad-42a3-962b-84608e74c2be",
+  "site_name": "coursejesus-accessbridge",
+  "deploy_id": "6af9665158650655e38c3b21",
+  "deploy_url": "https://6af9665158650655e38c3b21--coursejesus-accessbridge.netlify.app",
+  "logs": "https://app.netlify.com/projects/coursejesus-accessbridge/deploys/6af9665158650655e38c3b21",
+  "function_logs": "https://app.netlify.com/projects/coursejesus-accessbridge/logs/functions",
+  "edge_function_logs": "https://app.netlify.com/projects/coursejesus-accessbridge/logs/edge-functions",
+  "url": "https://coursejesus-accessbridge.netlify.app"
+}

@@ -1,0 +1,116 @@
+{
+  "schema": "coursejesus.release-security-scan.v1",
+  "checked_at": "2026-11-15T08:00:35.3730848Z",
+  "status": "PASS",
+  "git_commit_count": 6,
+  "tracked_file_count": 1001,
+  "sensitive_filenames": [],
+  "high_confidence_secret_matches": [
+    {
+      "match": "9575ed0022bcef806c15a696e6fae005b89339cc:evidence/security-scan-results.json:10:      \"match\": \"2ac73bbe1beaaeb48f6139055abc3ad2d8faca20:services/rag-api/tests/test_deepseek_canary.py:435:    sentinel = \\\"sk-deepseek-canary-sentinel-123\\\"\",",
+      "classification": "SYNTHETIC_TEST_SENTINEL"
+    },
+    {
+      "match": "9575ed0022bcef806c15a696e6fae005b89339cc:scripts/scan_release_security.ps1:39:        $classification = if ($_ -match 'services/rag-api/tests/test_deepseek_canary\\.py:.*sk-deepseek-canary-sentinel-123') {",
+      "classification": "SCANNER_PATTERN_DEFINITION"
+    },
+    {
+      "match": "9575ed0022bcef806c15a696e6fae005b89339cc:services/rag-api/tests/test_deepseek_canary.py:435:    sentinel = \"sk-deepseek-canary-sentinel-123\"",
+      "classification": "SYNTHETIC_TEST_SENTINEL"
+    },
+    {
+      "match": "9c9afe38058fb0c130c743c978668b8b89a1ddad:evidence/security-scan-results.json:10:      \"match\": \"2ac73bbe1beaaeb48f6139055abc3ad2d8faca20:services/rag-api/tests/test_deepseek_canary.py:435:    sentinel = \\\"sk-deepseek-canary-sentinel-123\\\"\",",
+      "classification": "SYNTHETIC_TEST_SENTINEL"
+    },
+    {
+      "match": "9c9afe38058fb0c130c743c978668b8b89a1ddad:scripts/scan_release_security.ps1:39:        $classification = if ($_ -match 'services/rag-api/tests/test_deepseek_canary\\.py:.*sk-deepseek-canary-sentinel-123') {",
+      "classification": "SCANNER_PATTERN_DEFINITION"
+    },
+    {
+      "match": "9c9afe38058fb0c130c743c978668b8b89a1ddad:services/rag-api/tests/test_deepseek_canary.py:435:    sentinel = \"sk-deepseek-canary-sentinel-123\"",
+      "classification": "SYNTHETIC_TEST_SENTINEL"
+    },
+    {
+      "match": "051190dc121ac6736e39a27471dc0f4ccca7cb35:evidence/security-scan-results.json:10:      \"match\": \"2ac73bbe1beaaeb48f6139055abc3ad2d8faca20:services/rag-api/tests/test_deepseek_canary.py:435:    sentinel = \\\"sk-deepseek-canary-sentinel-123\\\"\",",
+      "classification": "SYNTHETIC_TEST_SENTINEL"
+    },
+    {
+      "match": "051190dc121ac6736e39a27471dc0f4ccca7cb35:scripts/scan_release_security.ps1:39:        $classification = if ($_ -match 'services/rag-api/tests/test_deepseek_canary\\.py:.*sk-deepseek-canary-sentinel-123') {",
+      "classification": "SCANNER_PATTERN_DEFINITION"
+    },
+    {
+      "match": "051190dc121ac6736e39a27471dc0f4ccca7cb35:services/rag-api/tests/test_deepseek_canary.py:435:    sentinel = \"sk-deepseek-canary-sentinel-123\"",
+      "classification": "SYNTHETIC_TEST_SENTINEL"
+    },
+    {
+      "match": "83aed7b6420949a7165a2ca51b1010529ee2a6aa:evidence/security-scan-results.json:10:      \"match\": \"2ac73bbe1beaaeb48f6139055abc3ad2d8faca20:services/rag-api/tests/test_deepseek_canary.py:435:    sentinel = \\\"sk-deepseek-canary-sentinel-123\\\"\",",
+      "classification": "SYNTHETIC_TEST_SENTINEL"
+    },
+    {
+      "match": "83aed7b6420949a7165a2ca51b1010529ee2a6aa:scripts/scan_release_security.ps1:39:        $classification = if ($_ -match 'services/rag-api/tests/test_deepseek_canary\\.py:.*sk-deepseek-canary-sentinel-123') {",
+      "classification": "SCANNER_PATTERN_DEFINITION"
+    },
+    {
+      "match": "83aed7b6420949a7165a2ca51b1010529ee2a6aa:services/rag-api/tests/test_deepseek_canary.py:435:    sentinel = \"sk-deepseek-canary-sentinel-123\"",
+      "classification": "SYNTHETIC_TEST_SENTINEL"
+    },
+    {
+      "match": "49d254213cd8448ec299b155b9cbd26a2e57bc79:evidence/security-scan-results.json:10:      \"match\": \"2ac73bbe1beaaeb48f6139055abc3ad2d8faca20:services/rag-api/tests/test_deepseek_canary.py:435:    sentinel = \\\"sk-deepseek-canary-sentinel-123\\\"\",",
+      "classification": "SYNTHETIC_TEST_SENTINEL"
+    },
+    {
+      "match": "49d254213cd8448ec299b155b9cbd26a2e57bc79:scripts/scan_release_security.ps1:39:        $classification = if ($_ -match 'services/rag-api/tests/test_deepseek_canary\\.py:.*sk-deepseek-canary-sentinel-123') {",
+      "classification": "SCANNER_PATTERN_DEFINITION"
+    },
+    {
+      "match": "49d254213cd8448ec299b155b9cbd26a2e57bc79:services/rag-api/tests/test_deepseek_canary.py:435:    sentinel = \"sk-deepseek-canary-sentinel-123\"",
+      "classification": "SYNTHETIC_TEST_SENTINEL"
+    },
+    {
+      "match": "2ac73bbe1beaaeb48f6139055abc3ad2d8faca20:services/rag-api/tests/test_deepseek_canary.py:435:    sentinel = \"sk-deepseek-canary-sentinel-123\"",
+      "classification": "SYNTHETIC_TEST_SENTINEL"
+    }
+  ],
+  "tracked_media_files": [
+    "apps/web/brand-source/coursejesus-logo-source.png",
+    "apps/web/public/brand/apple-touch-icon-180.png",
+    "apps/web/public/brand/favicon-16.png",
+    "apps/web/public/brand/favicon-32.png",
+    "apps/web/public/brand/favicon-48.png",
+    "apps/web/public/brand/icon-192.png",
+    "apps/web/public/brand/icon-512.png",
+    "apps/web/public/brand/logo-mark-512.png",
+    "evidence/demo-captioned.mp4",
+    "evidence/screenshots/complete-site-accessbridge-desktop.png",
+    "evidence/screenshots/complete-site-accessbridge-mobile-390.png",
+    "evidence/screenshots/complete-site-accessbridge-zoom200-reflow.png",
+    "evidence/screenshots/complete-site-guest-desktop.png",
+    "evidence/screenshots/complete-site-guest-mobile-360.png",
+    "evidence/screenshots/complete-site-guest-mobile-390.png",
+    "evidence/screenshots/complete-site-guest-tablet.png",
+    "evidence/screenshots/complete-site-guest-zoom200-reflow.png",
+    "evidence/screenshots/final-demo-accessbridge-en.png",
+    "evidence/screenshots/final-video-frame-100s.png",
+    "evidence/screenshots/final-video-frame-20s.png",
+    "evidence/screenshots/live-public-accessbridge.png",
+    "evidence/screenshots/public-accessbridge-entry-desktop.png",
+    "evidence/screenshots/public-accessbridge-entry-mobile-390.png"
+  ],
+  "allowed_owner_brand_media": [
+    "apps/web/brand-source/coursejesus-logo-source.png",
+    "apps/web/public/brand/apple-touch-icon-180.png",
+    "apps/web/public/brand/favicon-16.png",
+    "apps/web/public/brand/favicon-32.png",
+    "apps/web/public/brand/favicon-48.png",
+    "apps/web/public/brand/icon-192.png",
+    "apps/web/public/brand/icon-512.png",
+    "apps/web/public/brand/logo-mark-512.png"
+  ],
+  "unexpected_media_files": [],
+  "notes": [
+    "In addition to the synthetic canary sentinel, matches for this scanner's regex text and its prior JSON evidence are classified separately.",
+    "Tracked media under evidence/screenshots and the captioned demo are competition-owned verification artifacts.",
+    "Runtime data, review-inputs, node_modules, .venv, .git, caches, and generated artifacts are excluded from source packages.",
+    "Dependency vulnerability status is recorded separately in npm-audit-final-results.json and pip-check-results.txt."
+  ]
+}

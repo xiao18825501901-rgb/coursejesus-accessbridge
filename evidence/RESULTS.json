@@ -1,6 +1,6 @@
 {
   "schema": "coursejesus.accessed-hacks.results.v1",
-  "captured_at": "2026-11-15T15:55:00+08:00",
+  "captured_at": "2026-11-15T16:01:00+08:00",
   "overall_status": "PARTIAL",
   "submission_status": "NOT_SUBMITTED",
   "workspace": "E:\\Hackathon-2026\\coursejesus-full-competition",
@@ -12,7 +12,8 @@
     "production_build": {
       "status": "PASS",
       "modules": 186,
-      "bundle_security_scan": "PASS"
+      "bundle_security_scan": "PASS",
+      "verified_at": "2026-11-15T15:57:46+08:00"
     },
     "frontend_tests": {
       "status": "PASS",
@@ -57,7 +58,8 @@
     },
     "competition_script_tests": {
       "status": "PASS",
-      "tests": 2
+      "tests": 2,
+      "verified_at": "2026-11-15T15:58:08+08:00"
     },
     "dependency_audit": {
       "status": "PASS",
@@ -67,6 +69,8 @@
     },
     "repository_security_scan": {
       "status": "PASS",
+      "git_commit_count": 6,
+      "tracked_file_count": 1001,
       "sensitive_filenames": 0,
       "unexpected_media_files": 0,
       "high_confidence_test_sentinel_matches": 1,
@@ -82,8 +86,14 @@
     "public_static_judging_entry": {
       "status": "VERIFIED_LIVE",
       "url": "https://coursejesus-accessbridge.netlify.app/",
+      "deploy_id": "6af9665158650655e38c3b21",
       "http_status": 200,
       "lesson_count": 3,
+      "large_text_verified": true,
+      "expandable_source_count": 4,
+      "offline_download_verified": true,
+      "mobile_390_horizontal_overflow_css_px": 0,
+      "axe_wcag_a_aa_violations": 0,
       "console_errors": 0,
       "failed_requests": 0,
       "api_requests": 0,
